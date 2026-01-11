@@ -20,7 +20,7 @@ mod util;
 
 use crate::config::ProxyConfig;
 use crate::proxy::ClientHandler;
-use crate::stats::Stats;
+use crate::stats::{Stats, ReplayChecker};
 use crate::transport::{create_listener, ListenOptions, UpstreamManager};
 use crate::util::ip::detect_ip;
 
@@ -54,6 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let config = Arc::new(config);
     let stats = Arc::new(Stats::new());
+    
+    // CHANGED: Initialize global ReplayChecker here instead of per-connection
+    let replay_checker = Arc::new(ReplayChecker::new(config.replay_check_len));
     
     // Initialize Upstream Manager
     let upstream_manager = Arc::new(UpstreamManager::new(config.upstreams.clone()));
@@ -145,13 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Accept loop
-    // For simplicity in this slice, we just spawn a task for each listener
-    // In a real high-perf scenario, we might want a more complex accept loop
-    
     for listener in listeners {
         let config = config.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
+        let replay_checker = replay_checker.clone();
         
         tokio::spawn(async move {
             loop {
@@ -160,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let config = config.clone();
                         let stats = stats.clone();
                         let upstream_manager = upstream_manager.clone();
+                        let replay_checker = replay_checker.clone();
                         
                         tokio::spawn(async move {
                             if let Err(e) = ClientHandler::new(
@@ -167,7 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 peer_addr, 
                                 config, 
                                 stats,
-                                upstream_manager
+                                upstream_manager,
+                                replay_checker // Pass global checker
                             ).run().await {
                                 // Log only relevant errors
                                 // debug!("Connection error: {}", e);

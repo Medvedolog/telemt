@@ -30,17 +30,10 @@ pub fn configure_tcp_socket(
         socket.set_tcp_keepalive(&keepalive)?;
     }
     
-    // Set buffer sizes
-    set_buffer_sizes(&socket, 65536, 65536)?;
+    // CHANGED: Removed manual buffer size setting (was 256KB).
+    // Allowing the OS kernel to handle TCP window scaling (Autotuning) is critical
+    // for mobile clients to avoid bufferbloat and stalled connections during uploads.
     
-    Ok(())
-}
-
-/// Set socket buffer sizes
-fn set_buffer_sizes(socket: &socket2::SockRef, recv: usize, send: usize) -> Result<()> {
-    // These may fail on some systems, so we ignore errors
-    let _ = socket.set_recv_buffer_size(recv);
-    let _ = socket.set_send_buffer_size(send);
     Ok(())
 }
 
@@ -65,6 +58,8 @@ pub fn configure_client_socket(
     socket.set_tcp_keepalive(&keepalive)?;
     
     // Set TCP user timeout (Linux only)
+    // NOTE: iOS does not support TCP_USER_TIMEOUT - application-level timeout 
+    // is implemented in relay_bidirectional instead
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;

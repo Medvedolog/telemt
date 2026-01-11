@@ -167,7 +167,10 @@ pub const DEFAULT_ACK_TIMEOUT_SECS: u64 = 300;
 // ============= Buffer Sizes =============
 
 /// Default buffer size
-pub const DEFAULT_BUFFER_SIZE: usize = 65536;
+/// CHANGED: Reduced from 64KB to 16KB to match TLS record size and align with
+/// the new buffering strategy for better iOS upload performance.
+pub const DEFAULT_BUFFER_SIZE: usize = 16384;
+
 /// Small buffer size for bad client handling
 pub const SMALL_BUFFER_SIZE: usize = 8192;
 

@@ -163,9 +163,12 @@ fn default_port() -> u16 { 443 }
 fn default_tls_domain() -> String { "www.google.com".to_string() }
 fn default_mask_port() -> u16 { 443 }
 fn default_replay_check_len() -> usize { 65536 }
-fn default_handshake_timeout() -> u64 { 10 }
+// CHANGED: Increased handshake timeout for bad mobile networks
+fn default_handshake_timeout() -> u64 { 15 } 
 fn default_connect_timeout() -> u64 { 10 }
-fn default_keepalive() -> u64 { 600 }
+// CHANGED: Reduced keepalive from 600s to 60s.
+// Mobile NATs often drop idle connections after 60-120s.
+fn default_keepalive() -> u64 { 60 } 
 fn default_ack_timeout() -> u64 { 300 }
 fn default_listen_addr() -> String { "0.0.0.0".to_string() }
 fn default_fake_cert_len() -> usize { 2048 }

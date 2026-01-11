@@ -45,11 +45,10 @@ impl ClientHandler {
         config: Arc<ProxyConfig>,
         stats: Arc<Stats>,
         upstream_manager: Arc<UpstreamManager>,
+        replay_checker: Arc<ReplayChecker>, // CHANGED: Accept global checker
     ) -> RunningClientHandler {
-        // Note: ReplayChecker should be shared globally for proper replay protection
-        // Creating it per-connection disables replay protection across connections
-        // TODO: Pass Arc<ReplayChecker> from main.rs
-        let replay_checker = Arc::new(ReplayChecker::new(config.replay_check_len));
+        // CHANGED: Removed local creation of ReplayChecker.
+        // It is now passed from main.rs to ensure global replay protection.
         
         RunningClientHandler {
             stream,
