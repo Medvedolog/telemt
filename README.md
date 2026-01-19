@@ -16,6 +16,7 @@
       - [IP](#bind-on-ip)
       - [SOCKS](#socks45-as-upstream)
 - [FAQ](#faq)
+  - [Recognizability for DPI + crawler](#recognizability-for-dpi-and-crawler)
   - [Telegram Calls](#telegram-calls-via-mtproxy)
   - [DPI](#how-does-dpi-see-mtproxy-tls)
   - [Whitelist on Network Level](#whitelist-on-ip)
@@ -242,6 +243,11 @@ enabled = true
 ```
 
 ## FAQ
+### Recognizability for DPI and crawler
+Since version 1.1, we have debugged masking perfectly, for all clients without "presenting" a key, 
+we transparently direct traffic to the target host. 
+- We consider this a breakthrough aspect, which few people managed to achieve in perfect form.
+- Based on this: if configured correctly, **TLS mode is completely identical to real-life handshake + communication** with a specified host.
 ### Telegram Calls via MTProxy
 - Telegram architecture **does NOT allow calls via MTProxy**, but only via SOCKS5, which cannot be obfuscated
 ### How does DPI see MTProxy TLS?
