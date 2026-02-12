@@ -298,20 +298,70 @@ impl RunningClientHandler {
         Ok(())
     }
     
+    /// Resolve DC index to a target address.
+    ///
+    /// Matches the C implementation's behavior exactly:
+    ///
+    /// 1. Look up DC in known clusters (standard DCs ±1..±5)
+    /// 2. If not found and `force=1` → fall back to `default_cluster`
+    ///
+    /// In the C code:
+    /// - `proxy-multi.conf` is downloaded from Telegram, contains only DC ±1..±5
+    /// - `default 2;` directive sets the default cluster
+    /// - `mf_cluster_lookup(CurConf, target_dc, 1)` returns default_cluster
+    ///   for any unknown DC (like CDN DC 203)
+    ///
+    /// So DC 203, DC 101, DC -300, etc. all route to the default DC (2).
+    /// There is NO modular arithmetic in the C implementation.
     fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
-        let idx = (dc_idx.abs() - 1) as usize;
-        
         let datacenters = if config.general.prefer_ipv6 {
             &*TG_DATACENTERS_V6
         } else {
             &*TG_DATACENTERS_V4
         };
-        
-        datacenters.get(idx)
-            .map(|ip| SocketAddr::new(*ip, TG_DATACENTER_PORT))
-            .ok_or_else(|| ProxyError::InvalidHandshake(
-                format!("Invalid DC index: {}", dc_idx)
-            ))
+    
+        let num_dcs = datacenters.len(); // 5
+    
+        // === Step 1: Check dc_overrides (like C's `proxy_for <dc> <ip>:<port>`) ===
+        let dc_key = dc_idx.to_string();
+        if let Some(addr_str) = config.dc_overrides.get(&dc_key) {
+            match addr_str.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    debug!(dc_idx = dc_idx, addr = %addr, "Using DC override from config");
+                    return Ok(addr);
+                }
+                Err(_) => {
+                    warn!(dc_idx = dc_idx, addr_str = %addr_str,
+                        "Invalid DC override address in config, ignoring");
+                }
+            }
+        }
+    
+        // === Step 2: Standard DCs ±1..±5 — direct lookup ===
+        let abs_dc = dc_idx.unsigned_abs() as usize;
+        if abs_dc >= 1 && abs_dc <= num_dcs {
+            return Ok(SocketAddr::new(datacenters[abs_dc - 1], TG_DATACENTER_PORT));
+        }
+    
+        // === Step 3: Unknown DC — fall back to default_cluster ===
+        // Exactly like C's `mf_cluster_lookup(CurConf, target_dc, force=1)`
+        // which returns `MC->default_cluster` when the DC is not found.
+        // Telegram's proxy-multi.conf uses `default 2;`
+        let default_dc = config.default_dc.unwrap_or(2) as usize;
+        let fallback_idx = if default_dc >= 1 && default_dc <= num_dcs {
+            default_dc - 1
+        } else {
+            1 // DC 2 (index 1) — matches Telegram's `default 2;`
+        };
+    
+        info!(
+            original_dc = dc_idx,
+            fallback_dc = (fallback_idx + 1) as u16,
+            fallback_addr = %datacenters[fallback_idx],
+            "Unknown DC not in ±1..5 range, routing to default cluster                  (same as C impl: mf_cluster_lookup with force=1 -> default_cluster)"
+        );
+    
+        Ok(SocketAddr::new(datacenters[fallback_idx], TG_DATACENTER_PORT))
     }
     
     async fn do_tg_handshake_static(

@@ -66,10 +66,25 @@ impl UpstreamState {
         }
     }
     
-    /// Convert dc_idx (1-based, may be negative) to array index 0..4
+    /// Map DC index to latency array slot (0..NUM_DCS).
+    ///
+    /// Matches the C implementation's `mf_cluster_lookup` behavior:
+    /// - Standard DCs ±1..±5 → direct mapping to array index 0..4
+    /// - Unknown DCs (CDN, media, etc.) → default DC slot (index 1 = DC 2)
+    ///   This matches Telegram's `default 2;` in proxy-multi.conf.
+    /// - There is NO modular arithmetic in the C implementation.
     fn dc_array_idx(dc_idx: i16) -> Option<usize> {
-        let idx = (dc_idx.unsigned_abs() as usize).checked_sub(1)?;
-        if idx < NUM_DCS { Some(idx) } else { None }
+        let abs_dc = dc_idx.unsigned_abs() as usize;
+        if abs_dc == 0 {
+            return None;
+        }
+        if abs_dc >= 1 && abs_dc <= NUM_DCS {
+            Some(abs_dc - 1)
+        } else {
+            // Unknown DC → default cluster (DC 2, index 1)
+            // Same as C: mf_cluster_lookup returns default_cluster
+            Some(1)
+        }
     }
     
     /// Get latency for a specific DC, falling back to average across all known DCs

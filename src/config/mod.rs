@@ -1,7 +1,7 @@
 //! Configuration
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -336,6 +336,21 @@ pub struct ProxyConfig {
 
     #[serde(default)]
     pub show_link: Vec<String>,
+
+    /// DC address overrides for non-standard DCs (CDN, media, test, etc.)
+    /// Keys are DC indices as strings, values are "ip:port" addresses.
+    /// Matches the C implementation's `proxy_for <dc_id> <ip>:<port>` config directive.
+    /// Example in config.toml:
+    ///   [dc_overrides]
+    ///   "203" = "149.154.175.100:443"
+    #[serde(default)]
+    pub dc_overrides: HashMap<String, String>,
+
+    /// Default DC index (1-5) for unmapped non-standard DCs.
+    /// Matches the C implementation's `default <dc_id>` config directive.
+    /// If not set, defaults to 2 (matching Telegram's official `default 2;` in proxy-multi.conf).
+    #[serde(default)]
+    pub default_dc: Option<u8>,
 }
 
 impl ProxyConfig {
