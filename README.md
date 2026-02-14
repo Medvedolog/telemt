@@ -22,7 +22,7 @@ development on it started on February 6th, and by February 10th, "big activity" 
 If you have expertise in asynchronous network applications – we are open to ideas and pull requests!
 
 # Features
-💥 The configuration structure has changed since version 1.1.0.0, change it in your environment!
+💥 The configuration structure has changed since version 1.1.0.0. change it in your environment!
 
 ⚓ Our implementation of **TLS-fronting** is one of the most deeply debugged, focused, advanced and *almost* **"behaviorally consistent to real"**:  we are confident we have it right - [see evidence on our validation and traces](#recognizability-for-dpi-and-crawler) 
 
@@ -44,6 +44,7 @@ If you have expertise in asynchronous network applications – we are open to id
   - [Telegram Calls](#telegram-calls-via-mtproxy)
   - [DPI](#how-does-dpi-see-mtproxy-tls)
   - [Whitelist on Network Level](#whitelist-on-ip)
+  - [Too many open files](#too-many-open-files)
 - [Build](#build)
 - [Docker](#docker)
 - [Why Rust?](#why-rust)
@@ -129,6 +130,7 @@ Type=simple
 WorkingDirectory=/bin
 ExecStart=/bin/telemt /etc/telemt.toml
 Restart=on-failure
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -378,6 +380,23 @@ Keep-Alive: timeout=60
   - in China behind the Great Firewall
   - in Russia on mobile networks, less in wired networks
   - in Iran during "activity"
+### Too many open files
+- On a fresh Linux install the default open file limit is low; under load `telemt` may fail with `Accept error: Too many open files`
+- **Systemd**: add `LimitNOFILE=65536` to the `[Service]` section (already included in the example above)
+- **Docker**: add `--ulimit nofile=65536:65536` to your `docker run` command, or in `docker-compose.yml`:
+```yaml
+ulimits:
+  nofile:
+    soft: 65536
+    hard: 65536
+```
+- **System-wide** (optional): add to `/etc/security/limits.conf`:
+```
+*       soft    nofile  1048576
+*       hard    nofile  1048576
+root    soft    nofile  1048576
+root    hard    nofile  1048576
+```
 
 
 ## Build
@@ -427,12 +446,13 @@ docker run --name telemt --restart unless-stopped \
   -v "$PWD/config.toml:/app/config.toml:ro" \
   --read-only \
   --cap-drop ALL --cap-add NET_BIND_SERVICE \
+  --ulimit nofile=65536:65536 \
   telemt:local
 ```
 
 ## Why Rust?
 - Long-running reliability and idempotent behavior
-- Rust’s deterministic resource management - RAII 
+- Rust's deterministic resource management - RAII 
 - No garbage collector
 - Memory safety and reduced attack surface
 - Tokio's asynchronous architecture
