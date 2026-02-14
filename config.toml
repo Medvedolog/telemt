@@ -64,6 +64,9 @@ hello = "00000000000000000000000000000000"
 # [access.user_max_tcp_conns]
 # hello = 50
 
+# [access.user_max_unique_ips]
+# hello = 5  
+
 # [access.user_data_quota]
 # hello = 1073741824 # 1 GB
 
