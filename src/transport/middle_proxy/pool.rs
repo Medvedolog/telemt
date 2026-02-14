@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
 
-use crate::crypto::{SecureRandom, derive_middleproxy_keys, sha256};
+use crate::crypto::{SecureRandom, build_middleproxy_prekey, derive_middleproxy_keys, sha256};
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
 
@@ -35,6 +35,8 @@ pub struct MePool {
     proxy_secret: Vec<u8>,
     pub(super) nat_ip_cfg: Option<IpAddr>,
     pub(super) nat_ip_detected: OnceLock<IpAddr>,
+    pub(super) nat_probe: bool,
+    pub(super) nat_stun: Option<String>,
     pool_size: usize,
 }
 
@@ -43,6 +45,8 @@ impl MePool {
         proxy_tag: Option<Vec<u8>>,
         proxy_secret: Vec<u8>,
         nat_ip: Option<IpAddr>,
+        nat_probe: bool,
+        nat_stun: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::new(ConnRegistry::new()),
@@ -52,6 +56,8 @@ impl MePool {
             proxy_secret,
             nat_ip_cfg: nat_ip,
             nat_ip_detected: OnceLock::new(),
+            nat_probe,
+            nat_stun,
             pool_size: 2,
         })
     }
@@ -143,7 +149,12 @@ impl MePool {
         let local_addr = stream.local_addr().map_err(ProxyError::Io)?;
         let peer_addr = stream.peer_addr().map_err(ProxyError::Io)?;
         let _ = self.maybe_detect_nat_ip(local_addr.ip()).await;
-        let local_addr_nat = self.translate_our_addr(local_addr);
+        let reflected = if self.nat_probe {
+            self.maybe_reflect_public_addr().await
+        } else {
+            None
+        };
+        let local_addr_nat = self.translate_our_addr_with_reflection(local_addr, reflected);
         let peer_addr_nat =
             SocketAddr::new(self.translate_ip_for_nat(peer_addr.ip()), peer_addr.port());
         let (mut rd, mut wr) = tokio::io::split(stream);
@@ -205,6 +216,7 @@ impl MePool {
         info!(
             %local_addr,
             %local_addr_nat,
+            reflected_ip = reflected.map(|r| r.ip()).as_ref().map(ToString::to_string),
             %peer_addr,
             %peer_addr_nat,
             key_selector = format_args!("0x{ks:08x}"),
@@ -237,6 +249,38 @@ impl MePool {
                 }
             };
 
+        let diag_level: u8 = std::env::var("ME_DIAG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let prekey_client = build_middleproxy_prekey(
+            &srv_nonce,
+            &my_nonce,
+            &ts_bytes,
+            srv_ip_opt.as_ref().map(|x| &x[..]),
+            &client_port_bytes,
+            b"CLIENT",
+            clt_ip_opt.as_ref().map(|x| &x[..]),
+            &server_port_bytes,
+            secret,
+            clt_v6_opt.as_ref(),
+            srv_v6_opt.as_ref(),
+        );
+        let prekey_server = build_middleproxy_prekey(
+            &srv_nonce,
+            &my_nonce,
+            &ts_bytes,
+            srv_ip_opt.as_ref().map(|x| &x[..]),
+            &client_port_bytes,
+            b"SERVER",
+            clt_ip_opt.as_ref().map(|x| &x[..]),
+            &server_port_bytes,
+            secret,
+            clt_v6_opt.as_ref(),
+            srv_v6_opt.as_ref(),
+        );
+
         let (wk, wi) = derive_middleproxy_keys(
             &srv_nonce,
             &my_nonce,
@@ -264,24 +308,39 @@ impl MePool {
             srv_v6_opt.as_ref(),
         );
 
-        let diag = std::env::var("ME_DIAG").map(|v| v == "1").unwrap_or(false);
         let hs_payload =
             build_handshake_payload(hs_our_ip, local_addr.port(), hs_peer_ip, peer_addr.port());
         let hs_frame = build_rpc_frame(-1, &hs_payload);
-        if diag {
+        if diag_level >= 1 {
             info!(
                 write_key = %hex_dump(&wk),
                 write_iv = %hex_dump(&wi),
                 read_key = %hex_dump(&rk),
                 read_iv = %hex_dump(&ri),
+                srv_ip = %srv_ip_opt.map(|ip| hex_dump(&ip)).unwrap_or_default(),
+                clt_ip = %clt_ip_opt.map(|ip| hex_dump(&ip)).unwrap_or_default(),
+                srv_port = %hex_dump(&server_port_bytes),
+                clt_port = %hex_dump(&client_port_bytes),
+                crypto_ts = %hex_dump(&ts_bytes),
+                nonce_srv = %hex_dump(&srv_nonce),
+                nonce_clt = %hex_dump(&my_nonce),
+                prekey_sha256_client = %hex_dump(&sha256(&prekey_client)),
+                prekey_sha256_server = %hex_dump(&sha256(&prekey_server)),
                 hs_plain = %hex_dump(&hs_frame),
                 proxy_secret_sha256 = %hex_dump(&sha256(secret)),
                 "ME diag: derived keys and handshake plaintext"
             );
         }
+        if diag_level >= 2 {
+            info!(
+                prekey_client = %hex_dump(&prekey_client),
+                prekey_server = %hex_dump(&prekey_server),
+                "ME diag: full prekey buffers"
+            );
+        }
 
         let (encrypted_hs, write_iv) = cbc_encrypt_padded(&wk, &wi, &hs_frame)?;
-        if diag {
+        if diag_level >= 1 {
             info!(
                 hs_cipher = %hex_dump(&encrypted_hs),
                 "ME diag: handshake ciphertext"

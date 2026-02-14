@@ -8,42 +8,47 @@ use crate::error::{ProxyError, Result};
 pub async fn fetch_proxy_secret(cache_path: Option<&str>) -> Result<Vec<u8>> {
     let cache = cache_path.unwrap_or("proxy-secret");
 
-    if let Ok(metadata) = tokio::fs::metadata(cache).await {
-        if let Ok(modified) = metadata.modified() {
-            let age = std::time::SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or(Duration::from_secs(u64::MAX));
-            if age < Duration::from_secs(86_400) {
-                if let Ok(data) = tokio::fs::read(cache).await {
-                    if data.len() >= 32 {
-                        info!(
-                            path = cache,
-                            len = data.len(),
-                            age_hours = age.as_secs() / 3600,
-                            "Loaded proxy-secret from cache"
-                        );
-                        return Ok(data);
-                    }
-                    warn!(
-                        path = cache,
-                        len = data.len(),
-                        "Cached proxy-secret too short"
-                    );
-                }
+    // 1) Try fresh download first.
+    match download_proxy_secret().await {
+        Ok(data) => {
+            if let Err(e) = tokio::fs::write(cache, &data).await {
+                warn!(error = %e, "Failed to cache proxy-secret (non-fatal)");
+            } else {
+                debug!(path = cache, len = data.len(), "Cached proxy-secret");
             }
+            return Ok(data);
+        }
+        Err(download_err) => {
+            warn!(error = %download_err, "Proxy-secret download failed, trying cache/file fallback");
+            // Fall through to cache/file.
         }
     }
 
-    info!("Downloading proxy-secret from core.telegram.org...");
-    let data = download_proxy_secret().await?;
-
-    if let Err(e) = tokio::fs::write(cache, &data).await {
-        warn!(error = %e, "Failed to cache proxy-secret (non-fatal)");
-    } else {
-        debug!(path = cache, len = data.len(), "Cached proxy-secret");
+    // 2) Fallback to cache/file regardless of age; require len>=32.
+    match tokio::fs::read(cache).await {
+        Ok(data) if data.len() >= 32 => {
+            let age_hours = tokio::fs::metadata(cache)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+                .map(|d| d.as_secs() / 3600);
+            info!(
+                path = cache,
+                len = data.len(),
+                age_hours,
+                "Loaded proxy-secret from cache/file after download failure"
+            );
+            Ok(data)
+        }
+        Ok(data) => Err(ProxyError::Proxy(format!(
+            "Cached proxy-secret too short: {} bytes (need >= 32)",
+            data.len()
+        ))),
+        Err(e) => Err(ProxyError::Proxy(format!(
+            "Failed to read proxy-secret cache after download failure: {e}"
+        ))),
     }
-
-    Ok(data)
 }
 
 async fn download_proxy_secret() -> Result<Vec<u8>> {

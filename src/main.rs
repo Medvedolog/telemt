@@ -229,7 +229,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "Proxy-secret loaded"
                 );
 
-                let pool = MePool::new(proxy_tag, proxy_secret, config.general.middle_proxy_nat_ip);
+                let pool = MePool::new(
+                    proxy_tag,
+                    proxy_secret,
+                    config.general.middle_proxy_nat_ip,
+                    config.general.middle_proxy_nat_probe,
+                    config.general.middle_proxy_nat_stun.clone(),
+                );
 
                 match pool.init(2, &rng).await {
                     Ok(()) => {

@@ -154,6 +154,14 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub middle_proxy_nat_ip: Option<IpAddr>,
 
+    /// Enable STUN-based NAT probing to discover public IP:port for ME KDF.
+    #[serde(default)]
+    pub middle_proxy_nat_probe: bool,
+
+    /// Optional STUN server address (host:port) for NAT probing.
+    #[serde(default)]
+    pub middle_proxy_nat_stun: Option<String>,
+
     #[serde(default)]
     pub log_level: LogLevel,
 }
@@ -168,6 +176,8 @@ impl Default for GeneralConfig {
             ad_tag: None,
             proxy_secret_path: None,
             middle_proxy_nat_ip: None,
+            middle_proxy_nat_probe: false,
+            middle_proxy_nat_stun: None,
             log_level: LogLevel::Normal,
         }
     }
