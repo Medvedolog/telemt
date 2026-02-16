@@ -29,7 +29,10 @@ use crate::ip_tracker::UserIpTracker;
 use crate::proxy::ClientHandler;
 use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
-use crate::transport::middle_proxy::{MePool, fetch_proxy_config, stun_probe};
+use crate::transport::middle_proxy::{
+    MePool, fetch_proxy_config, run_me_ping, MePingFamily, MePingSample, format_sample_line,
+    stun_probe,
+};
 use crate::transport::{ListenOptions, UpstreamManager, create_listener};
 use crate::util::ip::detect_ip;
 use crate::protocol::constants::{TG_MIDDLE_PROXIES_V4, TG_MIDDLE_PROXIES_V6};
@@ -386,6 +389,71 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         info!("Transport: Middle Proxy (supports all DCs including CDN)");
     } else {
         info!("Transport: Direct TCP (standard DCs only)");
+    }
+
+    // Middle-End ping before DC connectivity
+    if let Some(ref pool) = me_pool {
+        let me_results = run_me_ping(pool, &rng).await;
+
+        let v4_ok = me_results.iter().any(|r| {
+            matches!(r.family, MePingFamily::V4)
+                && r.samples.iter().any(|s| s.error.is_none() && s.handshake_ms.is_some())
+        });
+        let v6_ok = me_results.iter().any(|r| {
+            matches!(r.family, MePingFamily::V6)
+                && r.samples.iter().any(|s| s.error.is_none() && s.handshake_ms.is_some())
+        });
+
+        info!("================= Telegram ME Connectivity =================");
+        if v4_ok && v6_ok {
+            info!("  IPv4 and IPv6 available");
+        } else if v4_ok {
+            info!("  IPv4 only / IPv6 unavailable");
+        } else if v6_ok {
+            info!("  IPv6 only / IPv4 unavailable");
+        } else {
+            info!("  No ME connectivity");
+        }
+        info!("  via direct");
+        info!("============================================================");
+
+        use std::collections::BTreeMap;
+        let mut grouped: BTreeMap<i32, Vec<MePingSample>> = BTreeMap::new();
+        for report in me_results {
+            for s in report.samples {
+                let key = s.dc.abs();
+                grouped.entry(key).or_default().push(s);
+            }
+        }
+
+        let family_order = if prefer_ipv6 {
+            vec![(MePingFamily::V6, true), (MePingFamily::V6, false), (MePingFamily::V4, true), (MePingFamily::V4, false)]
+        } else {
+            vec![(MePingFamily::V4, true), (MePingFamily::V4, false), (MePingFamily::V6, true), (MePingFamily::V6, false)]
+        };
+
+        for (dc_abs, samples) in grouped {
+            for (family, is_pos) in &family_order {
+                let fam_samples: Vec<&MePingSample> = samples
+                    .iter()
+                    .filter(|s| matches!(s.family, f if &f == family) && (s.dc >= 0) == *is_pos)
+                    .collect();
+                if fam_samples.is_empty() {
+                    continue;
+                }
+
+                let fam_label = match family {
+                    MePingFamily::V4 => "IPv4",
+                    MePingFamily::V6 => "IPv6",
+                };
+                info!("    DC{} [{}]", dc_abs, fam_label);
+                for sample in fam_samples {
+                    let line = format_sample_line(sample);
+                    info!("{}", line);
+                }
+            }
+        }
+        info!("============================================================");
     }
 
     info!("================= Telegram DC Connectivity =================");
