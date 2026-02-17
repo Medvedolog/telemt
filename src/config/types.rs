@@ -403,6 +403,10 @@ pub struct UpstreamConfig {
     pub weight: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub scopes: String,
+    #[serde(skip)]
+    pub selected_scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

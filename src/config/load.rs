@@ -208,6 +208,8 @@ impl ProxyConfig {
                 upstream_type: UpstreamType::Direct { interface: None },
                 weight: 1,
                 enabled: true,
+                scopes: String::new(),
+                selected_scope: String::new(),
             });
         }
 
