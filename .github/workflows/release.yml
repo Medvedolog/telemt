@@ -56,12 +56,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
       - name: Build Release
-        uses: actions-rs/cargo@ae10961054e4aa8bff448f48a500763b90d5c550 # v1.0.1
-        with:
-          use-cross: true
-          command: build
-          args: --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
