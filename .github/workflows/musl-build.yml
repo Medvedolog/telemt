@@ -21,8 +21,8 @@ jobs:
             artifact_name: telemt-aarch64-linux-musl
 
     env:
-      # Включаем статическую линковку только для musl-таргетов
       RUSTFLAGS: "-C target-feature=+crt-static"
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
     steps:
       - name: Checkout
@@ -32,10 +32,16 @@ jobs:
           ref: "3.0.3"
           fetch-depth: 0
 
-      - name: Install musl tools
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools and cross-compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
 
       - name: Build (cargo)
         run: |
@@ -45,14 +51,8 @@ jobs:
         run: |
           mkdir -p out
           cp target/${{ matrix.target }}/release/telemt out/${{ matrix.artifact_name }}
-          tar -C out -czf ${{
-            matrix.artifact_name
-          }}.tar.gz ${{ matrix.artifact_name }}
-          sha256sum ${{
-            matrix.artifact_name
-          }}.tar.gz > ${{
-            matrix.artifact_name
-          }}.tar.gz.sha256
+          tar -C out -czf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
