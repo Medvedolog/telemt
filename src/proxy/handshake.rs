@@ -14,7 +14,6 @@ use crate::error::{ProxyError, HandshakeResult};
 use crate::stats::ReplayChecker;
 use crate::config::ProxyConfig;
 use crate::tls_front::{TlsFrontCache, emulator};
-use crate::tls_front::types::CachedTlsData;
 
 /// Result of successful handshake
 ///
