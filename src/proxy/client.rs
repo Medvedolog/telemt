@@ -51,6 +51,7 @@ pub async fn handle_client_stream<S>(
     me_pool: Option<Arc<MePool>>,
     tls_cache: Option<Arc<TlsFrontCache>>,
     ip_tracker: Arc<UserIpTracker>,
+    proxy_protocol_enabled: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -58,7 +59,7 @@ where
     stats.increment_connects_all();
     let mut real_peer = normalize_ip(peer);
 
-    if config.server.proxy_protocol {
+    if proxy_protocol_enabled {
         match parse_proxy_protocol(&mut stream, peer).await {
             Ok(info) => {
                 debug!(
@@ -229,6 +230,7 @@ pub struct RunningClientHandler {
     me_pool: Option<Arc<MePool>>,
     tls_cache: Option<Arc<TlsFrontCache>>,
     ip_tracker: Arc<UserIpTracker>,
+    proxy_protocol_enabled: bool,
 }
 
 impl ClientHandler {
@@ -244,6 +246,7 @@ impl ClientHandler {
         me_pool: Option<Arc<MePool>>,
         tls_cache: Option<Arc<TlsFrontCache>>,
         ip_tracker: Arc<UserIpTracker>,
+        proxy_protocol_enabled: bool,
     ) -> RunningClientHandler {
         RunningClientHandler {
             stream,
@@ -257,6 +260,7 @@ impl ClientHandler {
             me_pool,
             tls_cache,
             ip_tracker,
+            proxy_protocol_enabled,
         }
     }
 }
@@ -303,7 +307,7 @@ impl RunningClientHandler {
     }
 
     async fn do_handshake(mut self) -> Result<HandshakeOutcome> {
-        if self.config.server.proxy_protocol {
+        if self.proxy_protocol_enabled {
             match parse_proxy_protocol(&mut self.stream, self.peer).await {
                 Ok(info) => {
                     debug!(

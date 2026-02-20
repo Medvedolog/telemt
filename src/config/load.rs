@@ -226,6 +226,7 @@ impl ProxyConfig {
                     ip: ipv4,
                     announce: None,
                     announce_ip: None,
+                    proxy_protocol: None,
                 });
             }
             if let Some(ipv6_str) = &config.server.listen_addr_ipv6 {
@@ -234,6 +235,7 @@ impl ProxyConfig {
                         ip: ipv6,
                         announce: None,
                         announce_ip: None,
+                        proxy_protocol: None,
                     });
                 }
             }

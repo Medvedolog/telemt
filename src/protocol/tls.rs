@@ -755,4 +755,65 @@ mod tests {
         // Should return None (no match) but not panic
         assert!(result.is_none());
     }
+
+    fn build_client_hello_with_exts(exts: Vec<(u16, Vec<u8>)>, host: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS_VERSION); // legacy version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session id len
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites len
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(1); // compression len
+        body.push(0); // null compression
+
+        // Build SNI extension
+        let host_bytes = host.as_bytes();
+        let mut sni_ext = Vec::new();
+        sni_ext.extend_from_slice(&(host_bytes.len() as u16 + 3).to_be_bytes());
+        sni_ext.push(0);
+        sni_ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(host_bytes);
+
+        let mut ext_blob = Vec::new();
+        for (typ, data) in exts {
+            ext_blob.extend_from_slice(&typ.to_be_bytes());
+            ext_blob.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            ext_blob.extend_from_slice(&data);
+        }
+        // SNI last
+        ext_blob.extend_from_slice(&0x0000u16.to_be_bytes());
+        ext_blob.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        ext_blob.extend_from_slice(&sni_ext);
+
+        body.extend_from_slice(&(ext_blob.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext_blob);
+
+        let mut handshake = Vec::new();
+        handshake.push(0x01); // ClientHello
+        let len_bytes = (body.len() as u32).to_be_bytes();
+        handshake.extend_from_slice(&len_bytes[1..4]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(TLS_RECORD_HANDSHAKE);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn test_extract_sni_with_grease_extension() {
+        // GREASE type 0x0a0a with zero length before SNI
+        let ch = build_client_hello_with_exts(vec![(0x0a0a, Vec::new())], "example.com");
+        let sni = extract_sni_from_client_hello(&ch);
+        assert_eq!(sni.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_extract_sni_tolerates_empty_unknown_extension() {
+        let ch = build_client_hello_with_exts(vec![(0x1234, Vec::new())], "test.local");
+        let sni = extract_sni_from_client_hello(&ch);
+        assert_eq!(sni.as_deref(), Some("test.local"));
+    }
 }

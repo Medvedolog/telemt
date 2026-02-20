@@ -699,6 +699,8 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
             Ok(socket) => {
                 let listener = TcpListener::from_std(socket.into())?;
                 info!("Listening on {}", addr);
+                let listener_proxy_protocol =
+                    listener_conf.proxy_protocol.unwrap_or(config.server.proxy_protocol);
 
                 // Resolve the public host for link generation
                 let public_host = if let Some(ref announce) = listener_conf.announce {
@@ -724,7 +726,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                     print_proxy_links(&public_host, link_port, &config);
                 }
 
-                listeners.push(listener);
+                listeners.push((listener, listener_proxy_protocol));
             }
             Err(e) => {
                 error!("Failed to bind to {}: {}", addr, e);
@@ -810,12 +812,13 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                         let me_pool = me_pool.clone();
                         let tls_cache = tls_cache.clone();
                         let ip_tracker = ip_tracker.clone();
+                        let proxy_protocol_enabled = config.server.proxy_protocol;
 
                         tokio::spawn(async move {
                             if let Err(e) = crate::proxy::client::handle_client_stream(
                                 stream, fake_peer, config, stats,
                                 upstream_manager, replay_checker, buffer_pool, rng,
-                                me_pool, tls_cache, ip_tracker,
+                                me_pool, tls_cache, ip_tracker, proxy_protocol_enabled,
                             ).await {
                                 debug!(error = %e, "Unix socket connection error");
                             }
@@ -855,7 +858,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         });
     }
 
-    for listener in listeners {
+    for (listener, listener_proxy_protocol) in listeners {
         let config = config.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
@@ -879,6 +882,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                         let me_pool = me_pool.clone();
                         let tls_cache = tls_cache.clone();
                         let ip_tracker = ip_tracker.clone();
+                        let proxy_protocol_enabled = listener_proxy_protocol;
 
                         tokio::spawn(async move {
                             if let Err(e) = ClientHandler::new(
@@ -893,6 +897,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                                 me_pool,
                                 tls_cache,
                                 ip_tracker,
+                                proxy_protocol_enabled,
                             )
                             .run()
                             .await

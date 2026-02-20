@@ -513,6 +513,9 @@ pub struct ListenerConfig {
     /// Migrated to `announce` automatically if `announce` is not set.
     #[serde(default)]
     pub announce_ip: Option<IpAddr>,
+    /// Per-listener PROXY protocol override. When set, overrides global server.proxy_protocol.
+    #[serde(default)]
+    pub proxy_protocol: Option<bool>,
 }
 
 // ============= ShowLink =============
