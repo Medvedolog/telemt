@@ -74,6 +74,34 @@ where
                             trace!(conn_id, bytes = data.len(), flags, "ME->C data");
                             stats_clone.add_user_octets_to(&user_clone, data.len() as u64);
                             write_client_payload(&mut writer, proto_tag, flags, &data, rng_clone.as_ref()).await?;
+
+                            // Drain all immediately queued ME responses and flush once.
+                            while let Ok(next) = me_rx_task.try_recv() {
+                                match next {
+                                    MeResponse::Data { flags, data } => {
+                                        trace!(conn_id, bytes = data.len(), flags, "ME->C data (batched)");
+                                        stats_clone.add_user_octets_to(&user_clone, data.len() as u64);
+                                        write_client_payload(
+                                            &mut writer,
+                                            proto_tag,
+                                            flags,
+                                            &data,
+                                            rng_clone.as_ref(),
+                                        ).await?;
+                                    }
+                                    MeResponse::Ack(confirm) => {
+                                        trace!(conn_id, confirm, "ME->C quickack (batched)");
+                                        write_client_ack(&mut writer, proto_tag, confirm).await?;
+                                    }
+                                    MeResponse::Close => {
+                                        debug!(conn_id, "ME sent close (batched)");
+                                        let _ = writer.flush().await;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+
+                            writer.flush().await.map_err(ProxyError::Io)?;
                         }
                         Some(MeResponse::Ack(confirm)) => {
                             trace!(conn_id, confirm, "ME->C quickack");
@@ -81,6 +109,7 @@ where
                         }
                         Some(MeResponse::Close) => {
                             debug!(conn_id, "ME sent close");
+                            let _ = writer.flush().await;
                             return Ok(());
                         }
                         None => {
@@ -99,8 +128,15 @@ where
 
     let mut main_result: Result<()> = Ok(());
     let mut client_closed = false;
+    let mut frame_counter: u64 = 0;
     loop {
-        match read_client_payload(&mut crypto_reader, proto_tag, frame_limit, &user).await {
+        match read_client_payload(
+            &mut crypto_reader,
+            proto_tag,
+            frame_limit,
+            &user,
+            &mut frame_counter,
+        ).await {
             Ok(Some((payload, quickack))) => {
                 trace!(conn_id, bytes = payload.len(), "C->ME frame");
                 stats.add_user_octets_from(&user, payload.len() as u64);
@@ -168,73 +204,111 @@ async fn read_client_payload<R>(
     proto_tag: ProtoTag,
     max_frame: usize,
     user: &str,
+    frame_counter: &mut u64,
 ) -> Result<Option<(Vec<u8>, bool)>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let (len, quickack) = match proto_tag {
-        ProtoTag::Abridged => {
-            let mut first = [0u8; 1];
-            match client_reader.read_exact(&mut first).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(ProxyError::Io(e)),
+    loop {
+        let (len, quickack, raw_len_bytes) = match proto_tag {
+            ProtoTag::Abridged => {
+                let mut first = [0u8; 1];
+                match client_reader.read_exact(&mut first).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(ProxyError::Io(e)),
+                }
+
+                let quickack = (first[0] & 0x80) != 0;
+                let len_words = if (first[0] & 0x7f) == 0x7f {
+                    let mut ext = [0u8; 3];
+                    client_reader
+                        .read_exact(&mut ext)
+                        .await
+                        .map_err(ProxyError::Io)?;
+                    u32::from_le_bytes([ext[0], ext[1], ext[2], 0]) as usize
+                } else {
+                    (first[0] & 0x7f) as usize
+                };
+
+                let len = len_words
+                    .checked_mul(4)
+                    .ok_or_else(|| ProxyError::Proxy("Abridged frame length overflow".into()))?;
+                (len, quickack, None)
             }
-
-            let quickack = (first[0] & 0x80) != 0;
-            let len_words = if (first[0] & 0x7f) == 0x7f {
-                let mut ext = [0u8; 3];
-                client_reader
-                    .read_exact(&mut ext)
-                    .await
-                    .map_err(ProxyError::Io)?;
-                u32::from_le_bytes([ext[0], ext[1], ext[2], 0]) as usize
-            } else {
-                (first[0] & 0x7f) as usize
-            };
-
-            let len = len_words
-                .checked_mul(4)
-                .ok_or_else(|| ProxyError::Proxy("Abridged frame length overflow".into()))?;
-            (len, quickack)
-        }
-        ProtoTag::Intermediate | ProtoTag::Secure => {
-            let mut len_buf = [0u8; 4];
-            match client_reader.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(ProxyError::Io(e)),
+            ProtoTag::Intermediate | ProtoTag::Secure => {
+                let mut len_buf = [0u8; 4];
+                match client_reader.read_exact(&mut len_buf).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(ProxyError::Io(e)),
+                }
+                let quickack = (len_buf[3] & 0x80) != 0;
+                (
+                    (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize,
+                    quickack,
+                    Some(len_buf),
+                )
             }
-            let quickack = (len_buf[3] & 0x80) != 0;
-            ((u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize, quickack)
+        };
+
+        if len == 0 {
+            continue;
         }
-    };
-
-    if len > max_frame {
-        warn!(
-            user = %user,
-            raw_len = len,
-            raw_len_hex = format_args!("0x{:08x}", len),
-            proto = ?proto_tag,
-            "Frame too large — possible crypto desync or TLS record error"
-        );
-        return Err(ProxyError::Proxy(format!("Frame too large: {len} (max {max_frame})")));
-    }
-
-    let mut payload = vec![0u8; len];
-    client_reader
-        .read_exact(&mut payload)
-        .await
-        .map_err(ProxyError::Io)?;
-
-    // Secure Intermediate: remove random padding (last len%4 bytes)
-    if proto_tag == ProtoTag::Secure {
-        let rem = len % 4;
-        if rem != 0 && payload.len() >= rem {
-            payload.truncate(len - rem);
+        if len < 4 && proto_tag != ProtoTag::Abridged {
+            warn!(
+                user = %user,
+                len,
+                proto = ?proto_tag,
+                "Frame too small — corrupt or probe"
+            );
+            return Err(ProxyError::Proxy(format!("Frame too small: {len}")));
         }
+
+        if len > max_frame {
+            let len_buf = raw_len_bytes.unwrap_or((len as u32).to_le_bytes());
+            let looks_like_tls = raw_len_bytes
+                .map(|b| b[0] == 0x16 && b[1] == 0x03)
+                .unwrap_or(false);
+            let looks_like_http = raw_len_bytes
+                .map(|b| matches!(b[0], b'G' | b'P' | b'H' | b'C' | b'D'))
+                .unwrap_or(false);
+            warn!(
+                user = %user,
+                raw_len = len,
+                raw_len_hex = format_args!("0x{:08x}", len),
+                raw_bytes = format_args!(
+                    "{:02x} {:02x} {:02x} {:02x}",
+                    len_buf[0], len_buf[1], len_buf[2], len_buf[3]
+                ),
+                proto = ?proto_tag,
+                tls_like = looks_like_tls,
+                http_like = looks_like_http,
+                frames_ok = *frame_counter,
+                "Frame too large — crypto desync forensics"
+            );
+            return Err(ProxyError::Proxy(format!(
+                "Frame too large: {len} (max {max_frame}), frames_ok={}",
+                *frame_counter
+            )));
+        }
+
+        let mut payload = vec![0u8; len];
+        client_reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(ProxyError::Io)?;
+
+        // Secure Intermediate: remove random padding (last len%4 bytes)
+        if proto_tag == ProtoTag::Secure {
+            let rem = len % 4;
+            if rem != 0 && payload.len() >= rem {
+                payload.truncate(len - rem);
+            }
+        }
+        *frame_counter += 1;
+        return Ok(Some((payload, quickack)));
     }
-    Ok(Some((payload, quickack)))
 }
 
 async fn write_client_payload<W>(
@@ -264,8 +338,11 @@ where
                 if quickack {
                     first |= 0x80;
                 }
+                let mut frame_buf = Vec::with_capacity(1 + data.len());
+                frame_buf.push(first);
+                frame_buf.extend_from_slice(data);
                 client_writer
-                    .write_all(&[first])
+                    .write_all(&frame_buf)
                     .await
                     .map_err(ProxyError::Io)?;
             } else if len_words < (1 << 24) {
@@ -274,8 +351,11 @@ where
                     first |= 0x80;
                 }
                 let lw = (len_words as u32).to_le_bytes();
+                let mut frame_buf = Vec::with_capacity(4 + data.len());
+                frame_buf.extend_from_slice(&[first, lw[0], lw[1], lw[2]]);
+                frame_buf.extend_from_slice(data);
                 client_writer
-                    .write_all(&[first, lw[0], lw[1], lw[2]])
+                    .write_all(&frame_buf)
                     .await
                     .map_err(ProxyError::Io)?;
             } else {
@@ -284,11 +364,6 @@ where
                     data.len()
                 )));
             }
-
-            client_writer
-                .write_all(data)
-                .await
-                .map_err(ProxyError::Io)?;
         }
         ProtoTag::Intermediate | ProtoTag::Secure => {
             let padding_len = if proto_tag == ProtoTag::Secure {
@@ -296,33 +371,22 @@ where
             } else {
                 0
             };
-            let mut len = (data.len() + padding_len) as u32;
+            let mut len_val = (data.len() + padding_len) as u32;
             if quickack {
-                len |= 0x8000_0000;
+                len_val |= 0x8000_0000;
             }
-            client_writer
-                .write_all(&len.to_le_bytes())
-                .await
-                .map_err(ProxyError::Io)?;
-            client_writer
-                .write_all(data)
-                .await
-                .map_err(ProxyError::Io)?;
+            let total = 4 + data.len() + padding_len;
+            let mut frame_buf = Vec::with_capacity(total);
+            frame_buf.extend_from_slice(&len_val.to_le_bytes());
+            frame_buf.extend_from_slice(data);
             if padding_len > 0 {
-                let pad = rng.bytes(padding_len);
-                client_writer
-                    .write_all(&pad)
-                    .await
-                    .map_err(ProxyError::Io)?;
+                frame_buf.extend_from_slice(&rng.bytes(padding_len));
             }
+            client_writer
+                .write_all(&frame_buf)
+                .await
+                .map_err(ProxyError::Io)?;
         }
-    }
-
-    // Avoid unconditional per-frame flush (throughput killer on large downloads).
-    // Flush only when low-latency ack semantics are requested or when
-    // CryptoWriter has buffered pending ciphertext that must be drained.
-    if quickack || client_writer.has_pending() {
-        client_writer.flush().await.map_err(ProxyError::Io)?;
     }
 
     Ok(())
