@@ -15,7 +15,7 @@ use crate::tls_front::types::{CachedTlsData, ParsedServerHello, TlsFetchResult};
 pub struct TlsFrontCache {
     memory: RwLock<HashMap<String, Arc<CachedTlsData>>>,
     default: Arc<CachedTlsData>,
-    full_cert_sent: RwLock<HashMap<(String, IpAddr), Instant>>,
+    full_cert_sent: RwLock<HashMap<IpAddr, Instant>>,
     disk_path: PathBuf,
 }
 
@@ -62,11 +62,10 @@ impl TlsFrontCache {
         self.memory.read().await.contains_key(domain)
     }
 
-    /// Returns true when full cert payload should be sent for (domain, client_ip)
+    /// Returns true when full cert payload should be sent for client_ip
     /// according to TTL policy.
     pub async fn take_full_cert_budget_for_ip(
         &self,
-        domain: &str,
         client_ip: IpAddr,
         ttl: Duration,
     ) -> bool {
@@ -74,7 +73,7 @@ impl TlsFrontCache {
             self.full_cert_sent
                 .write()
                 .await
-                .insert((domain.to_string(), client_ip), Instant::now());
+                .insert(client_ip, Instant::now());
             return true;
         }
 
@@ -82,8 +81,7 @@ impl TlsFrontCache {
         let mut guard = self.full_cert_sent.write().await;
         guard.retain(|_, seen_at| now.duration_since(*seen_at) < ttl);
 
-        let key = (domain.to_string(), client_ip);
-        match guard.get_mut(&key) {
+        match guard.get_mut(&client_ip) {
             Some(seen_at) => {
                 if now.duration_since(*seen_at) >= ttl {
                     *seen_at = now;
@@ -93,7 +91,7 @@ impl TlsFrontCache {
                 }
             }
             None => {
-                guard.insert(key, now);
+                guard.insert(client_ip, now);
                 true
             }
         }
@@ -223,16 +221,16 @@ mod tests {
         let ttl = Duration::from_millis(80);
 
         assert!(cache
-            .take_full_cert_budget_for_ip("example.com", ip, ttl)
+            .take_full_cert_budget_for_ip(ip, ttl)
             .await);
         assert!(!cache
-            .take_full_cert_budget_for_ip("example.com", ip, ttl)
+            .take_full_cert_budget_for_ip(ip, ttl)
             .await);
 
         tokio::time::sleep(Duration::from_millis(90)).await;
 
         assert!(cache
-            .take_full_cert_budget_for_ip("example.com", ip, ttl)
+            .take_full_cert_budget_for_ip(ip, ttl)
             .await);
     }
 
@@ -247,10 +245,10 @@ mod tests {
         let ttl = Duration::ZERO;
 
         assert!(cache
-            .take_full_cert_budget_for_ip("example.com", ip, ttl)
+            .take_full_cert_budget_for_ip(ip, ttl)
             .await);
         assert!(cache
-            .take_full_cert_budget_for_ip("example.com", ip, ttl)
+            .take_full_cert_budget_for_ip(ip, ttl)
             .await);
     }
 }

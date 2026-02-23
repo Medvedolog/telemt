@@ -121,7 +121,6 @@ where
             let cached_entry = cache.get(&selected_domain).await;
             let use_full_cert_payload = cache
                 .take_full_cert_budget_for_ip(
-                    &selected_domain,
                     peer.ip(),
                     Duration::from_secs(config.censorship.tls_full_cert_ttl_secs),
                 )
