@@ -10,6 +10,7 @@
 //! | `general` | `ad_tag`                      | Passed on next connection         |
 //! | `general` | `middle_proxy_pool_size`      | Passed on next connection         |
 //! | `general` | `me_keepalive_*`              | Passed on next connection         |
+//! | `general` | `desync_all_full`             | Applied immediately               |
 //! | `access`  | All user/quota fields         | Effective immediately             |
 //!
 //! Fields that require re-binding sockets (`server.port`, `censorship.*`,
@@ -34,6 +35,7 @@ pub struct HotFields {
     pub log_level:               LogLevel,
     pub ad_tag:                  Option<String>,
     pub middle_proxy_pool_size:  usize,
+    pub desync_all_full:         bool,
     pub me_keepalive_enabled:    bool,
     pub me_keepalive_interval_secs: u64,
     pub me_keepalive_jitter_secs:   u64,
@@ -47,6 +49,7 @@ impl HotFields {
             log_level:               cfg.general.log_level.clone(),
             ad_tag:                  cfg.general.ad_tag.clone(),
             middle_proxy_pool_size:  cfg.general.middle_proxy_pool_size,
+            desync_all_full:         cfg.general.desync_all_full,
             me_keepalive_enabled:    cfg.general.me_keepalive_enabled,
             me_keepalive_interval_secs: cfg.general.me_keepalive_interval_secs,
             me_keepalive_jitter_secs:   cfg.general.me_keepalive_jitter_secs,
@@ -172,6 +175,13 @@ fn log_changes(
         info!(
             "config reload: middle_proxy_pool_size: {} → {}",
             old_hot.middle_proxy_pool_size, new_hot.middle_proxy_pool_size,
+        );
+    }
+
+    if old_hot.desync_all_full != new_hot.desync_all_full {
+        info!(
+            "config reload: desync_all_full: {} → {}",
+            old_hot.desync_all_full, new_hot.desync_all_full,
         );
     }
 

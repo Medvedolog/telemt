@@ -118,6 +118,10 @@ pub(crate) fn default_max_client_frame() -> usize {
     16 * 1024 * 1024
 }
 
+pub(crate) fn default_desync_all_full() -> bool {
+    false
+}
+
 pub(crate) fn default_tls_new_session_tickets() -> u8 {
     0
 }

@@ -201,6 +201,11 @@ pub struct GeneralConfig {
     #[serde(default = "default_max_client_frame")]
     pub max_client_frame: usize,
 
+    /// Emit full crypto-desync forensic logs for every event.
+    /// When false, full forensic details are emitted once per key window.
+    #[serde(default = "default_desync_all_full")]
+    pub desync_all_full: bool,
+
     /// Enable staggered warmup of extra ME writers.
     #[serde(default = "default_true")]
     pub me_warmup_stagger_enabled: bool,
@@ -310,6 +315,7 @@ impl Default for GeneralConfig {
             links: LinksConfig::default(),
             crypto_pending_buffer: default_crypto_pending_buffer(),
             max_client_frame: default_max_client_frame(),
+            desync_all_full: default_desync_all_full(),
             fast_mode_min_tls_record: default_fast_mode_min_tls_record(),
             proxy_secret_auto_reload_secs: default_proxy_secret_reload_secs(),
             proxy_config_auto_reload_secs: default_proxy_config_reload_secs(),

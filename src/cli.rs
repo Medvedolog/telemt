@@ -194,6 +194,7 @@ prefer_ipv6 = false
 fast_mode = true
 use_middle_proxy = false
 log_level = "normal"
+desync_all_full = false
 
 [network]
 ipv4 = true
