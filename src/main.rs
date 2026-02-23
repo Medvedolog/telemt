@@ -265,7 +265,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Connection concurrency limit
-    let _max_connections = Arc::new(Semaphore::new(10_000));
+    let max_connections = Arc::new(Semaphore::new(10_000));
 
     if use_middle_proxy && !decision.ipv4_me && !decision.ipv6_me {
         warn!("No usable IP family for Middle Proxy detected; falling back to direct DC");
@@ -844,6 +844,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         let me_pool = me_pool.clone();
         let tls_cache = tls_cache.clone();
         let ip_tracker = ip_tracker.clone();
+        let max_connections_unix = max_connections.clone();
 
         tokio::spawn(async move {
             let unix_conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -851,6 +852,13 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
             loop {
                 match unix_listener.accept().await {
                     Ok((stream, _)) => {
+                        let permit = match max_connections_unix.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                error!("Connection limiter is closed");
+                                break;
+                            }
+                        };
                         let conn_id = unix_conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let fake_peer = SocketAddr::from(([127, 0, 0, 1], (conn_id % 65535) as u16));
 
@@ -866,6 +874,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                         let proxy_protocol_enabled = config.server.proxy_protocol;
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = crate::proxy::client::handle_client_stream(
                                 stream, fake_peer, config, stats,
                                 upstream_manager, replay_checker, buffer_pool, rng,
@@ -933,11 +942,19 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         let me_pool = me_pool.clone();
         let tls_cache = tls_cache.clone();
         let ip_tracker = ip_tracker.clone();
+        let max_connections_tcp = max_connections.clone();
 
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
+                        let permit = match max_connections_tcp.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                error!("Connection limiter is closed");
+                                break;
+                            }
+                        };
                         let config = config_rx.borrow_and_update().clone();
                         let stats = stats.clone();
                         let upstream_manager = upstream_manager.clone();
@@ -950,6 +967,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                         let proxy_protocol_enabled = listener_proxy_protocol;
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = ClientHandler::new(
                                 stream,
                                 peer_addr,

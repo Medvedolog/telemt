@@ -109,7 +109,22 @@ impl Stats {
     
     pub fn decrement_user_curr_connects(&self, user: &str) {
         if let Some(stats) = self.user_stats.get(user) {
-            stats.curr_connects.fetch_sub(1, Ordering::Relaxed);
+            let counter = &stats.curr_connects;
+            let mut current = counter.load(Ordering::Relaxed);
+            loop {
+                if current == 0 {
+                    break;
+                }
+                match counter.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
     }
     

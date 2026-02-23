@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::mpsc::error::TrySendError;
@@ -9,6 +10,7 @@ use super::codec::WriterCommand;
 use super::MeResponse;
 
 const ROUTE_CHANNEL_CAPACITY: usize = 4096;
+const ROUTE_BACKPRESSURE_TIMEOUT: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteResult {
@@ -94,15 +96,26 @@ impl ConnRegistry {
     }
 
     pub async fn route(&self, id: u64, resp: MeResponse) -> RouteResult {
-        let inner = self.inner.read().await;
-        if let Some(tx) = inner.map.get(&id) {
-            match tx.try_send(resp) {
-                Ok(()) => RouteResult::Routed,
-                Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
-                Err(TrySendError::Full(_)) => RouteResult::QueueFull,
+        let tx = {
+            let inner = self.inner.read().await;
+            inner.map.get(&id).cloned()
+        };
+
+        let Some(tx) = tx else {
+            return RouteResult::NoConn;
+        };
+
+        match tx.try_send(resp) {
+            Ok(()) => RouteResult::Routed,
+            Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
+            Err(TrySendError::Full(resp)) => {
+                // Absorb short bursts without dropping/closing the session immediately.
+                match tokio::time::timeout(ROUTE_BACKPRESSURE_TIMEOUT, tx.send(resp)).await {
+                    Ok(Ok(())) => RouteResult::Routed,
+                    Ok(Err(_)) => RouteResult::ChannelClosed,
+                    Err(_) => RouteResult::QueueFull,
+                }
             }
-        } else {
-            RouteResult::NoConn
         }
     }
 
