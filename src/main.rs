@@ -373,6 +373,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     config.general.me_pool_drain_ttl_secs,
                     config.general.effective_me_pool_force_close_secs(),
                     config.general.me_pool_min_fresh_ratio,
+                    config.general.me_hardswap_warmup_delay_min_ms,
+                    config.general.me_hardswap_warmup_delay_max_ms,
+                    config.general.me_hardswap_warmup_extra_passes,
+                    config.general.me_hardswap_warmup_pass_backoff_base_ms,
                 );
 
                 let pool_size = config.general.middle_proxy_pool_size.max(1);

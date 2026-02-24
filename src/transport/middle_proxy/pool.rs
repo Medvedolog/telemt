@@ -83,6 +83,10 @@ pub struct MePool {
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
+    pub(super) me_hardswap_warmup_delay_min_ms: AtomicU64,
+    pub(super) me_hardswap_warmup_delay_max_ms: AtomicU64,
+    pub(super) me_hardswap_warmup_extra_passes: AtomicU32,
+    pub(super) me_hardswap_warmup_pass_backoff_base_ms: AtomicU64,
     pool_size: usize,
 }
 
@@ -140,6 +144,10 @@ impl MePool {
         me_pool_drain_ttl_secs: u64,
         me_pool_force_close_secs: u64,
         me_pool_min_fresh_ratio: f32,
+        me_hardswap_warmup_delay_min_ms: u64,
+        me_hardswap_warmup_delay_max_ms: u64,
+        me_hardswap_warmup_extra_passes: u8,
+        me_hardswap_warmup_pass_backoff_base_ms: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::new(ConnRegistry::new()),
@@ -188,6 +196,10 @@ impl MePool {
             me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
             me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
             me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(me_pool_min_fresh_ratio)),
+            me_hardswap_warmup_delay_min_ms: AtomicU64::new(me_hardswap_warmup_delay_min_ms),
+            me_hardswap_warmup_delay_max_ms: AtomicU64::new(me_hardswap_warmup_delay_max_ms),
+            me_hardswap_warmup_extra_passes: AtomicU32::new(me_hardswap_warmup_extra_passes as u32),
+            me_hardswap_warmup_pass_backoff_base_ms: AtomicU64::new(me_hardswap_warmup_pass_backoff_base_ms),
         })
     }
 
@@ -205,6 +217,10 @@ impl MePool {
         drain_ttl_secs: u64,
         force_close_secs: u64,
         min_fresh_ratio: f32,
+        hardswap_warmup_delay_min_ms: u64,
+        hardswap_warmup_delay_max_ms: u64,
+        hardswap_warmup_extra_passes: u8,
+        hardswap_warmup_pass_backoff_base_ms: u64,
     ) {
         self.hardswap.store(hardswap, Ordering::Relaxed);
         self.me_pool_drain_ttl_secs.store(drain_ttl_secs, Ordering::Relaxed);
@@ -212,6 +228,14 @@ impl MePool {
             .store(force_close_secs, Ordering::Relaxed);
         self.me_pool_min_fresh_ratio_permille
             .store(Self::ratio_to_permille(min_fresh_ratio), Ordering::Relaxed);
+        self.me_hardswap_warmup_delay_min_ms
+            .store(hardswap_warmup_delay_min_ms, Ordering::Relaxed);
+        self.me_hardswap_warmup_delay_max_ms
+            .store(hardswap_warmup_delay_max_ms, Ordering::Relaxed);
+        self.me_hardswap_warmup_extra_passes
+            .store(hardswap_warmup_extra_passes as u32, Ordering::Relaxed);
+        self.me_hardswap_warmup_pass_backoff_base_ms
+            .store(hardswap_warmup_pass_backoff_base_ms, Ordering::Relaxed);
     }
 
     pub fn reset_stun_state(&self) {
@@ -330,6 +354,49 @@ impl MePool {
         endpoint_count.max(3)
     }
 
+    fn hardswap_warmup_connect_delay_ms(&self) -> u64 {
+        let min_ms = self
+            .me_hardswap_warmup_delay_min_ms
+            .load(Ordering::Relaxed);
+        let max_ms = self
+            .me_hardswap_warmup_delay_max_ms
+            .load(Ordering::Relaxed);
+        let (min_ms, max_ms) = if min_ms <= max_ms {
+            (min_ms, max_ms)
+        } else {
+            (max_ms, min_ms)
+        };
+        if min_ms == max_ms {
+            return min_ms;
+        }
+        rand::rng().random_range(min_ms..=max_ms)
+    }
+
+    fn hardswap_warmup_backoff_ms(&self, pass_idx: usize) -> u64 {
+        let base_ms = self
+            .me_hardswap_warmup_pass_backoff_base_ms
+            .load(Ordering::Relaxed);
+        let cap_ms = (self.me_reconnect_backoff_cap.as_millis() as u64).max(base_ms);
+        let shift = (pass_idx as u32).min(20);
+        let scaled = base_ms.saturating_mul(1u64 << shift);
+        let core = scaled.min(cap_ms);
+        let jitter = (core / 2).max(1);
+        core.saturating_add(rand::rng().random_range(0..=jitter))
+    }
+
+    async fn fresh_writer_count_for_endpoints(
+        &self,
+        generation: u64,
+        endpoints: &HashSet<SocketAddr>,
+    ) -> usize {
+        let ws = self.writers.read().await;
+        ws.iter()
+            .filter(|w| !w.draining.load(Ordering::Relaxed))
+            .filter(|w| w.generation == generation)
+            .filter(|w| endpoints.contains(&w.addr))
+            .count()
+    }
+
     pub(super) async fn connect_endpoints_round_robin(
         self: &Arc<Self>,
         endpoints: &[SocketAddr],
@@ -356,6 +423,12 @@ impl MePool {
         generation: u64,
         desired_by_dc: &HashMap<i32, HashSet<SocketAddr>>,
     ) {
+        let extra_passes = self
+            .me_hardswap_warmup_extra_passes
+            .load(Ordering::Relaxed)
+            .min(10) as usize;
+        let total_passes = 1 + extra_passes;
+
         for (dc, endpoints) in desired_by_dc {
             if endpoints.is_empty() {
                 continue;
@@ -364,30 +437,85 @@ impl MePool {
             let mut endpoint_list: Vec<SocketAddr> = endpoints.iter().copied().collect();
             endpoint_list.sort_unstable();
             let required = Self::required_writers_for_dc(endpoint_list.len());
+            let mut completed = false;
+            let mut last_fresh_count = self
+                .fresh_writer_count_for_endpoints(generation, endpoints)
+                .await;
 
-            loop {
-                let fresh_count = {
-                    let ws = self.writers.read().await;
-                    ws.iter()
-                        .filter(|w| !w.draining.load(Ordering::Relaxed))
-                        .filter(|w| w.generation == generation)
-                        .filter(|w| endpoints.contains(&w.addr))
-                        .count()
-                };
-                if fresh_count >= required {
+            for pass_idx in 0..total_passes {
+                if last_fresh_count >= required {
+                    completed = true;
                     break;
                 }
 
-                if !self.connect_endpoints_round_robin(&endpoint_list, rng).await {
-                    warn!(
+                let missing = required.saturating_sub(last_fresh_count);
+                debug!(
+                    dc = *dc,
+                    pass = pass_idx + 1,
+                    total_passes,
+                    fresh_count = last_fresh_count,
+                    required,
+                    missing,
+                    endpoint_count = endpoint_list.len(),
+                    "ME hardswap warmup pass started"
+                );
+
+                for attempt_idx in 0..missing {
+                    let delay_ms = self.hardswap_warmup_connect_delay_ms();
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                    let connected = self.connect_endpoints_round_robin(&endpoint_list, rng).await;
+                    debug!(
                         dc = *dc,
-                        fresh_count,
+                        pass = pass_idx + 1,
+                        total_passes,
+                        attempt = attempt_idx + 1,
+                        delay_ms,
+                        connected,
+                        "ME hardswap warmup connect attempt finished"
+                    );
+                }
+
+                last_fresh_count = self
+                    .fresh_writer_count_for_endpoints(generation, endpoints)
+                    .await;
+                if last_fresh_count >= required {
+                    completed = true;
+                    info!(
+                        dc = *dc,
+                        pass = pass_idx + 1,
+                        total_passes,
+                        fresh_count = last_fresh_count,
                         required,
-                        endpoint_count = endpoint_list.len(),
-                        "ME warmup stopped: unable to reach required writer floor for DC"
+                        "ME hardswap warmup floor reached for DC"
                     );
                     break;
                 }
+
+                if pass_idx + 1 < total_passes {
+                    let backoff_ms = self.hardswap_warmup_backoff_ms(pass_idx);
+                    debug!(
+                        dc = *dc,
+                        pass = pass_idx + 1,
+                        total_passes,
+                        fresh_count = last_fresh_count,
+                        required,
+                        backoff_ms,
+                        "ME hardswap warmup pass incomplete, delaying next pass"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+
+            if !completed {
+                warn!(
+                    dc = *dc,
+                    fresh_count = last_fresh_count,
+                    required,
+                    endpoint_count = endpoint_list.len(),
+                    total_passes,
+                    "ME warmup stopped: unable to reach required writer floor for DC"
+                );
             }
         }
     }
