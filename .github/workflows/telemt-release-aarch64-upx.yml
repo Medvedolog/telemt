@@ -3,7 +3,7 @@ name: Build and Release Telemt (aarch64-musl)
 on:
   push:
     tags:
-      # Убрали префикс 'v', теперь реагирует на чистые версии
+      # Trigger on pure version tags (e.g., 3.0.13)
       - '3.0.1[3-9]'
       - '3.0.[2-9]*'
       - '3.[1-9]*'
@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Введите тег (например, 3.0.13) или ветку (main)'
+        description: 'Enter tag (e.g., 3.0.13) or branch (main)'
         required: true
-        default: '3.0.13' # Исправлено значение по умолчанию
+        default: '3.0.13'
 
 jobs:
   release:
@@ -27,6 +27,7 @@ jobs:
       - name: Extract version
         id: vars
         run: |
+          # Determine the target version based on the trigger event
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "VERSION=${{ github.event.inputs.build_target }}" >> $GITHUB_ENV
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -38,8 +39,8 @@ jobs:
       - name: Checkout upstream repository
         uses: actions/checkout@v4
         with:
+          # Checkout source code from the original repository
           repository: 'telemt/telemt'
-          # Теперь сюда передается правильное значение (например, 3.0.13)
           ref: ${{ env.VERSION }}
 
       - name: Setup Rust
@@ -49,11 +50,13 @@ jobs:
 
       - name: Install cross
         run: |
+          # Download pre-compiled cross binary to save time
           curl -L https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
           sudo mv cross /usr/local/bin/
 
       - name: Build binary with cross
         run: |
+          # Build and strip the binary automatically
           CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
@@ -65,14 +68,82 @@ jobs:
 
       - name: Append version string
         run: |
+          # Append the version string to the end of the binary without a newline
           echo -n "${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
+          
+          # Rename for the release
           mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
+
+      - name: Build IPK packages
+        run: |
+          # Target architectures array
+          ARCHS=("aarch64_generic" "aarch64_generic_musl" "aarch64_cortex-a53")
+          PKG_VER="${{ env.VERSION }}"
+          BIN_SRC="telemt-aarch64-musl"
+          
+          for PKG_ARCH in "${ARCHS[@]}"; do
+            echo "Building IPK for $PKG_ARCH..."
+            PKG_DIR="build_telemt_$PKG_ARCH"
+            OUT_IPK="telemt_${PKG_VER}_${PKG_ARCH}.ipk"
+            
+            # Prepare directory structure
+            mkdir -p "$PKG_DIR/control"
+            mkdir -p "$PKG_DIR/data/usr/bin"
+            echo "2.0" > "$PKG_DIR/debian-binary"
+            
+            # Copy binary to /usr/bin and make it executable
+            cp "$BIN_SRC" "$PKG_DIR/data/usr/bin/telemt"
+            chmod 755 "$PKG_DIR/data/usr/bin/telemt"
+            
+            # Create control file
+            cat > "$PKG_DIR/control/control" <<EOF
+          Package: telemt
+          Version: $PKG_VER
+          Depends: libc, ca-bundle
+          Architecture: $PKG_ARCH
+          Maintainer: Community
+          Description: Telemt MTProxy binary (v$PKG_VER) [Built for $PKG_ARCH]
+          EOF
+            
+            # Create postinst script for installation notification
+            cat > "$PKG_DIR/control/postinst" <<EOF
+          #!/bin/sh
+          echo ""
+          echo "================================================================="
+          echo " Installed telemt executable version $PKG_VER"
+          echo " "
+          echo " To configure it, you need the following package:"
+          echo " https://github.com/Medvedolog/luci-app-telemt"
+          echo "================================================================="
+          echo ""
+          exit 0
+          EOF
+            
+            # Make postinst script executable (required for opkg)
+            chmod 755 "$PKG_DIR/control/postinst"
+            
+            # Pack data.tar.gz and control.tar.gz
+            cd "$PKG_DIR/data"
+            tar -czf ../data.tar.gz .
+            cd ../control
+            tar -czf ../control.tar.gz .
+            cd ..
+            
+            # Build final IPK
+            tar -czf "../$OUT_IPK" debian-binary data.tar.gz control.tar.gz
+            cd ..
+            
+            echo "Successfully built $OUT_IPK"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          files: telemt-aarch64-musl
+          # Upload the raw binary and all built IPK files
+          files: |
+            telemt-aarch64-musl
+            *.ipk
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
           prerelease: ${{ env.VERSION == 'main' || env.VERSION == 'master' }}
