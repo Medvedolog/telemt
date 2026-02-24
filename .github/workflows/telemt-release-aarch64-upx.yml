@@ -15,11 +15,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code for selected ref
+      - name: Checkout repository (full history + tags)
         uses: actions/checkout@v4
         with:
-          # Checkout the user-provided tag/branch
-          ref: ${{ github.event.inputs.release_tag }}
+          fetch-depth: 0  # fetch full history & tags
+
+      - name: Explicitly fetch all tags + specified ref
+        run: |
+          git fetch --prune --unshallow origin "+refs/tags/*:refs/tags/*" "+refs/heads/*:refs/remotes/origin/*"
+          git fetch origin ${{ github.event.inputs.release_tag }} || true
+          git checkout ${{ github.event.inputs.release_tag }}
 
       - name: Install Rust toolchain and target
         run: |
@@ -30,7 +35,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools curl
-          # install cross toolchain
           curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
@@ -48,10 +52,9 @@ jobs:
 
       - name: Strip binary
         run: |
-          # remove debug symbols
           aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/telemt
 
-      - name: Embed version tag in binary
+      - name: Embed version tag into binary
         run: |
           VERSION="${{ github.event.inputs.release_tag }}"
           printf "\nTELEMT_VERSION=${VERSION}\n" >> target/aarch64-unknown-linux-musl/release/telemt
@@ -65,7 +68,7 @@ jobs:
         run: |
           upx --best --lzma target/aarch64-unknown-linux-musl/release/telemt
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: telemt-aarch64
