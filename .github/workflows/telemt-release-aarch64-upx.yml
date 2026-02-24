@@ -48,15 +48,19 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install cross
+      - name: Install cross and nFPM
         run: |
-          # Download pre-compiled cross binary to save time
-          curl -L https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
+          # Download pre-compiled cross binary to save build time
+          curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
           sudo mv cross /usr/local/bin/
+          
+          # Download pre-compiled nFPM binary for IPK/APK packaging
+          curl -sL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
+          sudo mv nfpm /usr/local/bin/
 
       - name: Build binary with cross
         run: |
-          # Build and strip the binary automatically
+          # Build and strip the binary automatically via Cargo profile
           CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
@@ -68,49 +72,22 @@ jobs:
 
       - name: Append version string
         run: |
-          # Append the version string to the end of the binary without a newline
-          echo -n "${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
+          # Append the version string WITH the expected prefix for the init.d script parsing
+          echo -n "MTProxy v${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
           
-          # Rename for the release
+          # Rename the raw binary for the release
           mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
 
-      - name: Build IPK packages
+      - name: Build IPK and APK packages with nFPM
         run: |
-          # Target architectures array
-          ARCHS=("aarch64_generic" "aarch64_generic_musl" "aarch64_cortex-a53")
-          PKG_VER="${{ env.VERSION }}"
-          BIN_SRC="telemt-aarch64-musl"
+          export PKG_VER="${{ env.VERSION }}"
           
-          for PKG_ARCH in "${ARCHS[@]}"; do
-            echo "Building IPK for $PKG_ARCH..."
-            PKG_DIR="build_telemt_$PKG_ARCH"
-            OUT_IPK="telemt_${PKG_VER}_${PKG_ARCH}.ipk"
-            
-            # Prepare directory structure
-            mkdir -p "$PKG_DIR/control"
-            mkdir -p "$PKG_DIR/data/usr/bin"
-            echo "2.0" > "$PKG_DIR/debian-binary"
-            
-            # Copy binary to /usr/bin and make it executable
-            cp "$BIN_SRC" "$PKG_DIR/data/usr/bin/telemt"
-            chmod 755 "$PKG_DIR/data/usr/bin/telemt"
-            
-            # Create control file
-            cat > "$PKG_DIR/control/control" <<EOF
-          Package: telemt
-          Version: $PKG_VER
-          Depends: libc, ca-bundle
-          Architecture: $PKG_ARCH
-          Maintainer: Community
-          Description: Telemt MTProxy binary (v$PKG_VER) [Built for $PKG_ARCH]
-          EOF
-            
-            # Create postinst script for installation notification
-            cat > "$PKG_DIR/control/postinst" <<EOF
+          # 1. Create the post-install script once
+          cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed telemt executable version $PKG_VER"
+          echo " Installed telemt executable version \$PKG_VER"
           echo " "
           echo " To configure it, you need the following package:"
           echo " https://github.com/Medvedolog/luci-app-telemt"
@@ -118,33 +95,58 @@ jobs:
           echo ""
           exit 0
           EOF
+          chmod 755 postinst.sh
+
+          # 2. Create the unified nFPM configuration template
+          cat > nfpm.yaml <<'EOF'
+          name: telemt
+          arch: ${PKG_ARCH}
+          platform: linux
+          version: ${PKG_VER}
+          maintainer: Community
+          description: Telemt MTProxy static binary (Built for ${PKG_ARCH})
+          contents:
+            - src: ./telemt-aarch64-musl
+              dst: /usr/bin/telemt
+              file_info:
+                mode: 0755
+          scripts:
+            postinstall: ./postinst.sh
+          
+          # OS-specific dependency overrides (Only certificates needed)
+          overrides:
+            ipk:
+              depends:
+                - ca-bundle
+            apk:
+              depends:
+                - ca-certificates
+          EOF
+
+          # 3. Build IPK and APK for OpenWrt architectures
+          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
+          
+          for ARCH in "${ARCHS[@]}"; do
+            export PKG_ARCH=$ARCH
+            echo "Building packages for $PKG_ARCH..."
             
-            # Make postinst script executable (required for opkg)
-            chmod 755 "$PKG_DIR/control/postinst"
+            # Build IPK
+            nfpm pkg --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
             
-            # Pack data.tar.gz and control.tar.gz
-            cd "$PKG_DIR/data"
-            tar -czf ../data.tar.gz .
-            cd ../control
-            tar -czf ../control.tar.gz .
-            cd ..
-            
-            # Build final IPK
-            tar -czf "../$OUT_IPK" debian-binary data.tar.gz control.tar.gz
-            cd ..
-            
-            echo "Successfully built $OUT_IPK"
+            # Build APK
+            nfpm pkg --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
           done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          # Upload the raw binary and all built IPK files
+          # Upload the raw binary, both IPK files, and both APK files
           files: |
             telemt-aarch64-musl
             *.ipk
+            *.apk
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
           prerelease: ${{ env.VERSION == 'main' || env.VERSION == 'master' }}
-          draft: false 
+          draft: false
