@@ -12,13 +12,13 @@
 
 #### Релиз 3.0.15 — 25 февраля
 
-25 февраля мы выпустили версию **3.0.15**.
+25 февраля мы выпустили версию **3.0.15**
 
 Мы предполагаем, что она станет завершающей версией поколения 3.0 и уже сейчас мы рассматриваем её как **LTS-кандидата** для версии **3.1.0**!
 
-После нескольких дней детального анализа особенностей работы Middle-End мы спроектировали и реализовали продуманный режим **ротации ME Writer**. Данный режим позволяет поддерживать стабильно высокую производительность в long-run сценариях без возникновения ошибок, связанных с некорректной конфигурацией прокси.
+После нескольких дней детального анализа особенностей работы Middle-End мы спроектировали и реализовали продуманный режим **ротации ME Writer**. Данный режим позволяет поддерживать стабильно высокую производительность в long-run сценариях без возникновения ошибок, связанных с некорректной конфигурацией прокси
 
-Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **статистики** и **UX**.
+Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **статистики** и **UX**
 
 Релиз:  
 [3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
@@ -40,13 +40,14 @@
 
 #### Release 3.0.15 — February 25
 
-On February 25, we released version **3.0.15**.
+On February 25, we released version **3.0.15**
 
 We expect this to become the final release of the 3.0 generation and at this point, we already see it as a strong **LTS candidate** for the upcoming **3.1.0** release!
 
-After several days of deep analysis of Middle-End behavior, we designed and implemented a well-engineered **ME Writer rotation mode**. This mode enables sustained high throughput in long-run scenarios while preventing proxy misconfiguration errors.
+After several days of deep analysis of Middle-End behavior, we designed and implemented a well-engineered **ME Writer rotation mode**. This mode enables sustained high throughput in long-run scenarios while preventing proxy misconfiguration errors
 
-We are looking forward to your feedback and improvement proposals — especially regarding **statistics** and **UX**.
+We are looking forward to your feedback and improvement proposals — especially regarding **statistics** and **UX**
+
 Release:  
 [3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
 
