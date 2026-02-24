@@ -54,8 +54,10 @@ jobs:
           curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
           sudo mv cross /usr/local/bin/
           
-          # Download pre-compiled nFPM binary for IPK/APK packaging
-          curl -sL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
+          # Dynamically fetch the latest nFPM version and download the correct tarball
+          NFPM_TAG=$(curl -sL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)
+          NFPM_VER=${NFPM_TAG#v}
+          curl -sL "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
           sudo mv nfpm /usr/local/bin/
 
       - name: Build binary with cross
@@ -87,7 +89,7 @@ jobs:
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed telemt executable version \$PKG_VER"
+          echo " Installed telemt static executable version \$PKG_VER"
           echo " "
           echo " To configure it, you need the following package:"
           echo " https://github.com/Medvedolog/luci-app-telemt"
