@@ -1,0 +1,67 @@
+name: Build release aarch64
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'    # триггер по тегам релиза, например v3.0.12
+  workflow_dispatch:
+
+jobs:
+  build_aarch64:
+    name: Build Telemt aarch64-musl
+    runs-on: ubuntu-latest
+
+    env:
+      RUSTUP_TOOLCHAIN: stable
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain + targets
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        targets: aarch64-unknown-linux-musl
+
+    - name: Install musl cross toolchain
+      run: |
+        sudo apt-update
+        sudo apt-install -y musl-tools
+        # Получаем готовый aarch64-linux-musl кросс-компилятор:
+        curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+        echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+
+    - name: Setup linker config for target
+      run: |
+        mkdir -p ~/.cargo
+        printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> ~/.cargo/config.toml
+
+    - name: Build release binary
+      run: |
+        export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+        export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+        cargo build --release --target aarch64-unknown-linux-musl
+
+    - name: Strip the binary
+      run: |
+        musl-strip target/aarch64-unknown-linux-musl/release/telemt
+
+    - name: Embed version into binary
+      run: |
+        # Вычислить версию (например из git tag)
+        VERSION=$(git describe --tags --dirty --always)
+        # Закодировать строку версии в конец exe
+        printf "\nTELEMT_VERSION=${VERSION}\n" >> target/aarch64-unknown-linux-musl/release/telemt
+
+    - name: UPX compress binary
+      run: |
+        sudo apt-install -y upx
+        upx --best --lzma target/aarch64-unknown-linux-musl/release/telemt
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: telemt-aarch64
+        path: target/aarch64-unknown-linux-musl/release/telemt
