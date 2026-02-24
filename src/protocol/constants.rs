@@ -1,6 +1,10 @@
 //! Protocol constants and datacenter addresses
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#![allow(dead_code)]
+
+use std::net::{IpAddr, Ipv4Addr};
+
+use crate::crypto::SecureRandom;
 use std::sync::LazyLock;
 
 // ============= Telegram Datacenters =============
@@ -151,7 +155,32 @@ pub const TLS_RECORD_ALERT: u8 = 0x15;
 /// Maximum TLS record size
 pub const MAX_TLS_RECORD_SIZE: usize = 16384;
 /// Maximum TLS chunk size (with overhead)
-pub const MAX_TLS_CHUNK_SIZE: usize = 16384 + 24;
+/// RFC 8446 §5.2 allows up to 16384 + 256 bytes of ciphertext
+pub const MAX_TLS_CHUNK_SIZE: usize = 16384 + 256;
+
+/// Secure Intermediate payload is expected to be 4-byte aligned.
+pub fn is_valid_secure_payload_len(data_len: usize) -> bool {
+    data_len.is_multiple_of(4)
+}
+
+/// Compute Secure Intermediate payload length from wire length.
+/// Secure mode strips up to 3 random tail bytes by truncating to 4-byte boundary.
+pub fn secure_payload_len_from_wire_len(wire_len: usize) -> Option<usize> {
+    if wire_len < 4 {
+        return None;
+    }
+    Some(wire_len - (wire_len % 4))
+}
+
+/// Generate padding length for Secure Intermediate protocol.
+/// Data must be 4-byte aligned; padding is 1..=3 so total is never divisible by 4.
+pub fn secure_padding_len(data_len: usize, rng: &SecureRandom) -> usize {
+    debug_assert!(
+        is_valid_secure_payload_len(data_len),
+        "Secure payload must be 4-byte aligned, got {data_len}"
+    );
+    rng.range(3) + 1
+}
 
 // ============= Timeouts =============
 
@@ -202,7 +231,6 @@ pub static RESERVED_NONCE_CONTINUES: &[[u8; 4]] = &[
 // ============= RPC Constants (for Middle Proxy) =============
 
 /// RPC Proxy Request
-
 /// RPC Flags (from Erlang mtp_rpc.erl)
 pub const RPC_FLAG_NOT_ENCRYPTED: u32 = 0x2;
 pub const RPC_FLAG_HAS_AD_TAG: u32    = 0x8;
@@ -284,6 +312,10 @@ pub mod rpc_flags {
         pub const FLAG_ABRIDGED: u32      = 0x40000000;
         pub const FLAG_QUICKACK: u32      = 0x80000000;
     }
+
+    pub mod rpc_crypto_flags {
+        pub const USE_CRC32C: u32 = 0x800;
+    }
     
     pub const ME_CONNECT_TIMEOUT_SECS: u64 = 5;
     pub const ME_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
@@ -318,5 +350,44 @@ mod tests {
     fn test_datacenters_count() {
         assert_eq!(TG_DATACENTERS_V4.len(), 5);
         assert_eq!(TG_DATACENTERS_V6.len(), 5);
+    }
+
+    #[test]
+    fn secure_padding_never_produces_aligned_total() {
+        let rng = SecureRandom::new();
+        for data_len in (0..1000).step_by(4) {
+            for _ in 0..100 {
+                let padding = secure_padding_len(data_len, &rng);
+                assert!(
+                    padding <= 3,
+                    "padding out of range: data_len={data_len}, padding={padding}"
+                );
+                assert_ne!(
+                    (data_len + padding) % 4,
+                    0,
+                    "invariant violated: data_len={data_len}, padding={padding}, total={}",
+                    data_len + padding
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secure_wire_len_roundtrip_for_aligned_payload() {
+        for payload_len in (4..4096).step_by(4) {
+            for padding in 0..=3usize {
+                let wire_len = payload_len + padding;
+                let recovered = secure_payload_len_from_wire_len(wire_len);
+                assert_eq!(recovered, Some(payload_len));
+            }
+        }
+    }
+
+    #[test]
+    fn secure_wire_len_rejects_too_short_frames() {
+        assert_eq!(secure_payload_len_from_wire_len(0), None);
+        assert_eq!(secure_payload_len_from_wire_len(1), None);
+        assert_eq!(secure_payload_len_from_wire_len(2), None);
+        assert_eq!(secure_payload_len_from_wire_len(3), None);
     }
 }

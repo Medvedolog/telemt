@@ -18,6 +18,8 @@
 //! - Explicit state machines for all async operations
 //! - Never lose data on partial reads
 //! - Atomic TLS record formation for writes
+
+#![allow(dead_code)]
 //! - Proper handling of all TLS record types
 //!
 //! Important nuance (Telegram FakeTLS):
@@ -25,7 +27,8 @@
 //! - However, the on-the-wire record length can exceed 16384 because TLS 1.3
 //!   uses AEAD and can include tag/overhead/padding.
 //! - Telegram FakeTLS clients (notably iOS) may send Application Data records
-//!   with length up to 16384 + 24 bytes. We accept that as MAX_TLS_CHUNK_SIZE.
+//!   with length up to 16384 + 256 bytes (RFC 8446 §5.2). We accept that as
+//!   MAX_TLS_CHUNK_SIZE.
 //!
 //! If you reject those (e.g. validate length <= 16384), you will see errors like:
 //!   "TLS record too large: 16408 bytes"
@@ -52,9 +55,8 @@ use super::state::{StreamState, HeaderBuffer, YieldBuffer, WriteBuffer};
 const TLS_HEADER_SIZE: usize = 5;
 
 /// Maximum TLS fragment size we emit for Application Data.
-/// Real TLS 1.3 ciphertexts often add ~16-24 bytes AEAD overhead, so to mimic
-/// on-the-wire record sizes we allow up to 16384 + 24 bytes of plaintext.
-const MAX_TLS_PAYLOAD: usize = 16384 + 24;
+/// Real TLS 1.3 allows up to 16384 + 256 bytes of ciphertext (incl. tag).
+const MAX_TLS_PAYLOAD: usize = 16384 + 256;
 
 /// Maximum pending write buffer for one record remainder.
 /// Note: we never queue unlimited amount of data here; state holds at most one record.
@@ -91,7 +93,7 @@ impl TlsRecordHeader {
     /// - We accept TLS 1.0 header version for ClientHello-like records (0x03 0x01),
     ///   and TLS 1.2/1.3 style version bytes for the rest (we use TLS_VERSION = 0x03 0x03).
     /// - For Application Data, Telegram FakeTLS may send payload length up to
-    ///   MAX_TLS_CHUNK_SIZE (16384 + 24).
+    ///   MAX_TLS_CHUNK_SIZE (16384 + 256).
     /// - For other record types we keep stricter bounds to avoid memory abuse.
     fn validate(&self) -> Result<()> {
         // Version: accept TLS 1.0 header (ClientHello quirk) and TLS_VERSION (0x0303).
@@ -105,7 +107,7 @@ impl TlsRecordHeader {
         let len = self.length as usize;
 
         // Length checks depend on record type.
-        // Telegram FakeTLS: ApplicationData length may be 16384 + 24.
+        // Telegram FakeTLS: ApplicationData length may be 16384 + 256.
         match self.record_type {
             TLS_RECORD_APPLICATION => {
                 if len > MAX_TLS_CHUNK_SIZE {
@@ -133,7 +135,7 @@ impl TlsRecordHeader {
     }
 
     /// Build header bytes
-    fn to_bytes(&self) -> [u8; 5] {
+    fn to_bytes(self) -> [u8; 5] {
         [
             self.record_type,
             self.version[0],
@@ -258,9 +260,9 @@ impl<R> FakeTlsReader<R> {
     fn take_poison_error(&mut self) -> io::Error {
         match &mut self.state {
             TlsReaderState::Poisoned { error } => error.take().unwrap_or_else(|| {
-                io::Error::new(ErrorKind::Other, "stream previously poisoned")
+                io::Error::other("stream previously poisoned")
             }),
-            _ => io::Error::new(ErrorKind::Other, "stream not poisoned"),
+            _ => io::Error::other("stream not poisoned"),
         }
     }
 }
@@ -295,7 +297,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for FakeTlsReader<R> {
                 TlsReaderState::Poisoned { error } => {
                     this.state = TlsReaderState::Poisoned { error: None };
                     let err = error.unwrap_or_else(|| {
-                        io::Error::new(ErrorKind::Other, "stream previously poisoned")
+                        io::Error::other("stream previously poisoned")
                     });
                     return Poll::Ready(Err(err));
                 }
@@ -614,9 +616,9 @@ impl<W> FakeTlsWriter<W> {
     fn take_poison_error(&mut self) -> io::Error {
         match &mut self.state {
             TlsWriterState::Poisoned { error } => error.take().unwrap_or_else(|| {
-                io::Error::new(ErrorKind::Other, "stream previously poisoned")
+                io::Error::other("stream previously poisoned")
             }),
-            _ => io::Error::new(ErrorKind::Other, "stream not poisoned"),
+            _ => io::Error::other("stream not poisoned"),
         }
     }
 
@@ -680,7 +682,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FakeTlsWriter<W> {
             TlsWriterState::Poisoned { error } => {
                 this.state = TlsWriterState::Poisoned { error: None };
                 let err = error.unwrap_or_else(|| {
-                    Error::new(ErrorKind::Other, "stream previously poisoned")
+                    Error::other("stream previously poisoned")
                 });
                 return Poll::Ready(Err(err));
             }
@@ -755,9 +757,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FakeTlsWriter<W> {
                     payload_size: chunk_size,
                 };
 
-                // Wake to retry flushing soon.
-                cx.waker().wake_by_ref();
-
                 Poll::Ready(Ok(chunk_size))
             }
         }
@@ -772,7 +771,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FakeTlsWriter<W> {
             TlsWriterState::Poisoned { error } => {
                 this.state = TlsWriterState::Poisoned { error: None };
                 let err = error.unwrap_or_else(|| {
-                    Error::new(ErrorKind::Other, "stream previously poisoned")
+                    Error::other("stream previously poisoned")
                 });
                 return Poll::Ready(Err(err));
             }

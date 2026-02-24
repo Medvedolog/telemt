@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
@@ -10,6 +12,32 @@ use crate::error::{ProxyError, Result};
 
 use super::defaults::*;
 use super::types::*;
+
+fn preprocess_includes(content: &str, base_dir: &Path, depth: u8) -> Result<String> {
+    if depth > 10 {
+        return Err(ProxyError::Config("Include depth > 10".into()));
+    }
+    let mut output = String::with_capacity(content.len());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("include") {
+            let rest = rest.trim();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let path_str = rest.trim().trim_matches('"');
+                let resolved = base_dir.join(path_str);
+                let included = std::fs::read_to_string(&resolved)
+                    .map_err(|e| ProxyError::Config(e.to_string()))?;
+                let included_dir = resolved.parent().unwrap_or(base_dir);
+                output.push_str(&preprocess_includes(&included, included_dir, depth + 1)?);
+                output.push('\n');
+                continue;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(output)
+}
 
 fn validate_network_cfg(net: &mut NetworkConfig) -> Result<()> {
     if !net.ipv4 && matches!(net.ipv6, Some(false)) {
@@ -84,10 +112,58 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content =
-            std::fs::read_to_string(path).map_err(|e| ProxyError::Config(e.to_string()))?;
+            std::fs::read_to_string(&path).map_err(|e| ProxyError::Config(e.to_string()))?;
+        let base_dir = path.as_ref().parent().unwrap_or(Path::new("."));
+        let processed = preprocess_includes(&content, base_dir, 0)?;
 
         let mut config: ProxyConfig =
-            toml::from_str(&content).map_err(|e| ProxyError::Config(e.to_string()))?;
+            toml::from_str(&processed).map_err(|e| ProxyError::Config(e.to_string()))?;
+
+        if let Some(update_every) = config.general.update_every {
+            if update_every == 0 {
+                return Err(ProxyError::Config(
+                    "general.update_every must be > 0".to_string(),
+                ));
+            }
+        } else {
+            let legacy_secret = config.general.proxy_secret_auto_reload_secs;
+            let legacy_config = config.general.proxy_config_auto_reload_secs;
+            let effective = legacy_secret.min(legacy_config);
+            if effective == 0 {
+                return Err(ProxyError::Config(
+                    "legacy proxy_*_auto_reload_secs values must be > 0 when general.update_every is not set".to_string(),
+                ));
+            }
+
+            if legacy_secret != default_proxy_secret_reload_secs()
+                || legacy_config != default_proxy_config_reload_secs()
+            {
+                warn!(
+                    proxy_secret_auto_reload_secs = legacy_secret,
+                    proxy_config_auto_reload_secs = legacy_config,
+                    effective_update_every_secs = effective,
+                    "proxy_*_auto_reload_secs are deprecated; set general.update_every"
+                );
+            }
+        }
+
+        if !(0.0..=1.0).contains(&config.general.me_pool_min_fresh_ratio) {
+            return Err(ProxyError::Config(
+                "general.me_pool_min_fresh_ratio must be within [0.0, 1.0]".to_string(),
+            ));
+        }
+
+        if config.general.effective_me_pool_force_close_secs() > 0
+            && config.general.effective_me_pool_force_close_secs()
+                < config.general.me_pool_drain_ttl_secs
+        {
+            warn!(
+                me_pool_drain_ttl_secs = config.general.me_pool_drain_ttl_secs,
+                me_reinit_drain_timeout_secs = config.general.effective_me_pool_force_close_secs(),
+                "force-close timeout is lower than drain TTL; bumping force-close timeout to TTL"
+            );
+            config.general.me_reinit_drain_timeout_secs = config.general.me_pool_drain_ttl_secs;
+        }
 
         // Validate secrets.
         for (user, secret) in &config.access.users {
@@ -135,6 +211,21 @@ impl ProxyConfig {
             config.censorship.mask_host = Some(config.censorship.tls_domain.clone());
         }
 
+        // Merge primary + extra TLS domains, deduplicate (primary always first).
+        if !config.censorship.tls_domains.is_empty() {
+            let mut all = Vec::with_capacity(1 + config.censorship.tls_domains.len());
+            all.push(config.censorship.tls_domain.clone());
+            for d in std::mem::take(&mut config.censorship.tls_domains) {
+                if !d.is_empty() && !all.contains(&d) {
+                    all.push(d);
+                }
+            }
+            // keep primary as tls_domain; store remaining back to tls_domains
+            if all.len() > 1 {
+                config.censorship.tls_domains = all[1..].to_vec();
+            }
+        }
+
         // Migration: prefer_ipv6 -> network.prefer.
         if config.general.prefer_ipv6 {
             if config.network.prefer == 4 {
@@ -151,8 +242,14 @@ impl ProxyConfig {
 
         validate_network_cfg(&mut config.network)?;
 
-        // Random fake_cert_len.
-        config.censorship.fake_cert_len = rand::rng().gen_range(1024..4096);
+        if config.general.use_middle_proxy && config.network.ipv6 == Some(true) {
+            warn!("IPv6 with Middle Proxy is experimental and may cause KDF address mismatch; consider disabling IPv6 or ME");
+        }
+
+        // Random fake_cert_len only when default is in use.
+        if !config.censorship.tls_emulation && config.censorship.fake_cert_len == default_fake_cert_len() {
+            config.censorship.fake_cert_len = rand::rng().gen_range(1024..4096);
+        }
 
         // Resolve listen_tcp: explicit value wins, otherwise auto-detect.
         // If unix socket is set → TCP only when listen_addr_ipv4 or listeners are explicitly provided.
@@ -177,23 +274,29 @@ impl ProxyConfig {
                     ip: ipv4,
                     announce: None,
                     announce_ip: None,
+                    proxy_protocol: None,
+                    reuse_allow: false,
                 });
             }
-            if let Some(ipv6_str) = &config.server.listen_addr_ipv6 {
-                if let Ok(ipv6) = ipv6_str.parse::<IpAddr>() {
-                    config.server.listeners.push(ListenerConfig {
-                        ip: ipv6,
-                        announce: None,
-                        announce_ip: None,
-                    });
-                }
+            if let Some(ipv6_str) = &config.server.listen_addr_ipv6
+                && let Ok(ipv6) = ipv6_str.parse::<IpAddr>()
+            {
+                config.server.listeners.push(ListenerConfig {
+                    ip: ipv6,
+                    announce: None,
+                    announce_ip: None,
+                    proxy_protocol: None,
+                    reuse_allow: false,
+                });
             }
         }
 
         // Migration: announce_ip → announce for each listener.
         for listener in &mut config.server.listeners {
-            if listener.announce.is_none() && listener.announce_ip.is_some() {
-                listener.announce = Some(listener.announce_ip.unwrap().to_string());
+            if listener.announce.is_none()
+                && let Some(ip) = listener.announce_ip.take()
+            {
+                listener.announce = Some(ip.to_string());
             }
         }
 
@@ -205,7 +308,7 @@ impl ProxyConfig {
         // Migration: Populate upstreams if empty (Default Direct).
         if config.upstreams.is_empty() {
             config.upstreams.push(UpstreamConfig {
-                upstream_type: UpstreamType::Direct { interface: None },
+                upstream_type: UpstreamType::Direct { interface: None, bind_addresses: None },
                 weight: 1,
                 enabled: true,
                 scopes: String::new(),
@@ -292,6 +395,111 @@ mod tests {
             .get("203")
             .map(|v| v.contains(&"91.105.192.100:443".to_string()))
             .unwrap_or(false));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_every_overrides_legacy_fields() {
+        let toml = r#"
+            [general]
+            update_every = 123
+            proxy_secret_auto_reload_secs = 700
+            proxy_config_auto_reload_secs = 800
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_update_every_override_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(cfg.general.effective_update_every_secs(), 123);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_every_fallback_to_legacy_min() {
+        let toml = r#"
+            [general]
+            proxy_secret_auto_reload_secs = 600
+            proxy_config_auto_reload_secs = 120
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_update_every_legacy_min_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(cfg.general.update_every, None);
+        assert_eq!(cfg.general.effective_update_every_secs(), 120);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_every_zero_is_rejected() {
+        let toml = r#"
+            [general]
+            update_every = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_update_every_zero_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.update_every must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_pool_min_fresh_ratio_out_of_range_is_rejected() {
+        let toml = r#"
+            [general]
+            me_pool_min_fresh_ratio = 1.5
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_pool_min_ratio_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_pool_min_fresh_ratio must be within [0.0, 1.0]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn force_close_bumped_when_below_drain_ttl() {
+        let toml = r#"
+            [general]
+            me_pool_drain_ttl_secs = 90
+            me_reinit_drain_timeout_secs = 30
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_force_close_bump_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(cfg.general.me_reinit_drain_timeout_secs, 90);
         let _ = std::fs::remove_file(path);
     }
 }

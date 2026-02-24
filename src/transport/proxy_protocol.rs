@@ -28,6 +28,7 @@ mod address_family {
 
 /// Information extracted from PROXY protocol header
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProxyProtocolInfo {
     /// Source (client) address
     pub src_addr: SocketAddr,
@@ -37,6 +38,7 @@ pub struct ProxyProtocolInfo {
     pub version: u8,
 }
 
+#[allow(dead_code)]
 impl ProxyProtocolInfo {
     /// Create info with just source address
     pub fn new(src_addr: SocketAddr) -> Self {
@@ -231,12 +233,14 @@ async fn parse_v2<R: AsyncRead + Unpin>(
 }
 
 /// Builder for PROXY protocol v1 header
+#[allow(dead_code)]
 pub struct ProxyProtocolV1Builder {
     family: &'static str,
     src_addr: Option<SocketAddr>,
     dst_addr: Option<SocketAddr>,
 }
 
+#[allow(dead_code)]
 impl ProxyProtocolV1Builder {
     pub fn new() -> Self {
         Self {
@@ -280,6 +284,60 @@ impl ProxyProtocolV1Builder {
 impl Default for ProxyProtocolV1Builder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Builder for PROXY protocol v2 header
+#[allow(dead_code)]
+pub struct ProxyProtocolV2Builder {
+    src: Option<SocketAddr>,
+    dst: Option<SocketAddr>,
+}
+
+#[allow(dead_code)]
+impl ProxyProtocolV2Builder {
+    pub fn new() -> Self {
+        Self { src: None, dst: None }
+    }
+
+    pub fn with_addrs(mut self, src: SocketAddr, dst: SocketAddr) -> Self {
+        self.src = Some(src);
+        self.dst = Some(dst);
+        self
+    }
+
+    pub fn build(&self) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(PROXY_V2_SIGNATURE);
+        // version 2, PROXY command
+        header.push(0x21);
+
+        match (self.src, self.dst) {
+            (Some(SocketAddr::V4(src)), Some(SocketAddr::V4(dst))) => {
+                header.push(0x11); // INET + STREAM
+                header.extend_from_slice(&(12u16).to_be_bytes());
+                header.extend_from_slice(&src.ip().octets());
+                header.extend_from_slice(&dst.ip().octets());
+                header.extend_from_slice(&src.port().to_be_bytes());
+                header.extend_from_slice(&dst.port().to_be_bytes());
+            }
+            (Some(SocketAddr::V6(src)), Some(SocketAddr::V6(dst))) => {
+                header.push(0x21); // INET6 + STREAM
+                header.extend_from_slice(&(36u16).to_be_bytes());
+                header.extend_from_slice(&src.ip().octets());
+                header.extend_from_slice(&dst.ip().octets());
+                header.extend_from_slice(&src.port().to_be_bytes());
+                header.extend_from_slice(&dst.port().to_be_bytes());
+            }
+            _ => {
+                // LOCAL/UNSPEC: no address information
+                header[12] = 0x20; // version 2, LOCAL command
+                header.push(0x00);
+                header.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+
+        header
     }
 }
 

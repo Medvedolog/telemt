@@ -6,27 +6,31 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::crypto::{AesCbc, crc32};
+use crate::crypto::AesCbc;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
+use crate::stats::Stats;
 
-use super::codec::RpcWriter;
+use super::codec::{RpcChecksumMode, WriterCommand, rpc_crc};
+use super::registry::RouteResult;
 use super::{ConnRegistry, MeResponse};
 
 pub(crate) async fn reader_loop(
     mut rd: tokio::io::ReadHalf<TcpStream>,
     dk: [u8; 32],
     mut div: [u8; 16],
+    crc_mode: RpcChecksumMode,
     reg: Arc<ConnRegistry>,
     enc_leftover: BytesMut,
     mut dec: BytesMut,
-    writer: Arc<Mutex<RpcWriter>>,
+    tx: mpsc::Sender<WriterCommand>,
     ping_tracker: Arc<Mutex<HashMap<i64, (Instant, u64)>>>,
     rtt_stats: Arc<Mutex<HashMap<u64, (f64, f64)>>>,
+    stats: Arc<Stats>,
     _writer_id: u64,
     degraded: Arc<AtomicBool>,
     cancel: CancellationToken,
@@ -78,18 +82,28 @@ pub(crate) async fn reader_loop(
             let frame = dec.split_to(fl);
             let pe = fl - 4;
             let ec = u32::from_le_bytes(frame[pe..pe + 4].try_into().unwrap());
-            if crc32(&frame[..pe]) != ec {
-                warn!("CRC mismatch in data frame");
-                continue;
+            let actual_crc = rpc_crc(crc_mode, &frame[..pe]);
+            if actual_crc != ec {
+                stats.increment_me_crc_mismatch();
+                warn!(
+                    frame_len = fl,
+                    expected_crc = format_args!("0x{ec:08x}"),
+                    actual_crc = format_args!("0x{actual_crc:08x}"),
+                    "CRC mismatch — CBC crypto desync, aborting ME connection"
+                );
+                return Err(ProxyError::Proxy("CRC mismatch (crypto desync)".into()));
             }
 
             let seq_no = i32::from_le_bytes(frame[4..8].try_into().unwrap());
             if seq_no != expected_seq {
+                stats.increment_me_seq_mismatch();
                 warn!(seq_no, expected = expected_seq, "ME RPC seq mismatch");
-                expected_seq = seq_no.wrapping_add(1);
-            } else {
-                expected_seq = expected_seq.wrapping_add(1);
+                return Err(ProxyError::SeqNoMismatch {
+                    expected: expected_seq,
+                    got: seq_no,
+                });
             }
+            expected_seq = expected_seq.wrapping_add(1);
 
             let payload = &frame[8..pe];
             if payload.len() < 4 {
@@ -106,9 +120,15 @@ pub(crate) async fn reader_loop(
                 trace!(cid, flags, len = data.len(), "RPC_PROXY_ANS");
 
                 let routed = reg.route(cid, MeResponse::Data { flags, data }).await;
-                if !routed {
+                if !matches!(routed, RouteResult::Routed) {
+                    match routed {
+                        RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
+                        RouteResult::ChannelClosed => stats.increment_me_route_drop_channel_closed(),
+                        RouteResult::QueueFull => stats.increment_me_route_drop_queue_full(),
+                        RouteResult::Routed => {}
+                    }
                     reg.unregister(cid).await;
-                    send_close_conn(&writer, cid).await;
+                    send_close_conn(&tx, cid).await;
                 }
             } else if pt == RPC_SIMPLE_ACK_U32 && body.len() >= 12 {
                 let cid = u64::from_le_bytes(body[0..8].try_into().unwrap());
@@ -116,9 +136,15 @@ pub(crate) async fn reader_loop(
                 trace!(cid, cfm, "RPC_SIMPLE_ACK");
 
                 let routed = reg.route(cid, MeResponse::Ack(cfm)).await;
-                if !routed {
+                if !matches!(routed, RouteResult::Routed) {
+                    match routed {
+                        RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
+                        RouteResult::ChannelClosed => stats.increment_me_route_drop_channel_closed(),
+                        RouteResult::QueueFull => stats.increment_me_route_drop_queue_full(),
+                        RouteResult::Routed => {}
+                    }
                     reg.unregister(cid).await;
-                    send_close_conn(&writer, cid).await;
+                    send_close_conn(&tx, cid).await;
                 }
             } else if pt == RPC_CLOSE_EXT_U32 && body.len() >= 8 {
                 let cid = u64::from_le_bytes(body[0..8].try_into().unwrap());
@@ -136,12 +162,13 @@ pub(crate) async fn reader_loop(
                 let mut pong = Vec::with_capacity(12);
                 pong.extend_from_slice(&RPC_PONG_U32.to_le_bytes());
                 pong.extend_from_slice(&ping_id.to_le_bytes());
-                if let Err(e) = writer.lock().await.send_and_flush(&pong).await {
-                    warn!(error = %e, "PONG send failed");
+                if tx.send(WriterCommand::DataAndFlush(pong)).await.is_err() {
+                    warn!("PONG send failed");
                     break;
                 }
             } else if pt == RPC_PONG_U32 && body.len() >= 8 {
                 let ping_id = i64::from_le_bytes(body[0..8].try_into().unwrap());
+                stats.increment_me_keepalive_pong();
                 if let Some((sent, wid)) = {
                     let mut guard = ping_tracker.lock().await;
                     guard.remove(&ping_id)
@@ -171,12 +198,10 @@ pub(crate) async fn reader_loop(
     }
 }
 
-async fn send_close_conn(writer: &Arc<Mutex<RpcWriter>>, conn_id: u64) {
+async fn send_close_conn(tx: &mpsc::Sender<WriterCommand>, conn_id: u64) {
     let mut p = Vec::with_capacity(12);
     p.extend_from_slice(&RPC_CLOSE_CONN_U32.to_le_bytes());
     p.extend_from_slice(&conn_id.to_le_bytes());
 
-    if let Err(e) = writer.lock().await.send_and_flush(&p).await {
-        debug!(conn_id, error = %e, "Failed to send RPC_CLOSE_CONN");
-    }
+    let _ = tx.send(WriterCommand::DataAndFlush(p)).await;
 }

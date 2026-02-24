@@ -1,7 +1,7 @@
 //! Masking - forward unrecognized traffic to mask host
 
-use std::time::Duration;
 use std::str;
+use std::time::Duration;
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -11,20 +11,20 @@ use tracing::debug;
 use crate::config::ProxyConfig;
 
 const MASK_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Maximum duration for the entire masking relay.
-    /// Limits resource consumption from slow-loris attacks and port scanners.
-    const MASK_RELAY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum duration for the entire masking relay.
+/// Limits resource consumption from slow-loris attacks and port scanners.
+const MASK_RELAY_TIMEOUT: Duration = Duration::from_secs(60);
 const MASK_BUFFER_SIZE: usize = 8192;
 
 /// Detect client type based on initial data
 fn detect_client_type(data: &[u8]) -> &'static str {
     // Check for HTTP request
-    if data.len() > 4 {
-        if data.starts_with(b"GET ") || data.starts_with(b"POST") ||
+    if data.len() > 4
+        && (data.starts_with(b"GET ") || data.starts_with(b"POST") ||
            data.starts_with(b"HEAD") || data.starts_with(b"PUT ") ||
-           data.starts_with(b"DELETE") || data.starts_with(b"OPTIONS") {
-            return "HTTP";
-        }
+           data.starts_with(b"DELETE") || data.starts_with(b"OPTIONS"))
+    {
+        return "HTTP";
     }
 
     // Check for TLS ClientHello (0x16 = handshake, 0x03 0x01-0x03 = TLS version)
@@ -78,7 +78,9 @@ where
         match connect_result {
             Ok(Ok(stream)) => {
                 let (mask_read, mask_write) = stream.into_split();
-                relay_to_mask(reader, writer, mask_read, mask_write, initial_data).await;
+                if timeout(MASK_RELAY_TIMEOUT, relay_to_mask(reader, writer, mask_read, mask_write, initial_data)).await.is_err() {
+                    debug!("Mask relay timed out (unix socket)");
+                }
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "Failed to connect to mask unix socket");
@@ -110,7 +112,9 @@ where
     match connect_result {
         Ok(Ok(stream)) => {
             let (mask_read, mask_write) = stream.into_split();
-            relay_to_mask(reader, writer, mask_read, mask_write, initial_data).await;
+            if timeout(MASK_RELAY_TIMEOUT, relay_to_mask(reader, writer, mask_read, mask_write, initial_data)).await.is_err() {
+                debug!("Mask relay timed out");
+            }
         }
         Ok(Err(e)) => {
             debug!(error = %e, "Failed to connect to mask host");

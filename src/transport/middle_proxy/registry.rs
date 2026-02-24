@@ -1,14 +1,27 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc::error::TrySendError;
 
-use super::codec::RpcWriter;
+use super::codec::WriterCommand;
 use super::MeResponse;
 
+const ROUTE_CHANNEL_CAPACITY: usize = 4096;
+const ROUTE_BACKPRESSURE_TIMEOUT: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteResult {
+    Routed,
+    NoConn,
+    ChannelClosed,
+    QueueFull,
+}
+
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ConnMeta {
     pub target_dc: i16,
     pub client_addr: SocketAddr,
@@ -17,6 +30,7 @@ pub struct ConnMeta {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct BoundConn {
     pub conn_id: u64,
     pub meta: ConnMeta,
@@ -25,12 +39,12 @@ pub struct BoundConn {
 #[derive(Clone)]
 pub struct ConnWriter {
     pub writer_id: u64,
-    pub writer: Arc<Mutex<RpcWriter>>,
+    pub tx: mpsc::Sender<WriterCommand>,
 }
 
 struct RegistryInner {
     map: HashMap<u64, mpsc::Sender<MeResponse>>,
-    writers: HashMap<u64, Arc<Mutex<RpcWriter>>>,
+    writers: HashMap<u64, mpsc::Sender<WriterCommand>>,
     writer_for_conn: HashMap<u64, u64>,
     conns_for_writer: HashMap<u64, HashSet<u64>>,
     meta: HashMap<u64, ConnMeta>,
@@ -64,7 +78,7 @@ impl ConnRegistry {
 
     pub async fn register(&self) -> (u64, mpsc::Receiver<MeResponse>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         self.inner.write().await.map.insert(id, tx);
         (id, rx)
     }
@@ -83,12 +97,27 @@ impl ConnRegistry {
         None
     }
 
-    pub async fn route(&self, id: u64, resp: MeResponse) -> bool {
-        let inner = self.inner.read().await;
-        if let Some(tx) = inner.map.get(&id) {
-            tx.try_send(resp).is_ok()
-        } else {
-            false
+    pub async fn route(&self, id: u64, resp: MeResponse) -> RouteResult {
+        let tx = {
+            let inner = self.inner.read().await;
+            inner.map.get(&id).cloned()
+        };
+
+        let Some(tx) = tx else {
+            return RouteResult::NoConn;
+        };
+
+        match tx.try_send(resp) {
+            Ok(()) => RouteResult::Routed,
+            Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
+            Err(TrySendError::Full(resp)) => {
+                // Absorb short bursts without dropping/closing the session immediately.
+                match tokio::time::timeout(ROUTE_BACKPRESSURE_TIMEOUT, tx.send(resp)).await {
+                    Ok(Ok(())) => RouteResult::Routed,
+                    Ok(Err(_)) => RouteResult::ChannelClosed,
+                    Err(_) => RouteResult::QueueFull,
+                }
+            }
         }
     }
 
@@ -96,13 +125,13 @@ impl ConnRegistry {
         &self,
         conn_id: u64,
         writer_id: u64,
-        writer: Arc<Mutex<RpcWriter>>,
+        tx: mpsc::Sender<WriterCommand>,
         meta: ConnMeta,
     ) {
         let mut inner = self.inner.write().await;
         inner.meta.entry(conn_id).or_insert(meta);
         inner.writer_for_conn.insert(conn_id, writer_id);
-        inner.writers.entry(writer_id).or_insert_with(|| writer.clone());
+        inner.writers.entry(writer_id).or_insert_with(|| tx.clone());
         inner
             .conns_for_writer
             .entry(writer_id)
@@ -114,7 +143,7 @@ impl ConnRegistry {
         let inner = self.inner.read().await;
         let writer_id = inner.writer_for_conn.get(&conn_id).cloned()?;
         let writer = inner.writers.get(&writer_id).cloned()?;
-        Some(ConnWriter { writer_id, writer })
+        Some(ConnWriter { writer_id, tx: writer })
     }
 
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
@@ -140,6 +169,7 @@ impl ConnRegistry {
         out
     }
 
+    #[allow(dead_code)]
     pub async fn get_meta(&self, conn_id: u64) -> Option<ConnMeta> {
         let inner = self.inner.read().await;
         inner.meta.get(&conn_id).cloned()

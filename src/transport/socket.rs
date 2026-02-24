@@ -1,5 +1,7 @@
 //! TCP Socket Configuration
 
+use std::collections::HashSet;
+use std::fs;
 use std::io::Result;
 use std::net::{SocketAddr, IpAddr};
 use std::time::Duration;
@@ -8,6 +10,7 @@ use socket2::{Socket, TcpKeepalive, Domain, Type, Protocol};
 use tracing::debug;
 
 /// Configure TCP socket with recommended settings for proxy use
+#[allow(dead_code)]
 pub fn configure_tcp_socket(
     stream: &TcpStream,
     keepalive: bool,
@@ -80,6 +83,7 @@ pub fn configure_client_socket(
 }
 
 /// Set socket to send RST on close (for masking)
+#[allow(dead_code)]
 pub fn set_linger_zero(stream: &TcpStream) -> Result<()> {
     let socket = socket2::SockRef::from(stream);
     socket.set_linger(Some(Duration::ZERO))?;
@@ -87,6 +91,7 @@ pub fn set_linger_zero(stream: &TcpStream) -> Result<()> {
 }
 
 /// Create a new TCP socket for outgoing connections
+#[allow(dead_code)]
 pub fn create_outgoing_socket(addr: SocketAddr) -> Result<Socket> {
     create_outgoing_socket_bound(addr, None)
 }
@@ -118,16 +123,51 @@ pub fn create_outgoing_socket_bound(addr: SocketAddr, bind_addr: Option<IpAddr>)
 
 
 /// Get local address of a socket
+#[allow(dead_code)]
 pub fn get_local_addr(stream: &TcpStream) -> Option<SocketAddr> {
     stream.local_addr().ok()
 }
 
+/// Resolve primary IP address of a network interface by name.
+/// Returns the first address matching the requested family (IPv4/IPv6).
+#[cfg(unix)]
+pub fn resolve_interface_ip(name: &str, want_ipv6: bool) -> Option<IpAddr> {
+    use nix::ifaddrs::getifaddrs;
+
+    if let Ok(addrs) = getifaddrs() {
+        for iface in addrs {
+            if iface.interface_name == name
+                && let Some(address) = iface.address
+            {
+                if let Some(v4) = address.as_sockaddr_in() {
+                    if !want_ipv6 {
+                        return Some(IpAddr::V4(v4.ip()));
+                    }
+                } else if let Some(v6) = address.as_sockaddr_in6()
+                    && want_ipv6
+                {
+                    return Some(IpAddr::V6(v6.ip()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stub for non-Unix platforms: interface name resolution unsupported.
+#[cfg(not(unix))]
+pub fn resolve_interface_ip(_name: &str, _want_ipv6: bool) -> Option<IpAddr> {
+    None
+}
+
 /// Get peer address of a socket
+#[allow(dead_code)]
 pub fn get_peer_addr(stream: &TcpStream) -> Option<SocketAddr> {
     stream.peer_addr().ok()
 }
 
 /// Check if address is IPv6
+#[allow(dead_code)]
 pub fn is_ipv6(addr: &SocketAddr) -> bool {
     addr.is_ipv6()
 }
@@ -200,6 +240,133 @@ pub fn create_listener(addr: SocketAddr, options: &ListenOptions) -> Result<Sock
     debug!(addr = %addr, "Created listening socket");
     
     Ok(socket)
+}
+
+/// Best-effort process list for listeners occupying the same local TCP port.
+#[derive(Debug, Clone)]
+pub struct ListenerProcessInfo {
+    pub pid: u32,
+    pub process: String,
+}
+
+/// Find processes currently listening on the local TCP port of `addr`.
+/// Returns an empty list when unsupported or when no owners can be resolved.
+pub fn find_listener_processes(addr: SocketAddr) -> Vec<ListenerProcessInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        find_listener_processes_linux(addr)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = addr;
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_listener_processes_linux(addr: SocketAddr) -> Vec<ListenerProcessInfo> {
+    let inodes = listening_inodes_for_port(addr);
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+
+    for entry in proc_entries.flatten() {
+        let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+
+        let fd_dir = entry.path().join("fd");
+        let fd_entries = match fs::read_dir(fd_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        let mut matched = false;
+        for fd in fd_entries.flatten() {
+            let link_target = match fs::read_link(fd.path()) {
+                Ok(link) => link,
+                Err(_) => continue,
+            };
+
+            let link_str = link_target.to_string_lossy();
+            let Some(rest) = link_str.strip_prefix("socket:[") else {
+                continue;
+            };
+            let Some(inode_str) = rest.strip_suffix(']') else {
+                continue;
+            };
+            let Ok(inode) = inode_str.parse::<u64>() else {
+                continue;
+            };
+
+            if inodes.contains(&inode) {
+                matched = true;
+                break;
+            }
+        }
+
+        if matched {
+            let process = fs::read_to_string(entry.path().join("comm"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            out.push(ListenerProcessInfo { pid, process });
+        }
+    }
+
+    out.sort_by_key(|p| p.pid);
+    out.dedup_by_key(|p| p.pid);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn listening_inodes_for_port(addr: SocketAddr) -> HashSet<u64> {
+    let path = match addr {
+        SocketAddr::V4(_) => "/proc/net/tcp",
+        SocketAddr::V6(_) => "/proc/net/tcp6",
+    };
+
+    let mut inodes = HashSet::new();
+    let Ok(data) = fs::read_to_string(path) else {
+        return inodes;
+    };
+
+    for line in data.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            continue;
+        }
+
+        // LISTEN state in /proc/net/tcp*
+        if cols[3] != "0A" {
+            continue;
+        }
+
+        let Some(port_hex) = cols[1].split(':').nth(1) else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if port != addr.port() {
+            continue;
+        }
+
+        if let Ok(inode) = cols[9].parse::<u64>() {
+            inodes.insert(inode);
+        }
+    }
+
+    inodes
 }
 
 #[cfg(test)]

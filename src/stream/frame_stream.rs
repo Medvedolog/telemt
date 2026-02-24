@@ -1,6 +1,8 @@
 //! MTProto frame stream wrappers
 
-use bytes::{Bytes, BytesMut};
+#![allow(dead_code)]
+
+use bytes::Bytes;
 use std::io::{Error, ErrorKind, Result};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use crate::protocol::constants::*;
@@ -76,7 +78,7 @@ impl<W> AbridgedFrameWriter<W> {
 impl<W: AsyncWrite + Unpin> AbridgedFrameWriter<W> {
     /// Write a frame
     pub async fn write_frame(&mut self, data: &[u8], meta: &FrameMeta) -> Result<()> {
-        if data.len() % 4 != 0 {
+        if !data.len().is_multiple_of(4) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Abridged frame must be aligned to 4 bytes, got {}", data.len()),
@@ -232,11 +234,13 @@ impl<R: AsyncRead + Unpin> SecureIntermediateFrameReader<R> {
         let mut data = vec![0u8; len];
         self.upstream.read_exact(&mut data).await?;
         
-        // Strip padding (not aligned to 4)
-        if len % 4 != 0 {
-            let actual_len = len - (len % 4);
-            data.truncate(actual_len);
-        }
+        let payload_len = secure_payload_len_from_wire_len(len).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid secure frame length: {len}"),
+            )
+        })?;
+        data.truncate(payload_len);
         
         Ok((Bytes::from(data), meta))
     }
@@ -267,8 +271,15 @@ impl<W: AsyncWrite + Unpin> SecureIntermediateFrameWriter<W> {
             return Ok(());
         }
         
-        // Add random padding (0-3 bytes)
-        let padding_len = self.rng.range(4);
+        if !is_valid_secure_payload_len(data.len()) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Secure payload must be 4-byte aligned, got {}", data.len()),
+            ));
+        }
+
+        // Add padding so total length is never divisible by 4 (MTProto Secure)
+        let padding_len = secure_padding_len(data.len(), &self.rng);
         let padding = self.rng.bytes(padding_len);
         
         let total_len = data.len() + padding_len;
@@ -320,7 +331,7 @@ impl<R: AsyncRead + Unpin> MtprotoFrameReader<R> {
             }
             
             // Validate length
-            if len < MIN_MSG_LEN || len > MAX_MSG_LEN || len % PADDING_FILLER.len() != 0 {
+            if !(MIN_MSG_LEN..=MAX_MSG_LEN).contains(&len) || !len.is_multiple_of(PADDING_FILLER.len()) {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Invalid message length: {}", len),
@@ -550,9 +561,7 @@ mod tests {
         writer.flush().await.unwrap();
         
         let (received, _meta) = reader.read_frame().await.unwrap();
-        // Received should have padding stripped to align to 4
-        let expected_len = (data.len() / 4) * 4;
-        assert_eq!(received.len(), expected_len);
+        assert_eq!(received.len(), data.len());
     }
     
     #[tokio::test]

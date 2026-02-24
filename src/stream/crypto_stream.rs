@@ -18,6 +18,8 @@
 //!   is either written to upstream or stored in our pending buffer
 //! - when upstream is pending -> ciphertext is buffered/bounded and backpressure is applied
 //!
+
+#![allow(dead_code)]
 //! =======================
 //! Writer state machine
 //! =======================
@@ -34,7 +36,7 @@
 //! └────────────────────────────────────────┘
 //!
 //! Backpressure
-//! - pending ciphertext buffer is bounded (MAX_PENDING_WRITE)
+//! - pending ciphertext buffer is bounded (configurable per connection)
 //! - pending is full and upstream is pending 
 //!   -> poll_write returns Poll::Pending
 //!   -> do not accept any plaintext
@@ -45,7 +47,7 @@
 //! - when upstream is Pending but pending still has room: accept `to_accept` bytes and
 //!   encrypt+append ciphertext directly into pending (in-place encryption of appended range)
 
-//! Encrypted stream wrappers using AES-CTR
+//!   Encrypted stream wrappers using AES-CTR
 //!
 //! This module provides stateful async stream wrappers that handle
 //! encryption/decryption with proper partial read/write handling.
@@ -55,17 +57,16 @@ use std::io::{self, ErrorKind, Result};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::crypto::AesCtr;
 use super::state::{StreamState, YieldBuffer};
 
 // ============= Constants =============
 
-/// Maximum size for pending ciphertext buffer (bounded backpressure).
-/// Reduced to 64KB to prevent bufferbloat on mobile networks.
-/// 512KB was causing high latency on 3G/LTE connections.
-const MAX_PENDING_WRITE: usize = 64 * 1024;
+/// Default size for pending ciphertext buffer (bounded backpressure).
+/// Actual limit is supplied at runtime from configuration.
+const DEFAULT_MAX_PENDING_WRITE: usize = 64 * 1024;
 
 /// Default read buffer capacity (reader mostly decrypts in-place into caller buffer).
 const DEFAULT_READ_CAPACITY: usize = 16 * 1024;
@@ -152,9 +153,9 @@ impl<R> CryptoReader<R> {
     fn take_poison_error(&mut self) -> io::Error {
         match &mut self.state {
             CryptoReaderState::Poisoned { error } => error.take().unwrap_or_else(|| {
-                io::Error::new(ErrorKind::Other, "stream previously poisoned")
+                io::Error::other("stream previously poisoned")
             }),
-            _ => io::Error::new(ErrorKind::Other, "stream not poisoned"),
+            _ => io::Error::other("stream not poisoned"),
         }
     }
 }
@@ -167,6 +168,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for CryptoReader<R> {
     ) -> Poll<Result<()>> {
         let this = self.get_mut();
 
+        #[allow(clippy::never_loop)]
         loop {
             match &mut this.state {
                 CryptoReaderState::Poisoned { .. } => {
@@ -427,15 +429,22 @@ pub struct CryptoWriter<W> {
     encryptor: AesCtr,
     state: CryptoWriterState,
     scratch: BytesMut,
+    max_pending_write: usize,
 }
 
 impl<W> CryptoWriter<W> {
-    pub fn new(upstream: W, encryptor: AesCtr) -> Self {
+    pub fn new(upstream: W, encryptor: AesCtr, max_pending_write: usize) -> Self {
+        let max_pending = if max_pending_write == 0 {
+            DEFAULT_MAX_PENDING_WRITE
+        } else {
+            max_pending_write
+        };
         Self {
             upstream,
             encryptor,
             state: CryptoWriterState::Idle,
             scratch: BytesMut::with_capacity(16 * 1024),
+            max_pending_write: max_pending.max(4 * 1024),
         }
     }
 
@@ -477,17 +486,17 @@ impl<W> CryptoWriter<W> {
     fn take_poison_error(&mut self) -> io::Error {
         match &mut self.state {
             CryptoWriterState::Poisoned { error } => error.take().unwrap_or_else(|| {
-                io::Error::new(ErrorKind::Other, "stream previously poisoned")
+                io::Error::other("stream previously poisoned")
             }),
-            _ => io::Error::new(ErrorKind::Other, "stream not poisoned"),
+            _ => io::Error::other("stream not poisoned"),
         }
     }
 
     /// Ensure we are in Flushing state and return mutable pending buffer.
-    fn ensure_pending<'a>(state: &'a mut CryptoWriterState) -> &'a mut PendingCiphertext {
+    fn ensure_pending(state: &mut CryptoWriterState, max_pending: usize) -> &mut PendingCiphertext {
         if matches!(state, CryptoWriterState::Idle) {
             *state = CryptoWriterState::Flushing {
-                pending: PendingCiphertext::new(MAX_PENDING_WRITE),
+                pending: PendingCiphertext::new(max_pending),
             };
         }
 
@@ -498,14 +507,14 @@ impl<W> CryptoWriter<W> {
     }
 
     /// Select how many plaintext bytes can be accepted in buffering path
-    fn select_to_accept_for_buffering(state: &CryptoWriterState, buf_len: usize) -> usize {
+    fn select_to_accept_for_buffering(state: &CryptoWriterState, buf_len: usize, max_pending: usize) -> usize {
         if buf_len == 0 {
             return 0;
         }
 
         match state {
             CryptoWriterState::Flushing { pending } => buf_len.min(pending.remaining_capacity()),
-            CryptoWriterState::Idle => buf_len.min(MAX_PENDING_WRITE),
+            CryptoWriterState::Idle => buf_len.min(max_pending),
             CryptoWriterState::Poisoned { .. } => 0,
         }
     }
@@ -603,7 +612,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CryptoWriter<W> {
                 Poll::Pending => {
                     // Upstream blocked. Apply ideal backpressure
                     let to_accept =
-                        Self::select_to_accept_for_buffering(&this.state, buf.len());
+                        Self::select_to_accept_for_buffering(&this.state, buf.len(), this.max_pending_write);
 
                     if to_accept == 0 {
                         trace!(
@@ -618,7 +627,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CryptoWriter<W> {
 
                     // Disjoint borrows
                     let encryptor = &mut this.encryptor;
-                    let pending = Self::ensure_pending(&mut this.state);
+                    let pending = Self::ensure_pending(&mut this.state, this.max_pending_write);
 
                     if let Err(e) = pending.push_encrypted(encryptor, plaintext) {
                         if e.kind() == ErrorKind::WouldBlock {
@@ -635,7 +644,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CryptoWriter<W> {
         // 2) Fast path: pending empty -> write-through
         debug_assert!(matches!(this.state, CryptoWriterState::Idle));
 
-        let to_accept = buf.len().min(MAX_PENDING_WRITE);
+        let to_accept = buf.len().min(this.max_pending_write);
         let plaintext = &buf[..to_accept];
 
         Self::encrypt_into_scratch(&mut this.encryptor, &mut this.scratch, plaintext);
@@ -645,7 +654,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CryptoWriter<W> {
                 // Upstream blocked: buffer FULL ciphertext for accepted bytes.
                 let ciphertext = std::mem::take(&mut this.scratch);
 
-                let pending = Self::ensure_pending(&mut this.state);
+                let pending = Self::ensure_pending(&mut this.state, this.max_pending_write);
                 pending.replace_with(ciphertext);
 
                 Poll::Ready(Ok(to_accept))
@@ -672,7 +681,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CryptoWriter<W> {
                 let remainder = this.scratch.split_off(n);
                 this.scratch.clear();
 
-                let pending = Self::ensure_pending(&mut this.state);
+                let pending = Self::ensure_pending(&mut this.state, this.max_pending_write);
                 pending.replace_with(remainder);
 
                 Poll::Ready(Ok(to_accept))

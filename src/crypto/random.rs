@@ -1,5 +1,8 @@
 //! Pseudorandom
 
+#![allow(deprecated)]
+#![allow(dead_code)]
+
 use rand::{Rng, RngCore, SeedableRng};
 use rand::rngs::StdRng;
 use parking_lot::Mutex;
@@ -10,6 +13,9 @@ use crate::crypto::AesCtr;
 pub struct SecureRandom {
     inner: Mutex<SecureRandomInner>,
 }
+
+unsafe impl Send for SecureRandom {}
+unsafe impl Sync for SecureRandom {}
 
 struct SecureRandomInner {
     rng: StdRng,
@@ -46,19 +52,32 @@ impl SecureRandom {
         }
     }
     
-    /// Generate random bytes
-    pub fn bytes(&self, len: usize) -> Vec<u8> {
+    /// Fill a caller-provided buffer with random bytes.
+    pub fn fill(&self, out: &mut [u8]) {
         let mut inner = self.inner.lock();
         const CHUNK_SIZE: usize = 512;
-        
-        while inner.buffer.len() < len {
-            let mut chunk = vec![0u8; CHUNK_SIZE];
-            inner.rng.fill_bytes(&mut chunk);
-            inner.cipher.apply(&mut chunk);
-            inner.buffer.extend_from_slice(&chunk);
+
+        let mut written = 0usize;
+        while written < out.len() {
+            if inner.buffer.is_empty() {
+                let mut chunk = vec![0u8; CHUNK_SIZE];
+                inner.rng.fill_bytes(&mut chunk);
+                inner.cipher.apply(&mut chunk);
+                inner.buffer.extend_from_slice(&chunk);
+            }
+
+            let take = (out.len() - written).min(inner.buffer.len());
+            out[written..written + take].copy_from_slice(&inner.buffer[..take]);
+            inner.buffer.drain(..take);
+            written += take;
         }
-        
-        inner.buffer.drain(..len).collect()
+    }
+
+    /// Generate random bytes
+    pub fn bytes(&self, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        self.fill(&mut out);
+        out
     }
     
     /// Generate random number in range [0, max)
@@ -76,7 +95,7 @@ impl SecureRandom {
             return 0;
         }
         
-        let bytes_needed = (k + 7) / 8;
+        let bytes_needed = k.div_ceil(8);
         let bytes = self.bytes(bytes_needed.min(8));
         
         let mut result = 0u64;

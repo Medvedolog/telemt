@@ -1,10 +1,13 @@
 //! Upstream Management with per-DC latency-weighted selection
-//! 
+//!
 //! IPv6/IPv4 connectivity checks with configurable preference.
+
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -15,7 +18,7 @@ use tracing::{debug, warn, info, trace};
 use crate::config::{UpstreamConfig, UpstreamType};
 use crate::error::{Result, ProxyError};
 use crate::protocol::constants::{TG_DATACENTERS_V4, TG_DATACENTERS_V6, TG_DATACENTER_PORT};
-use crate::transport::socket::create_outgoing_socket_bound;
+use crate::transport::socket::{create_outgoing_socket_bound, resolve_interface_ip};
 use crate::transport::socks::{connect_socks4, connect_socks5};
 
 /// Number of Telegram datacenters
@@ -23,6 +26,8 @@ const NUM_DCS: usize = 5;
 
 /// Timeout for individual DC ping attempt
 const DC_PING_TIMEOUT_SECS: u64 = 5;
+/// Timeout for direct TG DC TCP connect readiness.
+const DIRECT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 // ============= RTT Tracking =============
 
@@ -52,9 +57,10 @@ impl LatencyEma {
 // ============= Per-DC IP Preference Tracking =============
 
 /// Tracks which IP version works for each DC
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpPreference {
     /// Not yet tested
+    #[default]
     Unknown,
     /// IPv6 works
     PreferV6,
@@ -64,12 +70,6 @@ pub enum IpPreference {
     BothWork,
     /// Both failed
     Unavailable,
-}
-
-impl Default for IpPreference {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 // ============= Upstream State =============
@@ -84,6 +84,8 @@ struct UpstreamState {
     dc_latency: [LatencyEma; NUM_DCS],
     /// Per-DC IP version preference (learned from connectivity tests)
     dc_ip_pref: [IpPreference; NUM_DCS],
+    /// Round-robin counter for bind_addresses selection
+    bind_rr: Arc<AtomicUsize>,
 }
 
 impl UpstreamState {
@@ -95,6 +97,7 @@ impl UpstreamState {
             last_check: std::time::Instant::now(),
             dc_latency: [LatencyEma::new(0.3); NUM_DCS],
             dc_ip_pref: [IpPreference::Unknown; NUM_DCS],
+            bind_rr: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -104,7 +107,7 @@ impl UpstreamState {
         if abs_dc == 0 {
             return None;
         }
-        if abs_dc >= 1 && abs_dc <= NUM_DCS {
+        if (1..=NUM_DCS).contains(&abs_dc) {
             Some(abs_dc - 1)
         } else {
             // Unknown DC → default cluster (DC 2, index 1)
@@ -114,10 +117,10 @@ impl UpstreamState {
 
     /// Get latency for a specific DC, falling back to average across all known DCs
     fn effective_latency(&self, dc_idx: Option<i16>) -> Option<f64> {
-        if let Some(di) = dc_idx.and_then(Self::dc_array_idx) {
-            if let Some(ms) = self.dc_latency[di].get() {
-                return Some(ms);
-            }
+        if let Some(di) = dc_idx.and_then(Self::dc_array_idx)
+            && let Some(ms) = self.dc_latency[di].get()
+        {
+            return Some(ms);
         }
 
         let (sum, count) = self.dc_latency.iter()
@@ -164,6 +167,46 @@ impl UpstreamManager {
         Self {
             upstreams: Arc::new(RwLock::new(states)),
         }
+    }
+
+    fn resolve_bind_address(
+        interface: &Option<String>,
+        bind_addresses: &Option<Vec<String>>,
+        target: SocketAddr,
+        rr: Option<&AtomicUsize>,
+    ) -> Option<IpAddr> {
+        let want_ipv6 = target.is_ipv6();
+
+        if let Some(addrs) = bind_addresses {
+            let candidates: Vec<IpAddr> = addrs
+                .iter()
+                .filter_map(|s| s.parse::<IpAddr>().ok())
+                .filter(|ip| ip.is_ipv6() == want_ipv6)
+                .collect();
+
+            if !candidates.is_empty() {
+                if let Some(counter) = rr {
+                    let idx = counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                    return Some(candidates[idx]);
+                }
+                return candidates.first().copied();
+            }
+        }
+
+        if let Some(iface) = interface {
+            if let Ok(ip) = iface.parse::<IpAddr>() {
+                if ip.is_ipv6() == want_ipv6 {
+                    return Some(ip);
+                }
+            } else {
+                #[cfg(unix)]
+                if let Some(ip) = resolve_interface_ip(iface, want_ipv6) {
+                    return Some(ip);
+                }
+            }
+        }
+
+        None
     }
 
     /// Select upstream using latency-weighted random selection.
@@ -262,7 +305,12 @@ impl UpstreamManager {
 
         let start = Instant::now();
 
-        match self.connect_via_upstream(&upstream, target).await {
+        let bind_rr = {
+            let guard = self.upstreams.read().await;
+            guard.get(idx).map(|u| u.bind_rr.clone())
+        };
+
+        match self.connect_via_upstream(&upstream, target, bind_rr).await {
             Ok(stream) => {
                 let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let mut guard = self.upstreams.write().await;
@@ -294,13 +342,27 @@ impl UpstreamManager {
         }
     }
 
-    async fn connect_via_upstream(&self, config: &UpstreamConfig, target: SocketAddr) -> Result<TcpStream> {
+    async fn connect_via_upstream(
+        &self,
+        config: &UpstreamConfig,
+        target: SocketAddr,
+        bind_rr: Option<Arc<AtomicUsize>>,
+    ) -> Result<TcpStream> {
         match &config.upstream_type {
-            UpstreamType::Direct { interface } => {
-                let bind_ip = interface.as_ref()
-                    .and_then(|s| s.parse::<IpAddr>().ok());
+            UpstreamType::Direct { interface, bind_addresses } => {
+                let bind_ip = Self::resolve_bind_address(
+                    interface,
+                    bind_addresses,
+                    target,
+                    bind_rr.as_deref(),
+                );
 
                 let socket = create_outgoing_socket_bound(target, bind_ip)?;
+                if let Some(ip) = bind_ip {
+                    debug!(bind = %ip, target = %target, "Bound outgoing socket");
+                } else if interface.is_some() || bind_addresses.is_some() {
+                    debug!(target = %target, "No matching bind address for target family");
+                }
 
                 socket.set_nonblocking(true)?;
                 match socket.connect(&target.into()) {
@@ -312,7 +374,16 @@ impl UpstreamManager {
                 let std_stream: std::net::TcpStream = socket.into();
                 let stream = TcpStream::from_std(std_stream)?;
 
-                stream.writable().await?;
+                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
+                match tokio::time::timeout(connect_timeout, stream.writable()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                    Err(_) => {
+                        return Err(ProxyError::ConnectionTimeout {
+                            addr: target.to_string(),
+                        });
+                    }
+                }
                 if let Some(e) = stream.take_error()? {
                     return Err(ProxyError::Io(e));
                 }
@@ -320,59 +391,128 @@ impl UpstreamManager {
                 Ok(stream)
             },
             UpstreamType::Socks4 { address, interface, user_id } => {
-                let proxy_addr: SocketAddr = address.parse()
-                    .map_err(|_| ProxyError::Config("Invalid SOCKS4 address".to_string()))?;
+                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
+                // Try to parse as SocketAddr first (IP:port), otherwise treat as hostname:port
+                let mut stream = if let Ok(proxy_addr) = address.parse::<SocketAddr>() {
+                    // IP:port format - use socket with optional interface binding
+                    let bind_ip = Self::resolve_bind_address(
+                        interface,
+                        &None,
+                        proxy_addr,
+                        bind_rr.as_deref(),
+                    );
 
-                let bind_ip = interface.as_ref()
-                    .and_then(|s| s.parse::<IpAddr>().ok());
+                    let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
 
-                let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
+                    socket.set_nonblocking(true)?;
+                    match socket.connect(&proxy_addr.into()) {
+                        Ok(()) => {},
+                        Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == std::io::ErrorKind::WouldBlock => {},
+                        Err(err) => return Err(ProxyError::Io(err)),
+                    }
 
-                socket.set_nonblocking(true)?;
-                match socket.connect(&proxy_addr.into()) {
-                    Ok(()) => {},
-                    Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == std::io::ErrorKind::WouldBlock => {},
-                    Err(err) => return Err(ProxyError::Io(err)),
-                }
+                    let std_stream: std::net::TcpStream = socket.into();
+                    let stream = TcpStream::from_std(std_stream)?;
 
-                let std_stream: std::net::TcpStream = socket.into();
-                let mut stream = TcpStream::from_std(std_stream)?;
+                    match tokio::time::timeout(connect_timeout, stream.writable()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                        Err(_) => {
+                            return Err(ProxyError::ConnectionTimeout {
+                                addr: proxy_addr.to_string(),
+                            });
+                        }
+                    }
+                    if let Some(e) = stream.take_error()? {
+                        return Err(ProxyError::Io(e));
+                    }
+                    stream
+                } else {
+                    // Hostname:port format - use tokio DNS resolution
+                    // Note: interface binding is not supported for hostnames
+                    if interface.is_some() {
+                        warn!("SOCKS4 interface binding is not supported for hostname addresses, ignoring");
+                    }
+                    match tokio::time::timeout(connect_timeout, TcpStream::connect(address)).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                        Err(_) => {
+                            return Err(ProxyError::ConnectionTimeout {
+                                addr: address.clone(),
+                            });
+                        }
+                    }
+                };
 
-                stream.writable().await?;
-                if let Some(e) = stream.take_error()? {
-                    return Err(ProxyError::Io(e));
-                }
                 // replace socks user_id with config.selected_scope, if set
                 let scope: Option<&str> = Some(config.selected_scope.as_str())
                     .filter(|s| !s.is_empty());
                 let _user_id: Option<&str> = scope.or(user_id.as_deref());
 
-                connect_socks4(&mut stream, target, _user_id).await?;
+                match tokio::time::timeout(connect_timeout, connect_socks4(&mut stream, target, _user_id)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(ProxyError::ConnectionTimeout {
+                            addr: target.to_string(),
+                        });
+                    }
+                }
                 Ok(stream)
             },
             UpstreamType::Socks5 { address, interface, username, password } => {
-                let proxy_addr: SocketAddr = address.parse()
-                    .map_err(|_| ProxyError::Config("Invalid SOCKS5 address".to_string()))?;
+                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
+                // Try to parse as SocketAddr first (IP:port), otherwise treat as hostname:port
+                let mut stream = if let Ok(proxy_addr) = address.parse::<SocketAddr>() {
+                    // IP:port format - use socket with optional interface binding
+                    let bind_ip = Self::resolve_bind_address(
+                        interface,
+                        &None,
+                        proxy_addr,
+                        bind_rr.as_deref(),
+                    );
 
-                let bind_ip = interface.as_ref()
-                    .and_then(|s| s.parse::<IpAddr>().ok());
+                    let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
 
-                let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
+                    socket.set_nonblocking(true)?;
+                    match socket.connect(&proxy_addr.into()) {
+                        Ok(()) => {},
+                        Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == std::io::ErrorKind::WouldBlock => {},
+                        Err(err) => return Err(ProxyError::Io(err)),
+                    }
 
-                socket.set_nonblocking(true)?;
-                match socket.connect(&proxy_addr.into()) {
-                    Ok(()) => {},
-                    Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == std::io::ErrorKind::WouldBlock => {},
-                    Err(err) => return Err(ProxyError::Io(err)),
-                }
+                    let std_stream: std::net::TcpStream = socket.into();
+                    let stream = TcpStream::from_std(std_stream)?;
 
-                let std_stream: std::net::TcpStream = socket.into();
-                let mut stream = TcpStream::from_std(std_stream)?;
-
-                stream.writable().await?;
-                if let Some(e) = stream.take_error()? {
-                    return Err(ProxyError::Io(e));
-                }
+                    match tokio::time::timeout(connect_timeout, stream.writable()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                        Err(_) => {
+                            return Err(ProxyError::ConnectionTimeout {
+                                addr: proxy_addr.to_string(),
+                            });
+                        }
+                    }
+                    if let Some(e) = stream.take_error()? {
+                        return Err(ProxyError::Io(e));
+                    }
+                    stream
+                } else {
+                    // Hostname:port format - use tokio DNS resolution
+                    // Note: interface binding is not supported for hostnames
+                    if interface.is_some() {
+                        warn!("SOCKS5 interface binding is not supported for hostname addresses, ignoring");
+                    }
+                    match tokio::time::timeout(connect_timeout, TcpStream::connect(address)).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                        Err(_) => {
+                            return Err(ProxyError::ConnectionTimeout {
+                                addr: address.clone(),
+                            });
+                        }
+                    }
+                };
 
                 debug!(config = ?config, "Socks5 connection");
                 // replace socks user:pass with config.selected_scope, if set
@@ -381,7 +521,20 @@ impl UpstreamManager {
                 let _username: Option<&str> = scope.or(username.as_deref());
                 let _password: Option<&str> = scope.or(password.as_deref());
 
-                connect_socks5(&mut stream, target, _username, _password).await?;
+                match tokio::time::timeout(
+                    connect_timeout,
+                    connect_socks5(&mut stream, target, _username, _password),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(ProxyError::ConnectionTimeout {
+                            addr: target.to_string(),
+                        });
+                    }
+                }
                 Ok(stream)
             },
         }
@@ -393,23 +546,23 @@ impl UpstreamManager {
     /// Tests BOTH IPv6 and IPv4, returns separate results for each.
     pub async fn ping_all_dcs(
         &self,
-        prefer_ipv6: bool,
+        _prefer_ipv6: bool,
         dc_overrides: &HashMap<String, Vec<String>>,
         ipv4_enabled: bool,
         ipv6_enabled: bool,
     ) -> Vec<StartupPingResult> {
-        let upstreams: Vec<(usize, UpstreamConfig)> = {
+        let upstreams: Vec<(usize, UpstreamConfig, Arc<AtomicUsize>)> = {
             let guard = self.upstreams.read().await;
             guard.iter().enumerate()
-                .map(|(i, u)| (i, u.config.clone()))
+                .map(|(i, u)| (i, u.config.clone(), u.bind_rr.clone()))
                 .collect()
         };
 
         let mut all_results = Vec::new();
 
-        for (upstream_idx, upstream_config) in &upstreams {
+        for (upstream_idx, upstream_config, bind_rr) in &upstreams {
             let upstream_name = match &upstream_config.upstream_type {
-                UpstreamType::Direct { interface } => {
+                UpstreamType::Direct { interface, .. } => {
                     format!("direct{}", interface.as_ref().map(|i| format!(" ({})", i)).unwrap_or_default())
                 }
                 UpstreamType::Socks4 { address, .. } => format!("socks4://{}", address),
@@ -424,7 +577,7 @@ impl UpstreamManager {
 
                     let result = tokio::time::timeout(
                         Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                        self.ping_single_dc(&upstream_config, addr_v6)
+                        self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr_v6)
                     ).await;
 
                     let ping_result = match result {
@@ -475,7 +628,7 @@ impl UpstreamManager {
 
                     let result = tokio::time::timeout(
                         Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                        self.ping_single_dc(&upstream_config, addr_v4)
+                        self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr_v4)
                     ).await;
 
                     let ping_result = match result {
@@ -538,7 +691,7 @@ impl UpstreamManager {
                             }
                             let result = tokio::time::timeout(
                                 Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                                self.ping_single_dc(&upstream_config, addr)
+                                self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr)
                             ).await;
 
                             let ping_result = match result {
@@ -607,9 +760,14 @@ impl UpstreamManager {
         all_results
     }
 
-    async fn ping_single_dc(&self, config: &UpstreamConfig, target: SocketAddr) -> Result<f64> {
+    async fn ping_single_dc(
+        &self,
+        config: &UpstreamConfig,
+        bind_rr: Option<Arc<AtomicUsize>>,
+        target: SocketAddr,
+    ) -> Result<f64> {
         let start = Instant::now();
-        let _stream = self.connect_via_upstream(config, target).await?;
+        let _stream = self.connect_via_upstream(config, target, bind_rr).await?;
         Ok(start.elapsed().as_secs_f64() * 1000.0)
     }
 
@@ -649,15 +807,16 @@ impl UpstreamManager {
             let count = self.upstreams.read().await.len();
 
             for i in 0..count {
-                let config = {
+                let (config, bind_rr) = {
                     let guard = self.upstreams.read().await;
-                    guard[i].config.clone()
+                    let u = &guard[i];
+                    (u.config.clone(), u.bind_rr.clone())
                 };
 
                 let start = Instant::now();
                 let result = tokio::time::timeout(
                     Duration::from_secs(10),
-                    self.connect_via_upstream(&config, dc_addr)
+                    self.connect_via_upstream(&config, dc_addr, Some(bind_rr.clone()))
                 ).await;
 
                 match result {
@@ -686,7 +845,7 @@ impl UpstreamManager {
                             let start2 = Instant::now();
                             let result2 = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                self.connect_via_upstream(&config, fallback_addr)
+                                self.connect_via_upstream(&config, fallback_addr, Some(bind_rr.clone()))
                             ).await;
 
                             let mut guard = self.upstreams.write().await;
@@ -745,6 +904,7 @@ impl UpstreamManager {
     }
 
     /// Get the preferred IP for a DC (for use by other components)
+    #[allow(dead_code)]
     pub async fn get_dc_ip_preference(&self, dc_idx: i16) -> Option<IpPreference> {
         let guard = self.upstreams.read().await;
         if guard.is_empty() {
@@ -756,6 +916,7 @@ impl UpstreamManager {
     }
 
     /// Get preferred DC address based on config preference
+    #[allow(dead_code)]
     pub async fn get_dc_addr(&self, dc_idx: i16, prefer_ipv6: bool) -> Option<SocketAddr> {
         let arr_idx = UpstreamState::dc_array_idx(dc_idx)?;
 

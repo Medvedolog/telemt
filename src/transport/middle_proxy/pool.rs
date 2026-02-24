@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use bytes::BytesMut;
 use rand::Rng;
 use rand::seq::SliceRandom;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
@@ -17,11 +17,9 @@ use crate::network::IpFamily;
 use crate::protocol::constants::*;
 
 use super::ConnRegistry;
-use super::registry::{BoundConn, ConnMeta};
-use super::codec::RpcWriter;
+use super::registry::BoundConn;
+use super::codec::{RpcWriter, WriterCommand};
 use super::reader::reader_loop;
-use super::MeResponse;
-
 const ME_ACTIVE_PING_SECS: u64 = 25;
 const ME_ACTIVE_PING_JITTER_SECS: i64 = 5;
 
@@ -29,12 +27,16 @@ const ME_ACTIVE_PING_JITTER_SECS: i64 = 5;
 pub struct MeWriter {
     pub id: u64,
     pub addr: SocketAddr,
-    pub writer: Arc<Mutex<RpcWriter>>,
+    pub generation: u64,
+    pub tx: mpsc::Sender<WriterCommand>,
     pub cancel: CancellationToken,
     pub degraded: Arc<AtomicBool>,
     pub draining: Arc<AtomicBool>,
+    pub draining_started_at_epoch_secs: Arc<AtomicU64>,
+    pub allow_drain_fallback: Arc<AtomicBool>,
 }
 
+#[allow(dead_code)]
 pub struct MePool {
     pub(super) registry: Arc<ConnRegistry>,
     pub(super) writers: Arc<RwLock<Vec<MeWriter>>>,
@@ -47,11 +49,24 @@ pub struct MePool {
     pub(super) nat_ip_detected: Arc<RwLock<Option<IpAddr>>>,
     pub(super) nat_probe: bool,
     pub(super) nat_stun: Option<String>,
+    pub(super) nat_stun_servers: Vec<String>,
     pub(super) detected_ipv6: Option<Ipv6Addr>,
     pub(super) nat_probe_attempts: std::sync::atomic::AtomicU8,
     pub(super) nat_probe_disabled: std::sync::atomic::AtomicBool,
+    pub(super) stun_backoff_until: Arc<RwLock<Option<Instant>>>,
     pub(super) me_one_retry: u8,
     pub(super) me_one_timeout: Duration,
+    pub(super) me_keepalive_enabled: bool,
+    pub(super) me_keepalive_interval: Duration,
+    pub(super) me_keepalive_jitter: Duration,
+    pub(super) me_keepalive_payload_random: bool,
+    pub(super) me_warmup_stagger_enabled: bool,
+    pub(super) me_warmup_step_delay: Duration,
+    pub(super) me_warmup_step_jitter: Duration,
+    pub(super) me_reconnect_max_concurrent_per_dc: u32,
+    pub(super) me_reconnect_backoff_base: Duration,
+    pub(super) me_reconnect_backoff_cap: Duration,
+    pub(super) me_reconnect_fast_retry_count: u32,
     pub(super) proxy_map_v4: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
     pub(super) proxy_map_v6: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
     pub(super) default_dc: AtomicI32,
@@ -59,6 +74,14 @@ pub struct MePool {
     pub(super) ping_tracker: Arc<Mutex<HashMap<i64, (std::time::Instant, u64)>>>,
     pub(super) rtt_stats: Arc<Mutex<HashMap<u64, (f64, f64)>>>,
     pub(super) nat_reflection_cache: Arc<Mutex<NatReflectionCache>>,
+    pub(super) writer_available: Arc<Notify>,
+    pub(super) conn_count: AtomicUsize,
+    pub(super) stats: Arc<crate::stats::Stats>,
+    pub(super) generation: AtomicU64,
+    pub(super) hardswap: AtomicBool,
+    pub(super) me_pool_drain_ttl_secs: AtomicU64,
+    pub(super) me_pool_force_close_secs: AtomicU64,
+    pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
     pool_size: usize,
 }
 
@@ -69,12 +92,29 @@ pub struct NatReflectionCache {
 }
 
 impl MePool {
+    fn ratio_to_permille(ratio: f32) -> u32 {
+        let clamped = ratio.clamp(0.0, 1.0);
+        (clamped * 1000.0).round() as u32
+    }
+
+    fn permille_to_ratio(permille: u32) -> f32 {
+        (permille.min(1000) as f32) / 1000.0
+    }
+
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     pub fn new(
         proxy_tag: Option<Vec<u8>>,
         proxy_secret: Vec<u8>,
         nat_ip: Option<IpAddr>,
         nat_probe: bool,
         nat_stun: Option<String>,
+        nat_stun_servers: Vec<String>,
         detected_ipv6: Option<Ipv6Addr>,
         me_one_retry: u8,
         me_one_timeout_ms: u64,
@@ -83,6 +123,22 @@ impl MePool {
         default_dc: Option<i32>,
         decision: NetworkDecision,
         rng: Arc<SecureRandom>,
+        stats: Arc<crate::stats::Stats>,
+        me_keepalive_enabled: bool,
+        me_keepalive_interval_secs: u64,
+        me_keepalive_jitter_secs: u64,
+        me_keepalive_payload_random: bool,
+        me_warmup_stagger_enabled: bool,
+        me_warmup_step_delay_ms: u64,
+        me_warmup_step_jitter_ms: u64,
+        me_reconnect_max_concurrent_per_dc: u32,
+        me_reconnect_backoff_base_ms: u64,
+        me_reconnect_backoff_cap_ms: u64,
+        me_reconnect_fast_retry_count: u32,
+        hardswap: bool,
+        me_pool_drain_ttl_secs: u64,
+        me_pool_force_close_secs: u64,
+        me_pool_min_fresh_ratio: f32,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::new(ConnRegistry::new()),
@@ -96,11 +152,25 @@ impl MePool {
             nat_ip_detected: Arc::new(RwLock::new(None)),
             nat_probe,
             nat_stun,
+            nat_stun_servers,
             detected_ipv6,
             nat_probe_attempts: std::sync::atomic::AtomicU8::new(0),
             nat_probe_disabled: std::sync::atomic::AtomicBool::new(false),
+            stun_backoff_until: Arc::new(RwLock::new(None)),
             me_one_retry,
             me_one_timeout: Duration::from_millis(me_one_timeout_ms),
+            stats,
+            me_keepalive_enabled,
+            me_keepalive_interval: Duration::from_secs(me_keepalive_interval_secs),
+            me_keepalive_jitter: Duration::from_secs(me_keepalive_jitter_secs),
+            me_keepalive_payload_random,
+            me_warmup_stagger_enabled,
+            me_warmup_step_delay: Duration::from_millis(me_warmup_step_delay_ms),
+            me_warmup_step_jitter: Duration::from_millis(me_warmup_step_jitter_ms),
+            me_reconnect_max_concurrent_per_dc,
+            me_reconnect_backoff_base: Duration::from_millis(me_reconnect_backoff_base_ms),
+            me_reconnect_backoff_cap: Duration::from_millis(me_reconnect_backoff_cap_ms),
+            me_reconnect_fast_retry_count,
             pool_size: 2,
             proxy_map_v4: Arc::new(RwLock::new(proxy_map_v4)),
             proxy_map_v6: Arc::new(RwLock::new(proxy_map_v6)),
@@ -109,11 +179,42 @@ impl MePool {
             ping_tracker: Arc::new(Mutex::new(HashMap::new())),
             rtt_stats: Arc::new(Mutex::new(HashMap::new())),
             nat_reflection_cache: Arc::new(Mutex::new(NatReflectionCache::default())),
+            writer_available: Arc::new(Notify::new()),
+            conn_count: AtomicUsize::new(0),
+            generation: AtomicU64::new(1),
+            hardswap: AtomicBool::new(hardswap),
+            me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
+            me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
+            me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(me_pool_min_fresh_ratio)),
         })
     }
 
     pub fn has_proxy_tag(&self) -> bool {
         self.proxy_tag.is_some()
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn update_runtime_reinit_policy(
+        &self,
+        hardswap: bool,
+        drain_ttl_secs: u64,
+        force_close_secs: u64,
+        min_fresh_ratio: f32,
+    ) {
+        self.hardswap.store(hardswap, Ordering::Relaxed);
+        self.me_pool_drain_ttl_secs.store(drain_ttl_secs, Ordering::Relaxed);
+        self.me_pool_force_close_secs
+            .store(force_close_secs, Ordering::Relaxed);
+        self.me_pool_min_fresh_ratio_permille
+            .store(Self::ratio_to_permille(min_fresh_ratio), Ordering::Relaxed);
+    }
+
+    pub fn reset_stun_state(&self) {
+        self.nat_probe_attempts.store(0, Ordering::Relaxed);
+        self.nat_probe_disabled.store(false, Ordering::Relaxed);
     }
 
     pub fn translate_our_addr(&self, addr: SocketAddr) -> SocketAddr {
@@ -129,10 +230,49 @@ impl MePool {
         self.writers.clone()
     }
 
+    fn force_close_timeout(&self) -> Option<Duration> {
+        let secs = self.me_pool_force_close_secs.load(Ordering::Relaxed);
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
+    }
+
+    fn coverage_ratio(
+        desired_by_dc: &HashMap<i32, HashSet<SocketAddr>>,
+        active_writer_addrs: &HashSet<SocketAddr>,
+    ) -> (f32, Vec<i32>) {
+        if desired_by_dc.is_empty() {
+            return (1.0, Vec::new());
+        }
+
+        let mut missing_dc = Vec::<i32>::new();
+        let mut covered = 0usize;
+        for (dc, endpoints) in desired_by_dc {
+            if endpoints.is_empty() {
+                continue;
+            }
+            if endpoints.iter().any(|addr| active_writer_addrs.contains(addr)) {
+                covered += 1;
+            } else {
+                missing_dc.push(*dc);
+            }
+        }
+
+        missing_dc.sort_unstable();
+        let total = desired_by_dc.len().max(1);
+        let ratio = (covered as f32) / (total as f32);
+        (ratio, missing_dc)
+    }
+
     pub async fn reconcile_connections(self: &Arc<Self>, rng: &SecureRandom) {
-        use std::collections::HashSet;
         let writers = self.writers.read().await;
-        let current: HashSet<SocketAddr> = writers.iter().map(|w| w.addr).collect();
+        let current: HashSet<SocketAddr> = writers
+            .iter()
+            .filter(|w| !w.draining.load(Ordering::Relaxed))
+            .map(|w| w.addr)
+            .collect();
         drop(writers);
 
         for family in self.family_order() {
@@ -158,6 +298,181 @@ impl MePool {
         }
     }
 
+    async fn desired_dc_endpoints(&self) -> HashMap<i32, HashSet<SocketAddr>> {
+        let mut out: HashMap<i32, HashSet<SocketAddr>> = HashMap::new();
+
+        if self.decision.ipv4_me {
+            let map_v4 = self.proxy_map_v4.read().await.clone();
+            for (dc, addrs) in map_v4 {
+                let entry = out.entry(dc.abs()).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+
+        if self.decision.ipv6_me {
+            let map_v6 = self.proxy_map_v6.read().await.clone();
+            for (dc, addrs) in map_v6 {
+                let entry = out.entry(dc.abs()).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+
+        out
+    }
+
+    async fn warmup_generation_for_all_dcs(
+        self: &Arc<Self>,
+        rng: &SecureRandom,
+        generation: u64,
+        desired_by_dc: &HashMap<i32, HashSet<SocketAddr>>,
+    ) {
+        for endpoints in desired_by_dc.values() {
+            if endpoints.is_empty() {
+                continue;
+            }
+
+            let has_fresh = {
+                let ws = self.writers.read().await;
+                ws.iter().any(|w| {
+                    !w.draining.load(Ordering::Relaxed)
+                        && w.generation == generation
+                        && endpoints.contains(&w.addr)
+                })
+            };
+
+            if has_fresh {
+                continue;
+            }
+
+            let mut shuffled: Vec<SocketAddr> = endpoints.iter().copied().collect();
+            shuffled.shuffle(&mut rand::rng());
+            for addr in shuffled {
+                if self.connect_one(addr, rng).await.is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub async fn zero_downtime_reinit_after_map_change(
+        self: &Arc<Self>,
+        rng: &SecureRandom,
+    ) {
+        let desired_by_dc = self.desired_dc_endpoints().await;
+        if desired_by_dc.is_empty() {
+            warn!("ME endpoint map is empty after update; skipping stale writer drain");
+            return;
+        }
+
+        let previous_generation = self.current_generation();
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let hardswap = self.hardswap.load(Ordering::Relaxed);
+
+        if hardswap {
+            self.warmup_generation_for_all_dcs(rng, generation, &desired_by_dc)
+                .await;
+        } else {
+            self.reconcile_connections(rng).await;
+        }
+
+        let writers = self.writers.read().await;
+        let active_writer_addrs: HashSet<SocketAddr> = writers
+            .iter()
+            .filter(|w| !w.draining.load(Ordering::Relaxed))
+            .map(|w| w.addr)
+            .collect();
+        let min_ratio = Self::permille_to_ratio(
+            self.me_pool_min_fresh_ratio_permille
+                .load(Ordering::Relaxed),
+        );
+        let (coverage_ratio, missing_dc) = Self::coverage_ratio(&desired_by_dc, &active_writer_addrs);
+        if !hardswap && coverage_ratio < min_ratio {
+            warn!(
+                previous_generation,
+                generation,
+                coverage_ratio = format_args!("{coverage_ratio:.3}"),
+                min_ratio = format_args!("{min_ratio:.3}"),
+                missing_dc = ?missing_dc,
+                "ME reinit coverage below threshold; keeping stale writers"
+            );
+            return;
+        }
+
+        if hardswap {
+            let fresh_writer_addrs: HashSet<SocketAddr> = writers
+                .iter()
+                .filter(|w| !w.draining.load(Ordering::Relaxed))
+                .filter(|w| w.generation == generation)
+                .map(|w| w.addr)
+                .collect();
+            let (fresh_ratio, fresh_missing_dc) =
+                Self::coverage_ratio(&desired_by_dc, &fresh_writer_addrs);
+            if !fresh_missing_dc.is_empty() {
+                warn!(
+                    previous_generation,
+                    generation,
+                    fresh_ratio = format_args!("{fresh_ratio:.3}"),
+                    missing_dc = ?fresh_missing_dc,
+                    "ME hardswap pending: fresh generation coverage incomplete"
+                );
+                return;
+            }
+        } else if !missing_dc.is_empty() {
+            warn!(
+                missing_dc = ?missing_dc,
+                // Keep stale writers alive when fresh coverage is incomplete.
+                "ME reinit coverage incomplete after map update; keeping stale writers"
+            );
+            return;
+        }
+
+        let desired_addrs: HashSet<SocketAddr> = desired_by_dc
+            .values()
+            .flat_map(|set| set.iter().copied())
+            .collect();
+
+        let stale_writer_ids: Vec<u64> = writers
+            .iter()
+            .filter(|w| !w.draining.load(Ordering::Relaxed))
+            .filter(|w| {
+                if hardswap {
+                    w.generation < generation
+                } else {
+                    !desired_addrs.contains(&w.addr)
+                }
+            })
+            .map(|w| w.id)
+            .collect();
+        drop(writers);
+
+        if stale_writer_ids.is_empty() {
+            debug!("ME map update completed with no stale writers");
+            return;
+        }
+
+        let drain_timeout = self.force_close_timeout();
+        let drain_timeout_secs = drain_timeout.map(|d| d.as_secs()).unwrap_or(0);
+        info!(
+            stale_writers = stale_writer_ids.len(),
+            previous_generation,
+            generation,
+            hardswap,
+            coverage_ratio = format_args!("{coverage_ratio:.3}"),
+            min_ratio = format_args!("{min_ratio:.3}"),
+            drain_timeout_secs,
+            "ME map update covered; draining stale writers"
+        );
+        self.stats.increment_pool_swap_total();
+        for writer_id in stale_writer_ids {
+            self.mark_writer_draining_with_timeout(writer_id, drain_timeout, !hardswap)
+                .await;
+        }
+    }
+
     pub async fn update_proxy_maps(
         &self,
         new_v4: HashMap<i32, Vec<(IpAddr, u16)>>,
@@ -175,12 +490,36 @@ impl MePool {
             let mut guard = self.proxy_map_v6.write().await;
             if !v6.is_empty() && *guard != v6 {
                 *guard = v6;
+                changed = true;
+            }
+        }
+        // Ensure negative DC entries mirror positives when absent (Telegram convention).
+        {
+            let mut guard = self.proxy_map_v4.write().await;
+            let keys: Vec<i32> = guard.keys().cloned().collect();
+            for k in keys.iter().cloned().filter(|k| *k > 0) {
+                if !guard.contains_key(&-k)
+                    && let Some(addrs) = guard.get(&k).cloned()
+                {
+                    guard.insert(-k, addrs);
+                }
+            }
+        }
+        {
+            let mut guard = self.proxy_map_v6.write().await;
+            let keys: Vec<i32> = guard.keys().cloned().collect();
+            for k in keys.iter().cloned().filter(|k| *k > 0) {
+                if !guard.contains_key(&-k)
+                    && let Some(addrs) = guard.get(&k).cloned()
+                {
+                    guard.insert(-k, addrs);
+                }
             }
         }
         changed
     }
 
-    pub async fn update_secret(&self, new_secret: Vec<u8>) -> bool {
+    pub async fn update_secret(self: &Arc<Self>, new_secret: Vec<u8>) -> bool {
         if new_secret.len() < 32 {
             warn!(len = new_secret.len(), "proxy-secret update ignored (too short)");
             return false;
@@ -195,10 +534,14 @@ impl MePool {
         false
     }
 
-    pub async fn reconnect_all(&self) {
-        // Graceful: do not drop all at once. New connections will use updated secret.
-        // Existing writers remain until health monitor replaces them.
-        // No-op here to avoid total outage.
+    pub async fn reconnect_all(self: &Arc<Self>) {
+        let ws = self.writers.read().await.clone();
+        for w in ws {
+            if let Ok(()) = self.connect_one(w.addr, self.rng.as_ref()).await {
+                self.mark_writer_draining(w.id).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
     }
 
     pub(super) async fn key_selector(&self) -> u32 {
@@ -277,7 +620,23 @@ impl MePool {
                 return Err(ProxyError::Proxy("Too many ME DC init failures, falling back to direct".into()));
             }
 
-            // Additional connections up to pool_size total (round-robin across DCs)
+        // Additional connections up to pool_size total (round-robin across DCs), staggered to de-phase lifecycles.
+        if self.me_warmup_stagger_enabled {
+            for (dc, addrs) in dc_addrs.iter() {
+                for (ip, port) in addrs {
+                    if self.connection_count() >= pool_size {
+                        break;
+                    }
+                    let addr = SocketAddr::new(*ip, *port);
+                    let jitter = rand::rng().random_range(0..=self.me_warmup_step_jitter.as_millis() as u64);
+                    let delay_ms = self.me_warmup_step_delay.as_millis() as u64 + jitter;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    if let Err(e) = self.connect_one(addr, rng.as_ref()).await {
+                        debug!(%addr, dc = %dc, error = %e, "Extra ME connect failed (staggered)");
+                    }
+                }
+            }
+        } else {
             for (dc, addrs) in dc_addrs.iter() {
                 for (ip, port) in addrs {
                     if self.connection_count() >= pool_size {
@@ -292,6 +651,7 @@ impl MePool {
                     break;
                 }
             }
+        }
 
             if !self.decision.effective_multipath && self.connection_count() > 0 {
                 break;
@@ -314,52 +674,97 @@ impl MePool {
         let hs = self.handshake_only(stream, addr, rng).await?;
 
         let writer_id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
+        let generation = self.current_generation();
         let cancel = CancellationToken::new();
         let degraded = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
-        let rpc_w = Arc::new(Mutex::new(RpcWriter {
+        let draining_started_at_epoch_secs = Arc::new(AtomicU64::new(0));
+        let allow_drain_fallback = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<WriterCommand>(4096);
+        let mut rpc_writer = RpcWriter {
             writer: hs.wr,
             key: hs.write_key,
             iv: hs.write_iv,
             seq_no: 0,
-        }));
+            crc_mode: hs.crc_mode,
+        };
+        let cancel_wr = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    cmd = rx.recv() => {
+                        match cmd {
+                            Some(WriterCommand::Data(payload)) => {
+                                if rpc_writer.send(&payload).await.is_err() { break; }
+                            }
+                            Some(WriterCommand::DataAndFlush(payload)) => {
+                                if rpc_writer.send_and_flush(&payload).await.is_err() { break; }
+                            }
+                            Some(WriterCommand::Close) | None => break,
+                        }
+                    }
+                    _ = cancel_wr.cancelled() => break,
+                }
+            }
+        });
         let writer = MeWriter {
             id: writer_id,
             addr,
-            writer: rpc_w.clone(),
+            generation,
+            tx: tx.clone(),
             cancel: cancel.clone(),
             degraded: degraded.clone(),
             draining: draining.clone(),
+            draining_started_at_epoch_secs: draining_started_at_epoch_secs.clone(),
+            allow_drain_fallback: allow_drain_fallback.clone(),
         };
         self.writers.write().await.push(writer.clone());
+        self.conn_count.fetch_add(1, Ordering::Relaxed);
+        self.writer_available.notify_one();
 
         let reg = self.registry.clone();
         let writers_arc = self.writers_arc();
         let ping_tracker = self.ping_tracker.clone();
+        let ping_tracker_reader = ping_tracker.clone();
         let rtt_stats = self.rtt_stats.clone();
+        let stats_reader = self.stats.clone();
+        let stats_ping = self.stats.clone();
         let pool = Arc::downgrade(self);
         let cancel_ping = cancel.clone();
-        let rpc_w_ping = rpc_w.clone();
+        let tx_ping = tx.clone();
         let ping_tracker_ping = ping_tracker.clone();
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let cleanup_for_reader = cleanup_done.clone();
+        let cleanup_for_ping = cleanup_done.clone();
+        let keepalive_enabled = self.me_keepalive_enabled;
+        let keepalive_interval = self.me_keepalive_interval;
+        let keepalive_jitter = self.me_keepalive_jitter;
+        let cancel_reader_token = cancel.clone();
+        let cancel_ping_token = cancel_ping.clone();
 
         tokio::spawn(async move {
-            let cancel_reader = cancel.clone();
             let res = reader_loop(
                 hs.rd,
                 hs.read_key,
                 hs.read_iv,
+                hs.crc_mode,
                 reg.clone(),
                 BytesMut::new(),
                 BytesMut::new(),
-                rpc_w.clone(),
-                ping_tracker.clone(),
+                tx.clone(),
+                ping_tracker_reader,
                 rtt_stats.clone(),
+                stats_reader,
                 writer_id,
                 degraded.clone(),
-                cancel_reader.clone(),
+                cancel_reader_token.clone(),
             )
             .await;
-            if let Some(pool) = pool.upgrade() {
+            if let Some(pool) = pool.upgrade()
+                && cleanup_for_reader
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
                 pool.remove_writer_and_close_clients(writer_id).await;
             }
             if let Err(e) = res {
@@ -373,15 +778,40 @@ impl MePool {
         let pool_ping = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut ping_id: i64 = rand::random::<i64>();
-            loop {
+            // Per-writer jittered start to avoid phase sync.
+            let startup_jitter = if keepalive_enabled {
+                let jitter_cap_ms = keepalive_interval.as_millis() / 2;
+                let effective_jitter_ms = keepalive_jitter.as_millis().min(jitter_cap_ms).max(1);
+                Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
+            } else {
                 let jitter = rand::rng()
                     .random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
                 let wait = (ME_ACTIVE_PING_SECS as i64 + jitter).max(5) as u64;
+                Duration::from_secs(wait)
+            };
+            tokio::select! {
+                _ = cancel_ping_token.cancelled() => return,
+                _ = tokio::time::sleep(startup_jitter) => {}
+            }
+            loop {
+                let wait = if keepalive_enabled {
+                    let jitter_cap_ms = keepalive_interval.as_millis() / 2;
+                    let effective_jitter_ms = keepalive_jitter.as_millis().min(jitter_cap_ms).max(1);
+                    keepalive_interval
+                        + Duration::from_millis(
+                            rand::rng().random_range(0..=effective_jitter_ms as u64)
+                        )
+                } else {
+                    let jitter = rand::rng()
+                        .random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
+                    let secs = (ME_ACTIVE_PING_SECS as i64 + jitter).max(5) as u64;
+                    Duration::from_secs(secs)
+                };
                 tokio::select! {
-                    _ = cancel_ping.cancelled() => {
+                    _ = cancel_ping_token.cancelled() => {
                         break;
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                    _ = tokio::time::sleep(wait) => {}
                 }
                 let sent_id = ping_id;
                 let mut p = Vec::with_capacity(12);
@@ -389,13 +819,25 @@ impl MePool {
                 p.extend_from_slice(&sent_id.to_le_bytes());
                 {
                     let mut tracker = ping_tracker_ping.lock().await;
+                    let before = tracker.len();
+                    tracker.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(120));
+                    let expired = before.saturating_sub(tracker.len());
+                    if expired > 0 {
+                        stats_ping.increment_me_keepalive_timeout_by(expired as u64);
+                    }
                     tracker.insert(sent_id, (std::time::Instant::now(), writer_id));
                 }
                 ping_id = ping_id.wrapping_add(1);
-                if let Err(e) = rpc_w_ping.lock().await.send_and_flush(&p).await {
-                    debug!(error = %e, "Active ME ping failed, removing dead writer");
+                stats_ping.increment_me_keepalive_sent();
+                if tx_ping.send(WriterCommand::DataAndFlush(p)).await.is_err() {
+                    stats_ping.increment_me_keepalive_failed();
+                    debug!("ME ping failed, removing dead writer");
                     cancel_ping.cancel();
-                    if let Some(pool) = pool_ping.upgrade() {
+                    if let Some(pool) = pool_ping.upgrade()
+                        && cleanup_for_ping
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                    {
                         pool.remove_writer_and_close_clients(writer_id).await;
                     }
                     break;
@@ -430,7 +872,7 @@ impl MePool {
         false
     }
 
-    pub(crate) async fn remove_writer_and_close_clients(&self, writer_id: u64) {
+    pub(crate) async fn remove_writer_and_close_clients(self: &Arc<Self>, writer_id: u64) {
         let conns = self.remove_writer_only(writer_id).await;
         for bound in conns {
             let _ = self.registry.route(bound.conn_id, super::MeResponse::Close).await;
@@ -439,42 +881,113 @@ impl MePool {
     }
 
     async fn remove_writer_only(&self, writer_id: u64) -> Vec<BoundConn> {
+        let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         {
             let mut ws = self.writers.write().await;
             if let Some(pos) = ws.iter().position(|w| w.id == writer_id) {
                 let w = ws.remove(pos);
+                if w.draining.load(Ordering::Relaxed) {
+                    self.stats.decrement_pool_drain_active();
+                }
                 w.cancel.cancel();
+                close_tx = Some(w.tx.clone());
+                self.conn_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        if let Some(tx) = close_tx {
+            let _ = tx.send(WriterCommand::Close).await;
+        }
+        self.rtt_stats.lock().await.remove(&writer_id);
         self.registry.writer_lost(writer_id).await
     }
 
-    pub(crate) async fn mark_writer_draining(self: &Arc<Self>, writer_id: u64) {
-        {
+    pub(crate) async fn mark_writer_draining_with_timeout(
+        self: &Arc<Self>,
+        writer_id: u64,
+        timeout: Option<Duration>,
+        allow_drain_fallback: bool,
+    ) {
+        let timeout = timeout.filter(|d| !d.is_zero());
+        let found = {
             let mut ws = self.writers.write().await;
             if let Some(w) = ws.iter_mut().find(|w| w.id == writer_id) {
+                let already_draining = w.draining.swap(true, Ordering::Relaxed);
+                w.allow_drain_fallback
+                    .store(allow_drain_fallback, Ordering::Relaxed);
+                w.draining_started_at_epoch_secs
+                    .store(Self::now_epoch_secs(), Ordering::Relaxed);
+                if !already_draining {
+                    self.stats.increment_pool_drain_active();
+                }
                 w.draining.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
             }
+        };
+
+        if !found {
+            return;
         }
+
+        let timeout_secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
+        debug!(
+            writer_id,
+            timeout_secs,
+            allow_drain_fallback,
+            "ME writer marked draining"
+        );
 
         let pool = Arc::downgrade(self);
         tokio::spawn(async move {
-            loop {
-                if let Some(p) = pool.upgrade() {
-                    if p.registry.is_writer_empty(writer_id).await {
-                        let _ = p.remove_writer_only(writer_id).await;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                } else {
+            let deadline = timeout.map(|t| Instant::now() + t);
+            while let Some(p) = pool.upgrade() {
+                if let Some(deadline_at) = deadline
+                    && Instant::now() >= deadline_at
+                {
+                    warn!(writer_id, "Drain timeout, force-closing");
+                    p.stats.increment_pool_force_close_total();
+                    let _ = p.remove_writer_and_close_clients(writer_id).await;
                     break;
                 }
+                if p.registry.is_writer_empty(writer_id).await {
+                    let _ = p.remove_writer_only(writer_id).await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
 
+    pub(crate) async fn mark_writer_draining(self: &Arc<Self>, writer_id: u64) {
+        self.mark_writer_draining_with_timeout(writer_id, Some(Duration::from_secs(300)), false)
+            .await;
+    }
+
+    pub(super) fn writer_accepts_new_binding(&self, writer: &MeWriter) -> bool {
+        if !writer.draining.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !writer.allow_drain_fallback.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let ttl_secs = self.me_pool_drain_ttl_secs.load(Ordering::Relaxed);
+        if ttl_secs == 0 {
+            return true;
+        }
+
+        let started = writer.draining_started_at_epoch_secs.load(Ordering::Relaxed);
+        if started == 0 {
+            return false;
+        }
+
+        Self::now_epoch_secs().saturating_sub(started) <= ttl_secs
+    }
+
 }
 
+#[allow(dead_code)]
 fn hex_dump(data: &[u8]) -> String {
     const MAX: usize = 64;
     let mut out = String::with_capacity(data.len() * 2 + 3);

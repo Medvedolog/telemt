@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http_body_util::Full;
@@ -7,12 +7,13 @@ use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+use ipnetwork::IpNetwork;
 use tokio::net::TcpListener;
 use tracing::{info, warn, debug};
 
 use crate::stats::Stats;
 
-pub async fn serve(port: u16, stats: Arc<Stats>, whitelist: Vec<IpAddr>) {
+pub async fn serve(port: u16, stats: Arc<Stats>, whitelist: Vec<IpNetwork>) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -32,7 +33,7 @@ pub async fn serve(port: u16, stats: Arc<Stats>, whitelist: Vec<IpAddr>) {
             }
         };
 
-        if !whitelist.is_empty() && !whitelist.contains(&peer.ip()) {
+        if !whitelist.is_empty() && !whitelist.iter().any(|net| net.contains(peer.ip())) {
             debug!(peer = %peer, "Metrics request denied by whitelist");
             continue;
         }
@@ -53,7 +54,7 @@ pub async fn serve(port: u16, stats: Arc<Stats>, whitelist: Vec<IpAddr>) {
     }
 }
 
-fn handle(req: Request<hyper::body::Incoming>, stats: &Stats) -> Result<Response<Full<Bytes>>, Infallible> {
+fn handle<B>(req: Request<B>, stats: &Stats) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.uri().path() != "/metrics" {
         let resp = Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -91,6 +92,113 @@ fn render_metrics(stats: &Stats) -> String {
     let _ = writeln!(out, "# TYPE telemt_handshake_timeouts_total counter");
     let _ = writeln!(out, "telemt_handshake_timeouts_total {}", stats.get_handshake_timeouts());
 
+    let _ = writeln!(out, "# HELP telemt_me_keepalive_sent_total ME keepalive frames sent");
+    let _ = writeln!(out, "# TYPE telemt_me_keepalive_sent_total counter");
+    let _ = writeln!(out, "telemt_me_keepalive_sent_total {}", stats.get_me_keepalive_sent());
+
+    let _ = writeln!(out, "# HELP telemt_me_keepalive_failed_total ME keepalive send failures");
+    let _ = writeln!(out, "# TYPE telemt_me_keepalive_failed_total counter");
+    let _ = writeln!(out, "telemt_me_keepalive_failed_total {}", stats.get_me_keepalive_failed());
+
+    let _ = writeln!(out, "# HELP telemt_me_keepalive_pong_total ME keepalive pong replies");
+    let _ = writeln!(out, "# TYPE telemt_me_keepalive_pong_total counter");
+    let _ = writeln!(out, "telemt_me_keepalive_pong_total {}", stats.get_me_keepalive_pong());
+
+    let _ = writeln!(out, "# HELP telemt_me_keepalive_timeout_total ME keepalive ping timeouts");
+    let _ = writeln!(out, "# TYPE telemt_me_keepalive_timeout_total counter");
+    let _ = writeln!(out, "telemt_me_keepalive_timeout_total {}", stats.get_me_keepalive_timeout());
+
+    let _ = writeln!(out, "# HELP telemt_me_reconnect_attempts_total ME reconnect attempts");
+    let _ = writeln!(out, "# TYPE telemt_me_reconnect_attempts_total counter");
+    let _ = writeln!(out, "telemt_me_reconnect_attempts_total {}", stats.get_me_reconnect_attempts());
+
+    let _ = writeln!(out, "# HELP telemt_me_reconnect_success_total ME reconnect successes");
+    let _ = writeln!(out, "# TYPE telemt_me_reconnect_success_total counter");
+    let _ = writeln!(out, "telemt_me_reconnect_success_total {}", stats.get_me_reconnect_success());
+
+    let _ = writeln!(out, "# HELP telemt_me_crc_mismatch_total ME CRC mismatches");
+    let _ = writeln!(out, "# TYPE telemt_me_crc_mismatch_total counter");
+    let _ = writeln!(out, "telemt_me_crc_mismatch_total {}", stats.get_me_crc_mismatch());
+
+    let _ = writeln!(out, "# HELP telemt_me_seq_mismatch_total ME sequence mismatches");
+    let _ = writeln!(out, "# TYPE telemt_me_seq_mismatch_total counter");
+    let _ = writeln!(out, "telemt_me_seq_mismatch_total {}", stats.get_me_seq_mismatch());
+
+    let _ = writeln!(out, "# HELP telemt_me_route_drop_no_conn_total ME route drops: no conn");
+    let _ = writeln!(out, "# TYPE telemt_me_route_drop_no_conn_total counter");
+    let _ = writeln!(out, "telemt_me_route_drop_no_conn_total {}", stats.get_me_route_drop_no_conn());
+
+    let _ = writeln!(out, "# HELP telemt_me_route_drop_channel_closed_total ME route drops: channel closed");
+    let _ = writeln!(out, "# TYPE telemt_me_route_drop_channel_closed_total counter");
+    let _ = writeln!(out, "telemt_me_route_drop_channel_closed_total {}", stats.get_me_route_drop_channel_closed());
+
+    let _ = writeln!(out, "# HELP telemt_me_route_drop_queue_full_total ME route drops: queue full");
+    let _ = writeln!(out, "# TYPE telemt_me_route_drop_queue_full_total counter");
+    let _ = writeln!(out, "telemt_me_route_drop_queue_full_total {}", stats.get_me_route_drop_queue_full());
+
+    let _ = writeln!(out, "# HELP telemt_secure_padding_invalid_total Invalid secure frame lengths");
+    let _ = writeln!(out, "# TYPE telemt_secure_padding_invalid_total counter");
+    let _ = writeln!(out, "telemt_secure_padding_invalid_total {}", stats.get_secure_padding_invalid());
+
+    let _ = writeln!(out, "# HELP telemt_desync_total Total crypto-desync detections");
+    let _ = writeln!(out, "# TYPE telemt_desync_total counter");
+    let _ = writeln!(out, "telemt_desync_total {}", stats.get_desync_total());
+
+    let _ = writeln!(out, "# HELP telemt_desync_full_logged_total Full forensic desync logs emitted");
+    let _ = writeln!(out, "# TYPE telemt_desync_full_logged_total counter");
+    let _ = writeln!(out, "telemt_desync_full_logged_total {}", stats.get_desync_full_logged());
+
+    let _ = writeln!(out, "# HELP telemt_desync_suppressed_total Suppressed desync forensic events");
+    let _ = writeln!(out, "# TYPE telemt_desync_suppressed_total counter");
+    let _ = writeln!(out, "telemt_desync_suppressed_total {}", stats.get_desync_suppressed());
+
+    let _ = writeln!(out, "# HELP telemt_desync_frames_bucket_total Desync count by frames_ok bucket");
+    let _ = writeln!(out, "# TYPE telemt_desync_frames_bucket_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_desync_frames_bucket_total{{bucket=\"0\"}} {}",
+        stats.get_desync_frames_bucket_0()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_desync_frames_bucket_total{{bucket=\"1_2\"}} {}",
+        stats.get_desync_frames_bucket_1_2()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_desync_frames_bucket_total{{bucket=\"3_10\"}} {}",
+        stats.get_desync_frames_bucket_3_10()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_desync_frames_bucket_total{{bucket=\"gt_10\"}} {}",
+        stats.get_desync_frames_bucket_gt_10()
+    );
+
+    let _ = writeln!(out, "# HELP telemt_pool_swap_total Successful ME pool swaps");
+    let _ = writeln!(out, "# TYPE telemt_pool_swap_total counter");
+    let _ = writeln!(out, "telemt_pool_swap_total {}", stats.get_pool_swap_total());
+
+    let _ = writeln!(out, "# HELP telemt_pool_drain_active Active draining ME writers");
+    let _ = writeln!(out, "# TYPE telemt_pool_drain_active gauge");
+    let _ = writeln!(out, "telemt_pool_drain_active {}", stats.get_pool_drain_active());
+
+    let _ = writeln!(out, "# HELP telemt_pool_force_close_total Forced close events for draining writers");
+    let _ = writeln!(out, "# TYPE telemt_pool_force_close_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_pool_force_close_total {}",
+        stats.get_pool_force_close_total()
+    );
+
+    let _ = writeln!(out, "# HELP telemt_pool_stale_pick_total Stale writer fallback picks for new binds");
+    let _ = writeln!(out, "# TYPE telemt_pool_stale_pick_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_pool_stale_pick_total {}",
+        stats.get_pool_stale_pick_total()
+    );
+
     let _ = writeln!(out, "# HELP telemt_user_connections_total Per-user total connections");
     let _ = writeln!(out, "# TYPE telemt_user_connections_total counter");
     let _ = writeln!(out, "# HELP telemt_user_connections_current Per-user active connections");
@@ -121,6 +229,7 @@ fn render_metrics(stats: &Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     #[test]
     fn test_render_metrics_format() {
@@ -177,21 +286,20 @@ mod tests {
         stats.increment_connects_all();
         stats.increment_connects_all();
 
-        let port = 19091u16;
-        let s = stats.clone();
-        tokio::spawn(async move {
-            serve(port, s, vec![]).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(())
+            .unwrap();
+        let resp = handle(req, &stats).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(body.as_ref()).unwrap().contains("telemt_connections_total 3"));
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{}/metrics", port))
-            .await.unwrap();
-        assert_eq!(resp.status(), 200);
-        let body = resp.text().await.unwrap();
-        assert!(body.contains("telemt_connections_total 3"));
-
-        let resp404 = reqwest::get(format!("http://127.0.0.1:{}/other", port))
-            .await.unwrap();
-        assert_eq!(resp404.status(), 404);
+        let req404 = Request::builder()
+            .uri("/other")
+            .body(())
+            .unwrap();
+        let resp404 = handle(req404, &stats).unwrap();
+        assert_eq!(resp404.status(), StatusCode::NOT_FOUND);
     }
 }

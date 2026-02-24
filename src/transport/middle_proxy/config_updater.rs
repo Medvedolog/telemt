@@ -4,14 +4,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use httpdate;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::config::ProxyConfig;
 use crate::error::Result;
 
 use super::MePool;
 use super::secret::download_proxy_secret;
 use crate::crypto::SecureRandom;
 use std::time::SystemTime;
+
+async fn retry_fetch(url: &str) -> Option<ProxyConfigData> {
+    let delays = [1u64, 5, 15];
+    for (i, d) in delays.iter().enumerate() {
+        match fetch_proxy_config(url).await {
+            Ok(cfg) => return Some(cfg),
+            Err(e) => {
+                if i == delays.len() - 1 {
+                    warn!(error = %e, url, "fetch_proxy_config failed");
+                } else {
+                    debug!(error = %e, url, "fetch_proxy_config retrying");
+                    tokio::time::sleep(Duration::from_secs(*d)).await;
+                }
+            }
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfigData {
@@ -20,14 +40,16 @@ pub struct ProxyConfigData {
 }
 
 fn parse_host_port(s: &str) -> Option<(IpAddr, u16)> {
-    if let Some(bracket_end) = s.rfind(']') {
-        if s.starts_with('[') && bracket_end + 1 < s.len() && s.as_bytes().get(bracket_end + 1) == Some(&b':') {
-            let host = &s[1..bracket_end];
-            let port_str = &s[bracket_end + 2..];
-            let ip = host.parse::<IpAddr>().ok()?;
-            let port = port_str.parse::<u16>().ok()?;
-            return Some((ip, port));
-        }
+    if let Some(bracket_end) = s.rfind(']')
+        && s.starts_with('[')
+        && bracket_end + 1 < s.len()
+        && s.as_bytes().get(bracket_end + 1) == Some(&b':')
+    {
+        let host = &s[1..bracket_end];
+        let port_str = &s[bracket_end + 2..];
+        let ip = host.parse::<IpAddr>().ok()?;
+        let port = port_str.parse::<u16>().ok()?;
+        return Some((ip, port));
     }
 
     let idx = s.rfind(':')?;
@@ -64,20 +86,18 @@ pub async fn fetch_proxy_config(url: &str) -> Result<ProxyConfigData> {
         .map_err(|e| crate::error::ProxyError::Proxy(format!("fetch_proxy_config GET failed: {e}")))?
         ;
 
-    if let Some(date) = resp.headers().get(reqwest::header::DATE) {
-        if let Ok(date_str) = date.to_str() {
-            if let Ok(server_time) = httpdate::parse_http_date(date_str) {
-                if let Ok(skew) = SystemTime::now().duration_since(server_time).or_else(|e| {
-                    server_time.duration_since(SystemTime::now()).map_err(|_| e)
-                }) {
-                    let skew_secs = skew.as_secs();
-                    if skew_secs > 60 {
-                        warn!(skew_secs, "Time skew >60s detected from fetch_proxy_config Date header");
-                    } else if skew_secs > 30 {
-                        warn!(skew_secs, "Time skew >30s detected from fetch_proxy_config Date header");
-                    }
-                }
-            }
+    if let Some(date) = resp.headers().get(reqwest::header::DATE)
+        && let Ok(date_str) = date.to_str()
+        && let Ok(server_time) = httpdate::parse_http_date(date_str)
+        && let Ok(skew) = SystemTime::now().duration_since(server_time).or_else(|e| {
+            server_time.duration_since(SystemTime::now()).map_err(|_| e)
+        })
+    {
+        let skew_secs = skew.as_secs();
+        if skew_secs > 60 {
+            warn!(skew_secs, "Time skew >60s detected from fetch_proxy_config Date header");
+        } else if skew_secs > 30 {
+            warn!(skew_secs, "Time skew >30s detected from fetch_proxy_config Date header");
         }
     }
 
@@ -110,42 +130,134 @@ pub async fn fetch_proxy_config(url: &str) -> Result<ProxyConfigData> {
     Ok(ProxyConfigData { map, default_dc })
 }
 
-pub async fn me_config_updater(pool: Arc<MePool>, rng: Arc<SecureRandom>, interval: Duration) {
-    let mut tick = tokio::time::interval(interval);
-    // skip immediate tick to avoid double-fetch right after startup
-    tick.tick().await;
-    loop {
-        tick.tick().await;
+async fn run_update_cycle(pool: &Arc<MePool>, rng: &Arc<SecureRandom>, cfg: &ProxyConfig) {
+    pool.update_runtime_reinit_policy(
+        cfg.general.hardswap,
+        cfg.general.me_pool_drain_ttl_secs,
+        cfg.general.effective_me_pool_force_close_secs(),
+        cfg.general.me_pool_min_fresh_ratio,
+    );
 
-        // Update proxy config v4
-        if let Ok(cfg) = fetch_proxy_config("https://core.telegram.org/getProxyConfig").await {
-            let changed = pool.update_proxy_maps(cfg.map.clone(), None).await;
-            if let Some(dc) = cfg.default_dc {
-                pool.default_dc.store(dc, std::sync::atomic::Ordering::Relaxed);
-            }
-            if changed {
-                info!("ME config updated (v4), reconciling connections");
-                pool.reconcile_connections(&rng).await;
-            } else {
-                debug!("ME config v4 unchanged");
-            }
+    let mut maps_changed = false;
+
+    // Update proxy config v4
+    let cfg_v4 = retry_fetch("https://core.telegram.org/getProxyConfig").await;
+    if let Some(cfg_v4) = cfg_v4 {
+        let changed = pool.update_proxy_maps(cfg_v4.map.clone(), None).await;
+        if let Some(dc) = cfg_v4.default_dc {
+            pool.default_dc
+                .store(dc, std::sync::atomic::Ordering::Relaxed);
+        }
+        if changed {
+            maps_changed = true;
+            info!("ME config updated (v4)");
         } else {
-            warn!("getProxyConfig update failed");
+            debug!("ME config v4 unchanged");
         }
+    }
 
-        // Update proxy config v6 (optional)
-        if let Ok(cfg_v6) = fetch_proxy_config("https://core.telegram.org/getProxyConfigV6").await {
-            let _ = pool.update_proxy_maps(HashMap::new(), Some(cfg_v6.map)).await;
+    // Update proxy config v6 (optional)
+    let cfg_v6 = retry_fetch("https://core.telegram.org/getProxyConfigV6").await;
+    if let Some(cfg_v6) = cfg_v6 {
+        let changed = pool.update_proxy_maps(HashMap::new(), Some(cfg_v6.map)).await;
+        if changed {
+            maps_changed = true;
+            info!("ME config updated (v6)");
+        } else {
+            debug!("ME config v6 unchanged");
         }
+    }
 
-        // Update proxy-secret
-        match download_proxy_secret().await {
-            Ok(secret) => {
-                if pool.update_secret(secret).await {
-                    info!("proxy-secret updated and pool reconnect scheduled");
+    if maps_changed {
+        pool.zero_downtime_reinit_after_map_change(rng.as_ref())
+            .await;
+    }
+
+    pool.reset_stun_state();
+
+    // Update proxy-secret
+    match download_proxy_secret().await {
+        Ok(secret) => {
+            if pool.update_secret(secret).await {
+                info!("proxy-secret updated and pool reconnect scheduled");
+            }
+        }
+        Err(e) => warn!(error = %e, "proxy-secret update failed"),
+    }
+}
+
+pub async fn me_config_updater(
+    pool: Arc<MePool>,
+    rng: Arc<SecureRandom>,
+    mut config_rx: watch::Receiver<Arc<ProxyConfig>>,
+) {
+    let mut update_every_secs = config_rx
+        .borrow()
+        .general
+        .effective_update_every_secs()
+        .max(1);
+    let mut update_every = Duration::from_secs(update_every_secs);
+    let mut next_tick = tokio::time::Instant::now() + update_every;
+    info!(update_every_secs, "ME config updater started");
+
+    loop {
+        let sleep = tokio::time::sleep_until(next_tick);
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            _ = &mut sleep => {
+                let cfg = config_rx.borrow().clone();
+                run_update_cycle(&pool, &rng, cfg.as_ref()).await;
+                let refreshed_secs = cfg.general.effective_update_every_secs().max(1);
+                if refreshed_secs != update_every_secs {
+                    info!(
+                        old_update_every_secs = update_every_secs,
+                        new_update_every_secs = refreshed_secs,
+                        "ME config updater interval changed"
+                    );
+                    update_every_secs = refreshed_secs;
+                    update_every = Duration::from_secs(update_every_secs);
+                }
+                next_tick = tokio::time::Instant::now() + update_every;
+            }
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    warn!("ME config updater stopped: config channel closed");
+                    break;
+                }
+                let cfg = config_rx.borrow().clone();
+                pool.update_runtime_reinit_policy(
+                    cfg.general.hardswap,
+                    cfg.general.me_pool_drain_ttl_secs,
+                    cfg.general.effective_me_pool_force_close_secs(),
+                    cfg.general.me_pool_min_fresh_ratio,
+                );
+                let new_secs = cfg.general.effective_update_every_secs().max(1);
+                if new_secs == update_every_secs {
+                    continue;
+                }
+
+                if new_secs < update_every_secs {
+                    info!(
+                        old_update_every_secs = update_every_secs,
+                        new_update_every_secs = new_secs,
+                        "ME config updater interval decreased, running immediate refresh"
+                    );
+                    update_every_secs = new_secs;
+                    update_every = Duration::from_secs(update_every_secs);
+                    run_update_cycle(&pool, &rng, cfg.as_ref()).await;
+                    next_tick = tokio::time::Instant::now() + update_every;
+                } else {
+                    info!(
+                        old_update_every_secs = update_every_secs,
+                        new_update_every_secs = new_secs,
+                        "ME config updater interval increased"
+                    );
+                    update_every_secs = new_secs;
+                    update_every = Duration::from_secs(update_every_secs);
+                    next_tick = tokio::time::Instant::now() + update_every;
                 }
             }
-            Err(e) => warn!(error = %e, "proxy-secret update failed"),
         }
     }
 }

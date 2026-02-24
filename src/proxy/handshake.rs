@@ -1,17 +1,23 @@
 //! MTProto Handshake
 
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn, trace, info};
 use zeroize::Zeroize;
 
 use crate::crypto::{sha256, AesCtr, SecureRandom};
+use rand::Rng;
 use crate::protocol::constants::*;
 use crate::protocol::tls;
 use crate::stream::{FakeTlsReader, FakeTlsWriter, CryptoReader, CryptoWriter};
 use crate::error::{ProxyError, HandshakeResult};
 use crate::stats::ReplayChecker;
 use crate::config::ProxyConfig;
+use crate::tls_front::{TlsFrontCache, emulator};
 
 /// Result of successful handshake
 ///
@@ -55,6 +61,7 @@ pub async fn handle_tls_handshake<R, W>(
     config: &ProxyConfig,
     replay_checker: &ReplayChecker,
     rng: &SecureRandom,
+    tls_cache: Option<Arc<TlsFrontCache>>,
 ) -> HandshakeResult<(FakeTlsReader<R>, FakeTlsWriter<W>, String), R, W>
 where
     R: AsyncRead + Unpin,
@@ -102,13 +109,85 @@ where
         None => return HandshakeResult::BadClient { reader, writer },
     };
 
-    let response = tls::build_server_hello(
-        secret,
-        &validation.digest,
-        &validation.session_id,
-        config.censorship.fake_cert_len,
-        rng,
-    );
+    let cached = if config.censorship.tls_emulation {
+        if let Some(cache) = tls_cache.as_ref() {
+            let selected_domain = if let Some(sni) = tls::extract_sni_from_client_hello(handshake) {
+                if cache.contains_domain(&sni).await {
+                    sni
+                } else {
+                    config.censorship.tls_domain.clone()
+                }
+            } else {
+                config.censorship.tls_domain.clone()
+            };
+            let cached_entry = cache.get(&selected_domain).await;
+            let use_full_cert_payload = cache
+                .take_full_cert_budget_for_ip(
+                    peer.ip(),
+                    Duration::from_secs(config.censorship.tls_full_cert_ttl_secs),
+                )
+                .await;
+            Some((cached_entry, use_full_cert_payload))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let alpn_list = if config.censorship.alpn_enforce {
+        tls::extract_alpn_from_client_hello(handshake)
+    } else {
+        Vec::new()
+    };
+    let selected_alpn = if config.censorship.alpn_enforce {
+        if alpn_list.iter().any(|p| p == b"h2") {
+            Some(b"h2".to_vec())
+        } else if alpn_list.iter().any(|p| p == b"http/1.1") {
+            Some(b"http/1.1".to_vec())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = if let Some((cached_entry, use_full_cert_payload)) = cached {
+        emulator::build_emulated_server_hello(
+            secret,
+            &validation.digest,
+            &validation.session_id,
+            &cached_entry,
+            use_full_cert_payload,
+            rng,
+            selected_alpn.clone(),
+            config.censorship.tls_new_session_tickets,
+        )
+    } else {
+        tls::build_server_hello(
+            secret,
+            &validation.digest,
+            &validation.session_id,
+            config.censorship.fake_cert_len,
+            rng,
+            selected_alpn.clone(),
+            config.censorship.tls_new_session_tickets,
+        )
+    };
+
+    // Optional anti-fingerprint delay before sending ServerHello.
+    if config.censorship.server_hello_delay_max_ms > 0 {
+        let min = config.censorship.server_hello_delay_min_ms;
+        let max = config.censorship.server_hello_delay_max_ms.max(min);
+        let delay_ms = if max == min {
+            max
+        } else {
+            rand::rng().random_range(min..=max)
+        };
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
 
     debug!(peer = %peer, response_len = response.len(), "Sending TLS ServerHello");
 
@@ -190,7 +269,11 @@ where
 
         let mode_ok = match proto_tag {
             ProtoTag::Secure => {
-                if is_tls { config.general.modes.tls } else { config.general.modes.secure }
+                if is_tls {
+                    config.general.modes.tls || config.general.modes.secure
+                } else {
+                    config.general.modes.secure || config.general.modes.tls
+                }
             }
             ProtoTag::Intermediate | ProtoTag::Abridged => config.general.modes.classic,
         };
@@ -237,9 +320,10 @@ where
             "MTProto handshake successful"
         );
 
+        let max_pending = config.general.crypto_pending_buffer;
         return HandshakeResult::Success((
             CryptoReader::new(reader, decryptor),
-            CryptoWriter::new(writer, encryptor),
+            CryptoWriter::new(writer, encryptor, max_pending),
             success,
         ));
     }

@@ -1,8 +1,11 @@
 //! telemt — Telegram MTProto Proxy
 
+#![allow(unused_assignments)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Semaphore;
@@ -23,9 +26,11 @@ mod proxy;
 mod stats;
 mod stream;
 mod transport;
+mod tls_front;
 mod util;
 
 use crate::config::{LogLevel, ProxyConfig};
+use crate::config::hot_reload::spawn_config_watcher;
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::network::probe::{decide_network_capabilities, log_probe_result, run_probe};
@@ -35,7 +40,8 @@ use crate::stream::BufferPool;
 use crate::transport::middle_proxy::{
     MePool, fetch_proxy_config, run_me_ping, MePingFamily, MePingSample, format_sample_line,
 };
-use crate::transport::{ListenOptions, UpstreamManager, create_listener};
+use crate::transport::{ListenOptions, UpstreamManager, create_listener, find_listener_processes};
+use crate::tls_front::TlsFrontCache;
 
 fn parse_cli() -> (String, bool, Option<String>) {
     let mut config_path = "config.toml".to_string();
@@ -92,6 +98,10 @@ fn parse_cli() -> (String, bool, Option<String>) {
                 eprintln!("    --no-start             Don't start the service after install");
                 std::process::exit(0);
             }
+            "--version" | "-V" => {
+                println!("telemt {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             s if !s.starts_with('-') => {
                 config_path = s.to_string();
             }
@@ -106,34 +116,47 @@ fn parse_cli() -> (String, bool, Option<String>) {
 }
 
 fn print_proxy_links(host: &str, port: u16, config: &ProxyConfig) {
-    info!("--- Proxy Links ({}) ---", host);
+    info!(target: "telemt::links", "--- Proxy Links ({}) ---", host);
     for user_name in config.general.links.show.resolve_users(&config.access.users) {
         if let Some(secret) = config.access.users.get(user_name) {
-            info!("User: {}", user_name);
+            info!(target: "telemt::links", "User: {}", user_name);
             if config.general.modes.classic {
                 info!(
+                    target: "telemt::links",
                     "  Classic: tg://proxy?server={}&port={}&secret={}",
                     host, port, secret
                 );
             }
             if config.general.modes.secure {
                 info!(
+                    target: "telemt::links",
                     "  DD:      tg://proxy?server={}&port={}&secret=dd{}",
                     host, port, secret
                 );
             }
             if config.general.modes.tls {
-                let domain_hex = hex::encode(&config.censorship.tls_domain);
-                info!(
-                    "  EE-TLS:  tg://proxy?server={}&port={}&secret=ee{}{}",
-                    host, port, secret, domain_hex
-                );
+                let mut domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
+                domains.push(config.censorship.tls_domain.clone());
+                for d in &config.censorship.tls_domains {
+                    if !domains.contains(d) {
+                        domains.push(d.clone());
+                    }
+                }
+
+                for domain in domains {
+                    let domain_hex = hex::encode(&domain);
+                    info!(
+                        target: "telemt::links",
+                        "  EE-TLS:  tg://proxy?server={}&port={}&secret=ee{}{}",
+                        host, port, secret, domain_hex
+                    );
+                }
             }
         } else {
-            warn!("User '{}' in show_link not found", user_name);
+            warn!(target: "telemt::links", "User '{}' in show_link not found", user_name);
         }
     }
-    info!("------------------------");
+    info!(target: "telemt::links", "------------------------");
 }
 
 #[tokio::main]
@@ -192,6 +215,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "Modes: classic={} secure={} tls={}",
         config.general.modes.classic, config.general.modes.secure, config.general.modes.tls
     );
+    if config.general.modes.classic {
+        warn!("Classic mode is vulnerable to DPI detection; enable only for legacy clients");
+    }
     info!("TLS domain: {}", config.censorship.tls_domain);
     if let Some(ref sock) = config.censorship.mask_unix_sock {
         info!("Mask: {} -> unix:{}", config.censorship.mask, sock);
@@ -241,7 +267,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Connection concurrency limit
-    let _max_connections = Arc::new(Semaphore::new(10_000));
+    let max_connections = Arc::new(Semaphore::new(10_000));
 
     if use_middle_proxy && !decision.ipv4_me && !decision.ipv6_me {
         warn!("No usable IP family for Middle Proxy detected; falling back to direct DC");
@@ -275,7 +301,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).await {
     Ok(proxy_secret) => {
         info!(
-            secret_len = proxy_secret.len() as usize,  // ← ЯВНЫЙ ТИП usize
+            secret_len = proxy_secret.len(),
             key_sig = format_args!(
                 "0x{:08x}",
                 if proxy_secret.len() >= 4 {
@@ -317,6 +343,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                     config.general.middle_proxy_nat_ip,
                     config.general.middle_proxy_nat_probe,
                     config.general.middle_proxy_nat_stun.clone(),
+                    config.general.middle_proxy_nat_stun_servers.clone(),
                     probe.detected_ipv6,
                     config.timeouts.me_one_retry,
                     config.timeouts.me_one_timeout_ms,
@@ -325,18 +352,36 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                     cfg_v4.default_dc.or(cfg_v6.default_dc),
                     decision.clone(),
                     rng.clone(),
+                    stats.clone(),
+                    config.general.me_keepalive_enabled,
+                    config.general.me_keepalive_interval_secs,
+                    config.general.me_keepalive_jitter_secs,
+                    config.general.me_keepalive_payload_random,
+                    config.general.me_warmup_stagger_enabled,
+                    config.general.me_warmup_step_delay_ms,
+                    config.general.me_warmup_step_jitter_ms,
+                    config.general.me_reconnect_max_concurrent_per_dc,
+                    config.general.me_reconnect_backoff_base_ms,
+                    config.general.me_reconnect_backoff_cap_ms,
+                    config.general.me_reconnect_fast_retry_count,
+                    config.general.hardswap,
+                    config.general.me_pool_drain_ttl_secs,
+                    config.general.effective_me_pool_force_close_secs(),
+                    config.general.me_pool_min_fresh_ratio,
                 );
 
-                match pool.init(2, &rng).await {
+                let pool_size = config.general.middle_proxy_pool_size.max(1);
+                match pool.init(pool_size, &rng).await {
                     Ok(()) => {
                         info!("Middle-End pool initialized successfully");
 
                         // Phase 4: Start health monitor
                         let pool_clone = pool.clone();
                         let rng_clone = rng.clone();
+                        let min_conns = pool_size;
                         tokio::spawn(async move {
                             crate::transport::middle_proxy::me_health_monitor(
-                                pool_clone, rng_clone, 2,
+                                pool_clone, rng_clone, min_conns,
                             )
                             .await;
                         });
@@ -349,18 +394,6 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                                 pool_clone_rot,
                                 rng_clone_rot,
                                 std::time::Duration::from_secs(1800),
-                            )
-                            .await;
-                        });
-
-                        // Periodic updater: getProxyConfig + proxy-secret
-                        let pool_clone2 = pool.clone();
-                        let rng_clone2 = rng.clone();
-                        tokio::spawn(async move {
-                            crate::transport::middle_proxy::me_config_updater(
-                                pool_clone2,
-                                rng_clone2,
-                                std::time::Duration::from_secs(12 * 3600),
                             )
                             .await;
                         });
@@ -386,6 +419,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
     if me_pool.is_some() {
         info!("Transport: Middle-End Proxy - all DC-over-RPC");
     } else {
+        let _ = use_middle_proxy;
         use_middle_proxy = false;
         // Make runtime config reflect direct-only mode for handlers.
         config.general.use_middle_proxy = false;
@@ -402,6 +436,74 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
 
     let upstream_manager = Arc::new(UpstreamManager::new(config.upstreams.clone()));
     let buffer_pool = Arc::new(BufferPool::with_config(16 * 1024, 4096));
+
+    // TLS front cache (optional emulation)
+    let mut tls_domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
+    tls_domains.push(config.censorship.tls_domain.clone());
+    for d in &config.censorship.tls_domains {
+        if !tls_domains.contains(d) {
+            tls_domains.push(d.clone());
+        }
+    }
+
+    let tls_cache: Option<Arc<TlsFrontCache>> = if config.censorship.tls_emulation {
+        let cache = Arc::new(TlsFrontCache::new(
+            &tls_domains,
+            config.censorship.fake_cert_len,
+            &config.censorship.tls_front_dir,
+        ));
+
+        cache.load_from_disk().await;
+
+        let port = config.censorship.mask_port;
+        let mask_host = config.censorship.mask_host.clone()
+            .unwrap_or_else(|| config.censorship.tls_domain.clone());
+        // Initial synchronous fetch to warm cache before serving clients.
+        for domain in tls_domains.clone() {
+            match crate::tls_front::fetcher::fetch_real_tls(
+                &mask_host,
+                port,
+                &domain,
+                Duration::from_secs(5),
+                Some(upstream_manager.clone()),
+            )
+            .await
+            {
+                Ok(res) => cache.update_from_fetch(&domain, res).await,
+                Err(e) => warn!(domain = %domain, error = %e, "TLS emulation fetch failed"),
+            }
+        }
+
+        // Periodic refresh with jitter.
+        let cache_clone = cache.clone();
+        let domains = tls_domains.clone();
+        let upstream_for_task = upstream_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                let base_secs = rand::rng().random_range(4 * 3600..=6 * 3600);
+                let jitter_secs = rand::rng().random_range(0..=7200);
+                tokio::time::sleep(Duration::from_secs(base_secs + jitter_secs)).await;
+                for domain in &domains {
+                    match crate::tls_front::fetcher::fetch_real_tls(
+                        &mask_host,
+                        port,
+                        domain,
+                        Duration::from_secs(5),
+                        Some(upstream_for_task.clone()),
+                    )
+                    .await
+                    {
+                        Ok(res) => cache_clone.update_from_fetch(domain, res).await,
+                        Err(e) => warn!(domain = %domain, error = %e, "TLS emulation refresh failed"),
+                    }
+                }
+            }
+        });
+
+        Some(cache)
+    } else {
+        None
+    };
 
     // Middle-End ping before DC connectivity
     if let Some(ref pool) = me_pool {
@@ -495,14 +597,12 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
 			} else {
 				info!("  IPv4 in use / IPv6 is fallback");
 			}
-		} else {
-			if v6_works && !v4_works {
-				info!("  IPv6 only / IPv4 unavailable)");
-			} else if v4_works && !v6_works {
-				info!("  IPv4 only / IPv6 unavailable)");
-			} else if !v6_works && !v4_works {
-				info!("  No DC connectivity");
-			}
+		} else if v6_works && !v4_works {
+			info!("  IPv6 only / IPv4 unavailable)");
+		} else if v4_works && !v6_works {
+			info!("  IPv4 only / IPv6 unavailable)");
+		} else if !v6_works && !v4_works {
+			info!("  No DC connectivity");
 		}
 
 		info!("  via {}", upstream_result.upstream_name);
@@ -582,6 +682,33 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         detected_ip_v4, detected_ip_v6
     );
 
+    // ── Hot-reload watcher ────────────────────────────────────────────────
+    // Uses inotify to detect file changes instantly (SIGHUP also works).
+    // detected_ip_v4/v6 are passed so newly added users get correct TG links.
+    let (config_rx, mut log_level_rx): (
+        tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
+        tokio::sync::watch::Receiver<LogLevel>,
+    ) = spawn_config_watcher(
+        std::path::PathBuf::from(&config_path),
+        config.clone(),
+        detected_ip_v4,
+        detected_ip_v6,
+    );
+
+    if let Some(ref pool) = me_pool {
+        let pool_clone = pool.clone();
+        let rng_clone = rng.clone();
+        let config_rx_clone = config_rx.clone();
+        tokio::spawn(async move {
+            crate::transport::middle_proxy::me_config_updater(
+                pool_clone,
+                rng_clone,
+                config_rx_clone,
+            )
+            .await;
+        });
+    }
+
     let mut listeners = Vec::new();
 
     for listener_conf in &config.server.listeners {
@@ -595,6 +722,7 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
             continue;
         }
         let options = ListenOptions {
+            reuse_port: listener_conf.reuse_allow,
             ipv6_only: listener_conf.ip.is_ipv6(),
             ..Default::default()
         };
@@ -603,6 +731,8 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
             Ok(socket) => {
                 let listener = TcpListener::from_std(socket.into())?;
                 info!("Listening on {}", addr);
+                let listener_proxy_protocol =
+                    listener_conf.proxy_protocol.unwrap_or(config.server.proxy_protocol);
 
                 // Resolve the public host for link generation
                 let public_host = if let Some(ref announce) = listener_conf.announce {
@@ -628,10 +758,36 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                     print_proxy_links(&public_host, link_port, &config);
                 }
 
-                listeners.push(listener);
+                listeners.push((listener, listener_proxy_protocol));
             }
             Err(e) => {
-                error!("Failed to bind to {}: {}", addr, e);
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    let owners = find_listener_processes(addr);
+                    if owners.is_empty() {
+                        error!(
+                            %addr,
+                            "Failed to bind: address already in use (owner process unresolved)"
+                        );
+                    } else {
+                        for owner in owners {
+                            error!(
+                                %addr,
+                                pid = owner.pid,
+                                process = %owner.process,
+                                "Failed to bind: address already in use"
+                            );
+                        }
+                    }
+
+                    if !listener_conf.reuse_allow {
+                        error!(
+                            %addr,
+                            "reuse_allow=false; set [[server.listeners]].reuse_allow=true to allow multi-instance listening"
+                        );
+                    }
+                } else {
+                    error!("Failed to bind to {}: {}", addr, e);
+                }
             }
         }
     }
@@ -686,14 +842,16 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
 
         has_unix_listener = true;
 
-        let config = config.clone();
+        let mut config_rx_unix: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
         let buffer_pool = buffer_pool.clone();
         let rng = rng.clone();
         let me_pool = me_pool.clone();
+        let tls_cache = tls_cache.clone();
         let ip_tracker = ip_tracker.clone();
+        let max_connections_unix = max_connections.clone();
 
         tokio::spawn(async move {
             let unix_conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -701,23 +859,33 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
             loop {
                 match unix_listener.accept().await {
                     Ok((stream, _)) => {
+                        let permit = match max_connections_unix.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                error!("Connection limiter is closed");
+                                break;
+                            }
+                        };
                         let conn_id = unix_conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let fake_peer = SocketAddr::from(([127, 0, 0, 1], (conn_id % 65535) as u16));
 
-                        let config = config.clone();
+                        let config = config_rx_unix.borrow_and_update().clone();
                         let stats = stats.clone();
                         let upstream_manager = upstream_manager.clone();
                         let replay_checker = replay_checker.clone();
                         let buffer_pool = buffer_pool.clone();
                         let rng = rng.clone();
                         let me_pool = me_pool.clone();
+                        let tls_cache = tls_cache.clone();
                         let ip_tracker = ip_tracker.clone();
+                        let proxy_protocol_enabled = config.server.proxy_protocol;
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = crate::proxy::client::handle_client_stream(
                                 stream, fake_peer, config, stats,
                                 upstream_manager, replay_checker, buffer_pool, rng,
-                                me_pool, ip_tracker,
+                                me_pool, tls_cache, ip_tracker, proxy_protocol_enabled,
                             ).await {
                                 debug!(error = %e, "Unix socket connection error");
                             }
@@ -740,12 +908,28 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
     // Switch to user-configured log level after startup
     let runtime_filter = if has_rust_log {
         EnvFilter::from_default_env()
+    } else if matches!(effective_log_level, LogLevel::Silent) {
+        EnvFilter::new("warn,telemt::links=info")
     } else {
         EnvFilter::new(effective_log_level.to_filter_str())
     };
     filter_handle
         .reload(runtime_filter)
         .expect("Failed to switch log filter");
+
+    // Apply log_level changes from hot-reload to the tracing filter.
+    tokio::spawn(async move {
+        loop {
+            if log_level_rx.changed().await.is_err() {
+                break;
+            }
+            let level = log_level_rx.borrow_and_update().clone();
+            let new_filter = tracing_subscriber::EnvFilter::new(level.to_filter_str());
+            if let Err(e) = filter_handle.reload(new_filter) {
+                tracing::error!("config reload: failed to update log filter: {}", e);
+            }
+        }
+    });
 
     if let Some(port) = config.server.metrics_port {
         let stats = stats.clone();
@@ -755,30 +939,42 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
         });
     }
 
-    for listener in listeners {
-        let config = config.clone();
+    for (listener, listener_proxy_protocol) in listeners {
+        let mut config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
         let buffer_pool = buffer_pool.clone();
         let rng = rng.clone();
         let me_pool = me_pool.clone();
+        let tls_cache = tls_cache.clone();
         let ip_tracker = ip_tracker.clone();
+        let max_connections_tcp = max_connections.clone();
 
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
-                        let config = config.clone();
+                        let permit = match max_connections_tcp.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                error!("Connection limiter is closed");
+                                break;
+                            }
+                        };
+                        let config = config_rx.borrow_and_update().clone();
                         let stats = stats.clone();
                         let upstream_manager = upstream_manager.clone();
                         let replay_checker = replay_checker.clone();
                         let buffer_pool = buffer_pool.clone();
                         let rng = rng.clone();
                         let me_pool = me_pool.clone();
+                        let tls_cache = tls_cache.clone();
                         let ip_tracker = ip_tracker.clone();
+                        let proxy_protocol_enabled = listener_proxy_protocol;
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = ClientHandler::new(
                                 stream,
                                 peer_addr,
@@ -789,12 +985,47 @@ match crate::transport::middle_proxy::fetch_proxy_secret(proxy_secret_path).awai
                                 buffer_pool,
                                 rng,
                                 me_pool,
+                                tls_cache,
                                 ip_tracker,
+                                proxy_protocol_enabled,
                             )
                             .run()
                             .await
                             {
-                                debug!(peer = %peer_addr, error = %e, "Connection error");
+                                let peer_closed = matches!(
+                                    &e,
+                                    crate::error::ProxyError::Io(ioe)
+                                        if matches!(
+                                            ioe.kind(),
+                                            std::io::ErrorKind::ConnectionReset
+                                                | std::io::ErrorKind::ConnectionAborted
+                                                | std::io::ErrorKind::BrokenPipe
+                                                | std::io::ErrorKind::NotConnected
+                                        )
+                                ) || matches!(
+                                    &e,
+                                    crate::error::ProxyError::Stream(
+                                        crate::error::StreamError::Io(ioe)
+                                    )
+                                        if matches!(
+                                            ioe.kind(),
+                                            std::io::ErrorKind::ConnectionReset
+                                                | std::io::ErrorKind::ConnectionAborted
+                                                | std::io::ErrorKind::BrokenPipe
+                                                | std::io::ErrorKind::NotConnected
+                                        )
+                                );
+
+                                let me_closed = matches!(
+                                    &e,
+                                    crate::error::ProxyError::Proxy(msg) if msg == "ME connection lost"
+                                );
+
+                                match (peer_closed, me_closed) {
+                                    (true, _) => debug!(peer = %peer_addr, error = %e, "Connection closed by client"),
+                                    (_, true) => warn!(peer = %peer_addr, error = %e, "Connection closed: Middle-End dropped session"),
+                                    _ => warn!(peer = %peer_addr, error = %e, "Connection closed with error"),
+                                }
                             }
                         });
                     }
