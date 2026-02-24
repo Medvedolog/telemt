@@ -1,75 +1,78 @@
-name: Build Telemt aarch64
+name: Build and Release Telemt (aarch64-musl)
 
 on:
+  push:
+    tags:
+      # Триггеры для тегов версий v3.0.13 и старше
+      - 'v3.0.1[3-9]'
+      - 'v3.0.[2-9]*'
+      - 'v3.[1-9]*'
+      - 'v[4-9]*'
+  
+  # Добавляем возможность запускать workflow вручную
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Tag or branch to build (e.g., v3.0.13)'
-        required: true
-        type: string
-        default: 'main'
 
 jobs:
-  build:
-    name: Build Telemt aarch64-musl
+  release:
+    name: Build and Release
     runs-on: ubuntu-latest
+    # Необходимо для того, чтобы GitHub Actions мог создать релиз
+    permissions:
+      contents: write 
 
     steps:
-      - name: Checkout repository (full history + tags)
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: vars
+        run: |
+          # Если запуск ручной (не по тегу), используем 'latest' или ветку
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "VERSION=v-custom" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0  # fetch full history & tags
+          targets: aarch64-unknown-linux-musl
 
-      - name: Explicitly fetch all tags + specified ref
+      - name: Install cross
         run: |
-          git fetch --prune --unshallow origin "+refs/tags/*:refs/tags/*" "+refs/heads/*:refs/remotes/origin/*"
-          git fetch origin ${{ github.event.inputs.release_tag }} || true
-          git checkout ${{ github.event.inputs.release_tag }}
+          # Скачиваем готовый бинарник cross для экономии времени (вместо долгого cargo install)
+          curl -L https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
+          sudo mv cross /usr/local/bin/
 
-      - name: Install Rust toolchain and target
+      - name: Build binary with cross
         run: |
-          rustup toolchain install stable
-          rustup target add aarch64-unknown-linux-musl
-
-      - name: Install musl cross tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools curl
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Configure Cargo for musl
-        run: |
-          mkdir -p ~/.cargo
-          printf "[target.aarch64-unknown-linux-musl]\nlinker = \"aarch64-linux-musl-gcc\"\n" >> ~/.cargo/config.toml
-
-      - name: Build release binary
-        run: |
-          export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-          export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
-          cargo build --release --target aarch64-unknown-linux-musl
-
-      - name: Strip binary
-        run: |
-          aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/telemt
-
-      - name: Embed version tag into binary
-        run: |
-          VERSION="${{ github.event.inputs.release_tag }}"
-          printf "\nTELEMT_VERSION=${VERSION}\n" >> target/aarch64-unknown-linux-musl/release/telemt
+          # CARGO_PROFILE_RELEASE_STRIP=true указывает Cargo автоматически сделать strip
+          # Это обрезает отладочные символы и значительно уменьшает вес
+          CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y upx
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
 
-      - name: Compress binary with UPX
+      - name: Compress with UPX
         run: |
           upx --best --lzma target/aarch64-unknown-linux-musl/release/telemt
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Append version string
+        run: |
+          # Добавляем строку с версией в конец файла (обязательно ПОСЛЕ UPX)
+          # Парсер luci-app-telemt сможет прочитать ее, например, с помощью: tail -c 10 telemt | grep -o 'v[0-9].*'
+          echo -n "${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
+          
+          # Переименовываем бинарник перед загрузкой в релиз
+          mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: telemt-aarch64
-          path: target/aarch64-unknown-linux-musl/release/telemt
+          files: telemt-aarch64-musl
+          name: Release ${{ env.VERSION }}
+          tag_name: ${{ env.VERSION }}
+          draft: false
+          prerelease: false
