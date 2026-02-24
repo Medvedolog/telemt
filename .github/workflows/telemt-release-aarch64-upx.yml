@@ -3,35 +3,41 @@ name: Build and Release Telemt (aarch64-musl)
 on:
   push:
     tags:
-      # Триггеры для тегов версий v3.0.13 и старше
       - 'v3.0.1[3-9]'
       - 'v3.0.[2-9]*'
       - 'v3.[1-9]*'
       - 'v[4-9]*'
   
-  # Добавляем возможность запускать workflow вручную
   workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Введите тег или ветку для сборки (например, v3.0.13 или nightly)'
+        required: true
+        default: 'main'
 
 jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
-    # Необходимо для того, чтобы GitHub Actions мог создать релиз
     permissions:
       contents: write 
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Скачиваем указанный вручную тег ИЛИ тот, что вызвал автоматический пуш
+          ref: ${{ github.event.inputs.build_target || github.ref }}
 
       - name: Extract version from tag
         id: vars
         run: |
-          # Если запуск ручной (не по тегу), используем 'latest' или ветку
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "VERSION=${{ github.event.inputs.build_target }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
           else
-            echo "VERSION=v-custom" >> $GITHUB_ENV
+            echo "VERSION=nightly" >> $GITHUB_ENV
           fi
 
       - name: Setup Rust
@@ -41,14 +47,12 @@ jobs:
 
       - name: Install cross
         run: |
-          # Скачиваем готовый бинарник cross для экономии времени (вместо долгого cargo install)
           curl -L https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
           sudo mv cross /usr/local/bin/
 
       - name: Build binary with cross
         run: |
-          # CARGO_PROFILE_RELEASE_STRIP=true указывает Cargo автоматически сделать strip
-          # Это обрезает отладочные символы и значительно уменьшает вес
+          # Strip включен на уровне профиля для уменьшения размера
           CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
@@ -60,19 +64,20 @@ jobs:
 
       - name: Append version string
         run: |
-          # Добавляем строку с версией в конец файла (обязательно ПОСЛЕ UPX)
-          # Парсер luci-app-telemt сможет прочитать ее, например, с помощью: tail -c 10 telemt | grep -o 'v[0-9].*'
+          # Добавляем версию в конец сжатого бинарника без переноса строки
           echo -n "${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
           
-          # Переименовываем бинарник перед загрузкой в релиз
+          # Переименовываем файл для релиза
           mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        # Разрешаем релиз при пуше тега ИЛИ при ручном запуске
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           files: telemt-aarch64-musl
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
+          # Если это ручная сборка из main (не тег), пометим как pre-release
+          prerelease: ${{ github.event.inputs.build_target == 'main' }}
           draft: false
-          prerelease: false
