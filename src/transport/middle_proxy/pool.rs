@@ -708,6 +708,7 @@ impl MePool {
             match self.connect_one(addr, self.rng.as_ref()).await {
                 Ok(()) => {
                     self.stats.increment_me_reconnect_success();
+                    self.stats.increment_me_writer_restored_same_endpoint_total();
                     info!(
                         %addr,
                         attempt = attempt + 1,
@@ -728,6 +729,7 @@ impl MePool {
 
         let dc_endpoints = self.endpoints_for_same_dc(addr).await;
         if dc_endpoints.is_empty() {
+            self.stats.increment_me_refill_failed_total();
             return false;
         }
 
@@ -738,6 +740,7 @@ impl MePool {
                 .await
             {
                 self.stats.increment_me_reconnect_success();
+                self.stats.increment_me_writer_restored_fallback_total();
                 info!(
                     %addr,
                     attempt = attempt + 1,
@@ -747,6 +750,7 @@ impl MePool {
             }
         }
 
+        self.stats.increment_me_refill_failed_total();
         false
     }
 
@@ -756,9 +760,11 @@ impl MePool {
             {
                 let mut guard = pool.refill_inflight.lock().await;
                 if !guard.insert(addr) {
+                    pool.stats.increment_me_refill_skipped_inflight_total();
                     return;
                 }
             }
+            pool.stats.increment_me_refill_triggered_total();
 
             let restored = pool.refill_writer_after_loss(addr).await;
             if !restored {
@@ -1189,9 +1195,13 @@ impl MePool {
                 if was_draining {
                     self.stats.decrement_pool_drain_active();
                 }
+                self.stats.increment_me_writer_removed_total();
                 w.cancel.cancel();
                 removed_addr = Some(w.addr);
                 trigger_refill = !was_draining;
+                if trigger_refill {
+                    self.stats.increment_me_writer_removed_unexpected_total();
+                }
                 close_tx = Some(w.tx.clone());
                 self.conn_count.fetch_sub(1, Ordering::Relaxed);
             }

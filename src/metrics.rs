@@ -199,6 +199,95 @@ fn render_metrics(stats: &Stats) -> String {
         stats.get_pool_stale_pick_total()
     );
 
+    let _ = writeln!(out, "# HELP telemt_me_writer_removed_total Total ME writer removals");
+    let _ = writeln!(out, "# TYPE telemt_me_writer_removed_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_removed_total {}",
+        stats.get_me_writer_removed_total()
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_removed_unexpected_total Unexpected ME writer removals that triggered refill"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_removed_unexpected_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_removed_unexpected_total {}",
+        stats.get_me_writer_removed_unexpected_total()
+    );
+
+    let _ = writeln!(out, "# HELP telemt_me_refill_triggered_total Immediate ME refill runs started");
+    let _ = writeln!(out, "# TYPE telemt_me_refill_triggered_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_refill_triggered_total {}",
+        stats.get_me_refill_triggered_total()
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_refill_skipped_inflight_total Immediate ME refill skips due to inflight dedup"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_refill_skipped_inflight_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_refill_skipped_inflight_total {}",
+        stats.get_me_refill_skipped_inflight_total()
+    );
+
+    let _ = writeln!(out, "# HELP telemt_me_refill_failed_total Immediate ME refill failures");
+    let _ = writeln!(out, "# TYPE telemt_me_refill_failed_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_refill_failed_total {}",
+        stats.get_me_refill_failed_total()
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_restored_same_endpoint_total Refilled ME writer restored on the same endpoint"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_restored_same_endpoint_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_restored_same_endpoint_total {}",
+        stats.get_me_writer_restored_same_endpoint_total()
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_restored_fallback_total Refilled ME writer restored via fallback endpoint"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_restored_fallback_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_restored_fallback_total {}",
+        stats.get_me_writer_restored_fallback_total()
+    );
+
+    let unresolved_writer_losses = stats
+        .get_me_writer_removed_unexpected_total()
+        .saturating_sub(
+            stats
+                .get_me_writer_restored_same_endpoint_total()
+                .saturating_add(stats.get_me_writer_restored_fallback_total()),
+        );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_removed_unexpected_minus_restored_total Unexpected writer removals not yet compensated by restore"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_writer_removed_unexpected_minus_restored_total gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_removed_unexpected_minus_restored_total {}",
+        unresolved_writer_losses
+    );
+
     let _ = writeln!(out, "# HELP telemt_user_connections_total Per-user total connections");
     let _ = writeln!(out, "# TYPE telemt_user_connections_total counter");
     let _ = writeln!(out, "# HELP telemt_user_connections_current Per-user active connections");
@@ -277,6 +366,10 @@ mod tests {
         assert!(output.contains("# TYPE telemt_connections_total counter"));
         assert!(output.contains("# TYPE telemt_connections_bad_total counter"));
         assert!(output.contains("# TYPE telemt_handshake_timeouts_total counter"));
+        assert!(output.contains("# TYPE telemt_me_writer_removed_total counter"));
+        assert!(output.contains(
+            "# TYPE telemt_me_writer_removed_unexpected_minus_restored_total gauge"
+        ));
     }
 
     #[tokio::test]
