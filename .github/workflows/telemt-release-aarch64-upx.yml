@@ -147,4 +147,4 @@ jobs:
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
           prerelease: ${{ env.VERSION == 'main' || env.VERSION == 'master' }}
-          draft: false
+          draft: false 
