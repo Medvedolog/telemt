@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Введите тег или ветку для сборки (например, v3.0.13 или nightly)'
+        description: 'Введите тег (например, v3.0.13) или ветку (main)'
         required: true
-        default: 'main'
+        default: 'v3.0.13' # По умолчанию стоит нужный тег для удобства запуска
 
 jobs:
   release:
@@ -23,15 +23,10 @@ jobs:
       contents: write 
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Скачиваем указанный вручную тег ИЛИ тот, что вызвал автоматический пуш
-          ref: ${{ github.event.inputs.build_target || github.ref }}
-
-      - name: Extract version from tag
+      - name: Extract version
         id: vars
         run: |
+          # Сначала определяем, какую версию собираем
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "VERSION=${{ github.event.inputs.build_target }}" >> $GITHUB_ENV
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -39,6 +34,14 @@ jobs:
           else
             echo "VERSION=nightly" >> $GITHUB_ENV
           fi
+
+      - name: Checkout upstream repository
+        uses: actions/checkout@v4
+        with:
+          # Явно скачиваем код из оригинального репозитория, где есть все теги
+          repository: 'telemt/telemt'
+          # Используем вычисленную выше переменную
+          ref: ${{ env.VERSION }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +55,6 @@ jobs:
 
       - name: Build binary with cross
         run: |
-          # Strip включен на уровне профиля для уменьшения размера
           CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
@@ -64,20 +66,15 @@ jobs:
 
       - name: Append version string
         run: |
-          # Добавляем версию в конец сжатого бинарника без переноса строки
           echo -n "${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
-          
-          # Переименовываем файл для релиза
           mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        # Разрешаем релиз при пуше тега ИЛИ при ручном запуске
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           files: telemt-aarch64-musl
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
-          # Если это ручная сборка из main (не тег), пометим как pre-release
-          prerelease: ${{ github.event.inputs.build_target == 'main' }}
+          prerelease: ${{ env.VERSION == 'main' || env.VERSION == 'master' }}
           draft: false
