@@ -16,7 +16,7 @@ tls = true
 
 # === Server Binding ===
 [server]
-port = 9999
+port = 443
 # proxy_protocol = false           # Enable if behind HAProxy/nginx with PROXY protocol
 metrics_port = 9090
 metrics_whitelist = ["127.0.0.1", "::1", "0.0.0.0/0"]
