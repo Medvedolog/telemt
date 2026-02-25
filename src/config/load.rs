@@ -428,6 +428,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serde_defaults_remain_unchanged_for_present_sections() {
+        let toml = r#"
+            [network]
+            [general]
+            [server]
+            [access]
+        "#;
+        let cfg: ProxyConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(cfg.network.ipv6, None);
+        assert!(!cfg.network.stun_tcp_fallback);
+        assert_eq!(cfg.general.middle_proxy_warm_standby, 0);
+        assert_eq!(cfg.general.me_reconnect_max_concurrent_per_dc, 0);
+        assert_eq!(cfg.general.me_reconnect_fast_retry_count, 0);
+        assert_eq!(cfg.general.update_every, None);
+        assert_eq!(cfg.server.listen_addr_ipv4, None);
+        assert_eq!(cfg.server.listen_addr_ipv6, None);
+        assert!(cfg.access.users.is_empty());
+    }
+
+    #[test]
+    fn impl_defaults_are_sourced_from_default_helpers() {
+        let network = NetworkConfig::default();
+        assert_eq!(network.ipv6, default_network_ipv6());
+        assert_eq!(network.stun_tcp_fallback, default_stun_tcp_fallback());
+
+        let general = GeneralConfig::default();
+        assert_eq!(
+            general.middle_proxy_warm_standby,
+            default_middle_proxy_warm_standby()
+        );
+        assert_eq!(
+            general.me_reconnect_max_concurrent_per_dc,
+            default_me_reconnect_max_concurrent_per_dc()
+        );
+        assert_eq!(
+            general.me_reconnect_fast_retry_count,
+            default_me_reconnect_fast_retry_count()
+        );
+        assert_eq!(general.update_every, default_update_every());
+
+        let server = ServerConfig::default();
+        assert_eq!(server.listen_addr_ipv6, Some(default_listen_addr_ipv6()));
+
+        let access = AccessConfig::default();
+        assert_eq!(access.users, default_access_users());
+    }
+
+    #[test]
     fn dc_overrides_allow_string_and_array() {
         let toml = r#"
             [dc_overrides]
