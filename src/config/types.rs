@@ -76,7 +76,7 @@ impl Default for ProxyModes {
         Self {
             classic: false,
             secure: false,
-            tls: true,
+            tls: default_true(),
         }
     }
 }
@@ -117,12 +117,12 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            ipv4: true,
-            ipv6: Some(false),
-            prefer: 4,
+            ipv4: default_true(),
+            ipv6: default_network_ipv6(),
+            prefer: default_prefer_4(),
             multipath: false,
             stun_servers: default_stun_servers(),
-            stun_tcp_fallback: true,
+            stun_tcp_fallback: default_stun_tcp_fallback(),
             http_ip_detect_urls: default_http_ip_detect_urls(),
             cache_public_ip_path: default_cache_public_ip_path(),
         }
@@ -370,27 +370,27 @@ impl Default for GeneralConfig {
         Self {
             modes: ProxyModes::default(),
             prefer_ipv6: false,
-            fast_mode: true,
+            fast_mode: default_true(),
             use_middle_proxy: false,
             ad_tag: None,
             proxy_secret_path: None,
             middle_proxy_nat_ip: None,
-            middle_proxy_nat_probe: false,
+            middle_proxy_nat_probe: true,
             middle_proxy_nat_stun: None,
             middle_proxy_nat_stun_servers: Vec::new(),
             middle_proxy_pool_size: default_pool_size(),
-            middle_proxy_warm_standby: 16,
-            me_keepalive_enabled: true,
+            middle_proxy_warm_standby: default_middle_proxy_warm_standby(),
+            me_keepalive_enabled: default_true(),
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),
-            me_keepalive_payload_random: true,
-            me_warmup_stagger_enabled: true,
+            me_keepalive_payload_random: default_true(),
+            me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
-            me_reconnect_max_concurrent_per_dc: 8,
+            me_reconnect_max_concurrent_per_dc: default_me_reconnect_max_concurrent_per_dc(),
             me_reconnect_backoff_base_ms: default_reconnect_backoff_base_ms(),
             me_reconnect_backoff_cap_ms: default_reconnect_backoff_cap_ms(),
-            me_reconnect_fast_retry_count: 8,
+            me_reconnect_fast_retry_count: default_me_reconnect_fast_retry_count(),
             stun_iface_mismatch_ignore: false,
             unknown_dc_log_path: default_unknown_dc_log_path(),
             log_level: LogLevel::Normal,
@@ -399,13 +399,13 @@ impl Default for GeneralConfig {
             crypto_pending_buffer: default_crypto_pending_buffer(),
             max_client_frame: default_max_client_frame(),
             desync_all_full: default_desync_all_full(),
-            beobachten: false,
+            beobachten: true,
             beobachten_minutes: default_beobachten_minutes(),
             beobachten_flush_secs: default_beobachten_flush_secs(),
             beobachten_file: default_beobachten_file(),
             hardswap: default_hardswap(),
             fast_mode_min_tls_record: default_fast_mode_min_tls_record(),
-            update_every: Some(default_update_every_secs()),
+            update_every: default_update_every(),
             me_reinit_every_secs: default_me_reinit_every_secs(),
             me_hardswap_warmup_delay_min_ms: default_me_hardswap_warmup_delay_min_ms(),
             me_hardswap_warmup_delay_max_ms: default_me_hardswap_warmup_delay_max_ms(),
@@ -423,7 +423,7 @@ impl Default for GeneralConfig {
             proxy_config_auto_reload_secs: default_proxy_config_reload_secs(),
             ntp_check: default_ntp_check(),
             ntp_servers: default_ntp_servers(),
-            auto_degradation_enabled: true,
+            auto_degradation_enabled: default_true(),
             degradation_min_unavailable_dc_groups: default_degradation_min_unavailable_dc_groups(),
         }
     }
@@ -510,7 +510,7 @@ impl Default for ServerConfig {
         Self {
             port: default_port(),
             listen_addr_ipv4: Some(default_listen_addr()),
-            listen_addr_ipv6: Some("::".to_string()),
+            listen_addr_ipv6: Some(default_listen_addr_ipv6()),
             listen_unix_sock: None,
             listen_unix_sock_perm: None,
             listen_tcp: None,
@@ -618,12 +618,12 @@ impl Default for AntiCensorshipConfig {
         Self {
             tls_domain: default_tls_domain(),
             tls_domains: Vec::new(),
-            mask: true,
+            mask: default_true(),
             mask_host: None,
             mask_port: default_mask_port(),
             mask_unix_sock: None,
             fake_cert_len: default_fake_cert_len(),
-            tls_emulation: false,
+            tls_emulation: true,
             tls_front_dir: default_tls_front_dir(),
             server_hello_delay_min_ms: default_server_hello_delay_min_ms(),
             server_hello_delay_max_ms: default_server_hello_delay_max_ms(),
@@ -663,13 +663,8 @@ pub struct AccessConfig {
 
 impl Default for AccessConfig {
     fn default() -> Self {
-        let mut users = HashMap::new();
-        users.insert(
-            "default".to_string(),
-            "00000000000000000000000000000000".to_string(),
-        );
         Self {
-            users,
+            users: default_access_users(),
             user_max_tcp_conns: HashMap::new(),
             user_expirations: HashMap::new(),
             user_data_quota: HashMap::new(),

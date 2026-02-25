@@ -272,7 +272,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // IP Tracker initialization
     let ip_tracker = Arc::new(UserIpTracker::new());
     ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
-
+    
     if !config.access.user_max_unique_ips.is_empty() {
         info!("IP limits configured for {} users", config.access.user_max_unique_ips.len());
     }
@@ -598,7 +598,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 			.v4_results
 			.iter()
 			.any(|r| r.rtt_ms.is_some());
-
+		
 		if upstream_result.both_available {
 			if prefer_ipv6 {
 				info!("  IPv6 in use / IPv4 is fallback");
@@ -677,14 +677,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         rc_clone.run_periodic_cleanup().await;
     });
 
-    let detected_ip_v4: Option<std::net::IpAddr> = probe
-        .reflected_ipv4
-        .map(|s| s.ip())
-        .or_else(|| probe.detected_ipv4.map(std::net::IpAddr::V4));
-    let detected_ip_v6: Option<std::net::IpAddr> = probe
-        .reflected_ipv6
-        .map(|s| s.ip())
-        .or_else(|| probe.detected_ipv6.map(std::net::IpAddr::V6));
+    let detected_ip_v4: Option<std::net::IpAddr> = probe.detected_ipv4.map(std::net::IpAddr::V4);
+    let detected_ip_v6: Option<std::net::IpAddr> = probe.detected_ipv6.map(std::net::IpAddr::V6);
     debug!(
         "Detected IPs: v4={:?} v6={:?}",
         detected_ip_v4, detected_ip_v6
