@@ -1,6 +1,7 @@
 //! Masking - forward unrecognized traffic to mask host
 
 use std::str;
+use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -9,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing::debug;
 use crate::config::ProxyConfig;
+use crate::stats::beobachten::BeobachtenStore;
 
 const MASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum duration for the entire masking relay.
@@ -50,19 +52,25 @@ pub async fn handle_bad_client<R, W>(
     reader: R,
     writer: W,
     initial_data: &[u8],
+    peer_ip: IpAddr,
     config: &ProxyConfig,
+    beobachten: &BeobachtenStore,
 )
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let client_type = detect_client_type(initial_data);
+    if config.general.beobachten {
+        let ttl = Duration::from_secs(config.general.beobachten_minutes.saturating_mul(60));
+        beobachten.record(client_type, peer_ip, ttl);
+    }
+
     if !config.censorship.mask {
         // Masking disabled, just consume data
         consume_client_data(reader).await;
         return;
     }
-
-    let client_type = detect_client_type(initial_data);
 
     // Connect via Unix socket or TCP
     #[cfg(unix)]

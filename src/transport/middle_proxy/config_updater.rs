@@ -228,6 +228,10 @@ async fn run_update_cycle(
         cfg.general.me_pool_drain_ttl_secs,
         cfg.general.effective_me_pool_force_close_secs(),
         cfg.general.me_pool_min_fresh_ratio,
+        cfg.general.me_hardswap_warmup_delay_min_ms,
+        cfg.general.me_hardswap_warmup_delay_max_ms,
+        cfg.general.me_hardswap_warmup_extra_passes,
+        cfg.general.me_hardswap_warmup_pass_backoff_base_ms,
     );
 
     let required_cfg_snapshots = cfg.general.me_config_stable_snapshots.max(1);
@@ -407,6 +411,10 @@ pub async fn me_config_updater(
                     cfg.general.me_pool_drain_ttl_secs,
                     cfg.general.effective_me_pool_force_close_secs(),
                     cfg.general.me_pool_min_fresh_ratio,
+                    cfg.general.me_hardswap_warmup_delay_min_ms,
+                    cfg.general.me_hardswap_warmup_delay_max_ms,
+                    cfg.general.me_hardswap_warmup_extra_passes,
+                    cfg.general.me_hardswap_warmup_pass_backoff_base_ms,
                 );
                 let new_secs = cfg.general.effective_update_every_secs().max(1);
                 if new_secs == update_every_secs {
