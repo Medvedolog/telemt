@@ -3,7 +3,7 @@ name: Build and Release Telemt (aarch64-musl)
 on:
   push:
     tags:
-      # Trigger on pure version tags (e.g., 3.0.13)
+      # Trigger on pure version tags (e.g., 3.0.13, 3.0.15)
       - '3.0.1[3-9]'
       - '3.0.[2-9]*'
       - '3.[1-9]*'
@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Enter tag (e.g., 3.0.13) or branch (main)'
+        description: 'Enter tag (e.g., 3.0.15) or branch (main)'
         required: true
-        default: '3.0.13'
+        default: '3.0.15'
 
 jobs:
   release:
@@ -83,6 +83,12 @@ jobs:
       - name: Build IPK and APK packages with nFPM
         run: |
           export PKG_VER="${{ env.VERSION }}"
+          
+          # CRITICAL FIX FOR OPENWRT:
+          # Lock the creation time of the files to drop nanoseconds.
+          # This prevents the creation of PAX extended headers (typeflag 0x78) in the tarball,
+          # which break the older opkg/busybox unpacker on OpenWrt.
+          export SOURCE_DATE_EPOCH=1704067200
           
           # 1. Create the post-install script once
           cat > postinst.sh <<EOF
