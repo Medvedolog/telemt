@@ -1,13 +1,13 @@
 # ==============================================================================
-# Build Script Version: 2.5
+# Build Script Version: 2.6
 # Date of Creation: February 25, 2026
 # Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
 # Features: 
 #   - Rust cross-compilation (aarch64-unknown-linux-musl)
 #   - UPX binary compression (LZMA)
 #   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
-#   - IPK Build: 2 files (generic & cortex-a53) WITH mtime fix to prevent 0x78 errors
-#   - APK Build: 2 files (generic & cortex-a53) WITHOUT mtime fix (Native OpenWrt 25 style)
+#   - IPK Build: 2 files (generic/cortex-a53), uses ca-bundle, WITH mtime fix (0x78)
+#   - APK Build: 2 files (generic/cortex-a53), uses ca-bundle, WITHOUT mtime fix
 # ==============================================================================
 
 name: Build and Release Telemt (aarch64-musl)
@@ -132,7 +132,7 @@ jobs:
           done
 
           # ------------------------------------------------------------------
-          # 2. Build APKs - WITHOUT mtime fix (Identical to working v3.0.13)
+          # 2. Build APKs - WITHOUT mtime fix, WITH ca-bundle dependency
           # ------------------------------------------------------------------
           unset SOURCE_DATE_EPOCH
           for ARCH in "${ARCHS[@]}"; do
@@ -153,7 +153,7 @@ jobs:
           scripts:
             postinstall: ./postinst.sh
           depends:
-            - ca-certificates
+            - ca-bundle
           EOF
             nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
           done
