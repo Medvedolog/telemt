@@ -1,13 +1,13 @@
 # ==============================================================================
-# Build Script Version: 2.4
+# Build Script Version: 2.5
 # Date of Creation: February 25, 2026
 # Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
 # Features: 
 #   - Rust cross-compilation (aarch64-unknown-linux-musl)
 #   - UPX binary compression (LZMA)
 #   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
-#   - IPK Build: 2 files (generic & cortex-a53) with mtime fix to prevent 0x78 errors
-#   - APK Build: 1 universal file (aarch64) without mtime hacks for strict OpenWrt 25
+#   - IPK Build: 2 files (generic & cortex-a53) WITH mtime fix to prevent 0x78 errors
+#   - APK Build: 2 files (generic & cortex-a53) WITHOUT mtime fix (Native OpenWrt 25 style)
 # ==============================================================================
 
 name: Build and Release Telemt (aarch64-musl)
@@ -86,6 +86,7 @@ jobs:
       - name: Build IPK and APK packages with nFPM
         run: |
           export PKG_VER="${{ env.VERSION }}"
+          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           
           # Create post-install script once
           cat > postinst.sh <<EOF
@@ -103,10 +104,9 @@ jobs:
           chmod 755 postinst.sh
 
           # ------------------------------------------------------------------
-          # 1. Build IPKs (2 files) - WITH mtime fix for old opkg
+          # 1. Build IPKs - WITH mtime fix (Saves older opkg from 0x78 errors)
           # ------------------------------------------------------------------
           export SOURCE_DATE_EPOCH=1704067200
-          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           for ARCH in "${ARCHS[@]}"; do
             export PKG_ARCH=$ARCH
             echo "Building IPK for $PKG_ARCH..."
@@ -132,18 +132,19 @@ jobs:
           done
 
           # ------------------------------------------------------------------
-          # 2. Build APK (1 universal file) - WITHOUT mtime fix for modern apk
+          # 2. Build APKs - WITHOUT mtime fix (Identical to working v3.0.13)
           # ------------------------------------------------------------------
           unset SOURCE_DATE_EPOCH
-          export PKG_ARCH="aarch64"
-          echo "Building universal APK for $PKG_ARCH..."
-          cat > nfpm_apk.yaml <<EOF
+          for ARCH in "${ARCHS[@]}"; do
+            export PKG_ARCH=$ARCH
+            echo "Building APK for $PKG_ARCH..."
+            cat > nfpm_apk.yaml <<EOF
           name: telemt
           arch: $PKG_ARCH
           platform: linux
           version: $PKG_VER
           maintainer: Community
-          description: Telemt MTProxy static binary (Universal aarch64)
+          description: Telemt MTProxy static binary (Built for $PKG_ARCH)
           contents:
             - src: ./telemt-aarch64-musl
               dst: /usr/bin/telemt
@@ -154,7 +155,8 @@ jobs:
           depends:
             - ca-certificates
           EOF
-          nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
