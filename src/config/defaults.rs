@@ -199,11 +199,11 @@ pub(crate) fn default_me_reinit_every_secs() -> u64 {
 }
 
 pub(crate) fn default_me_hardswap_warmup_delay_min_ms() -> u64 {
-    1000
+    2000
 }
 
 pub(crate) fn default_me_hardswap_warmup_delay_max_ms() -> u64 {
-    2000
+    3500
 }
 
 pub(crate) fn default_me_hardswap_warmup_extra_passes() -> u8 {
