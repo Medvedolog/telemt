@@ -1,13 +1,13 @@
 # ==============================================================================
-# Build Script Version: 2.1
+# Build Script Version: 2.4
 # Date of Creation: February 25, 2026
 # Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
 # Features: 
 #   - Rust cross-compilation (aarch64-unknown-linux-musl)
 #   - UPX binary compression (LZMA)
 #   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
-#   - nFPM packaging: 2x IPK (OpenWrt specific arches) & 1x APK (Standard aarch64)
-#   - Hardcoded mtime to prevent PAX header (0x78) unpacker errors in older opkg
+#   - IPK Build: 2 files (generic & cortex-a53) with mtime fix to prevent 0x78 errors
+#   - APK Build: 1 universal file (aarch64) without mtime hacks for strict OpenWrt 25
 # ==============================================================================
 
 name: Build and Release Telemt (aarch64-musl)
@@ -87,9 +87,6 @@ jobs:
         run: |
           export PKG_VER="${{ env.VERSION }}"
           
-          # Force reproducible builds to prevent PAX headers (typeflag 0x78)
-          export SOURCE_DATE_EPOCH=1704067200
-          
           # Create post-install script once
           cat > postinst.sh <<EOF
           #!/bin/sh
@@ -105,9 +102,10 @@ jobs:
           EOF
           chmod 755 postinst.sh
 
-          # --------------------------------------------------------------------
-          # 1. Build IPKs for standard OpenWrt (requires specific arch names)
-          # --------------------------------------------------------------------
+          # ------------------------------------------------------------------
+          # 1. Build IPKs (2 files) - WITH mtime fix for old opkg
+          # ------------------------------------------------------------------
+          export SOURCE_DATE_EPOCH=1704067200
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           for ARCH in "${ARCHS[@]}"; do
             export PKG_ARCH=$ARCH
@@ -133,11 +131,12 @@ jobs:
             nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
           done
 
-          # --------------------------------------------------------------------
-          # 2. Build APK for OpenWrt 25+ / Alpine (requires standard Linux arch)
-          # --------------------------------------------------------------------
+          # ------------------------------------------------------------------
+          # 2. Build APK (1 universal file) - WITHOUT mtime fix for modern apk
+          # ------------------------------------------------------------------
+          unset SOURCE_DATE_EPOCH
           export PKG_ARCH="aarch64"
-          echo "Building APK for $PKG_ARCH..."
+          echo "Building universal APK for $PKG_ARCH..."
           cat > nfpm_apk.yaml <<EOF
           name: telemt
           arch: $PKG_ARCH
@@ -150,7 +149,6 @@ jobs:
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
-                mtime: 2024-01-01T00:00:00Z
           scripts:
             postinstall: ./postinst.sh
           depends:
