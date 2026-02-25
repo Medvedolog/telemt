@@ -3,7 +3,6 @@ name: Build and Release Telemt (aarch64-musl)
 on:
   push:
     tags:
-      # Trigger on pure version tags (e.g., 3.0.13, 3.0.15)
       - '3.0.1[3-9]'
       - '3.0.[2-9]*'
       - '3.[1-9]*'
@@ -27,7 +26,6 @@ jobs:
       - name: Extract version
         id: vars
         run: |
-          # Determine the target version based on the trigger event
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "VERSION=${{ github.event.inputs.build_target }}" >> $GITHUB_ENV
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -39,7 +37,6 @@ jobs:
       - name: Checkout upstream repository
         uses: actions/checkout@v4
         with:
-          # Checkout source code from the original repository
           repository: 'telemt/telemt'
           ref: ${{ env.VERSION }}
 
@@ -50,11 +47,9 @@ jobs:
 
       - name: Install cross and nFPM
         run: |
-          # Download pre-compiled cross binary to save build time
           curl -sL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz
           sudo mv cross /usr/local/bin/
           
-          # Dynamically fetch the latest nFPM version and download the correct tarball
           NFPM_TAG=$(curl -sL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)
           NFPM_VER=${NFPM_TAG#v}
           curl -sL "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
@@ -62,7 +57,6 @@ jobs:
 
       - name: Build binary with cross
         run: |
-          # Build and strip the binary automatically via Cargo profile
           CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
 
       - name: Install UPX
@@ -74,23 +68,16 @@ jobs:
 
       - name: Append version string
         run: |
-          # Append the version string WITH the expected prefix for the init.d script parsing
           echo -n "MTProxy v${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
-          
-          # Rename the raw binary for the release
           mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
 
       - name: Build IPK and APK packages with nFPM
         run: |
           export PKG_VER="${{ env.VERSION }}"
           
-          # CRITICAL FIX FOR OPENWRT:
-          # Lock the creation time of the files to drop nanoseconds.
-          # This prevents the creation of PAX extended headers (typeflag 0x78) in the tarball,
-          # which break the older opkg/busybox unpacker on OpenWrt.
+          # Force reproducible builds to prevent PAX headers (typeflag 0x78)
           export SOURCE_DATE_EPOCH=1704067200
           
-          # 1. Create the post-install script once
           cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
@@ -105,7 +92,7 @@ jobs:
           EOF
           chmod 755 postinst.sh
 
-          # 2. Create the unified nFPM configuration template
+          # Added static mtime to file_info to explicitly strip nanoseconds
           cat > nfpm.yaml <<'EOF'
           name: telemt
           arch: ${PKG_ARCH}
@@ -118,10 +105,9 @@ jobs:
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
+                mtime: 2024-01-01T00:00:00Z
           scripts:
             postinstall: ./postinst.sh
-          
-          # OS-specific dependency overrides (Only certificates needed)
           overrides:
             ipk:
               depends:
@@ -131,17 +117,12 @@ jobs:
                 - ca-certificates
           EOF
 
-          # 3. Build IPK and APK for OpenWrt architectures
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           
           for ARCH in "${ARCHS[@]}"; do
             export PKG_ARCH=$ARCH
             echo "Building packages for $PKG_ARCH..."
-            
-            # Build IPK
             nfpm pkg --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
-            
-            # Build APK
             nfpm pkg --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
           done
 
@@ -149,7 +130,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          # Upload the raw binary, both IPK files, and both APK files
           files: |
             telemt-aarch64-musl
             *.ipk
