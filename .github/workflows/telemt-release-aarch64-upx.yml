@@ -1,3 +1,15 @@
+# ==============================================================================
+# Build Script Version: 2.0
+# Date of Creation: February 25, 2026
+# Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
+# Features: 
+#   - Rust cross-compilation (aarch64-unknown-linux-musl)
+#   - UPX binary compression (LZMA)
+#   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
+#   - nFPM packaging for OpenWrt (IPK) and Alpine (APK)
+#   - Hardcoded mtime to prevent PAX header (0x78) unpacker errors in older opkg
+# ==============================================================================
+
 name: Build and Release Telemt (aarch64-musl)
 
 on:
