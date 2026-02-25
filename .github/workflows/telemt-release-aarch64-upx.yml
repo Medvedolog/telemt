@@ -1,13 +1,15 @@
 # ==============================================================================
-# Build Script Version: 2.6
+# Build Script Version: 2.8 (Final)
 # Date of Creation: February 25, 2026
 # Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
 # Features: 
 #   - Rust cross-compilation (aarch64-unknown-linux-musl)
 #   - UPX binary compression (LZMA)
 #   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
-#   - IPK Build: 2 files (generic/cortex-a53), uses ca-bundle, WITH mtime fix (0x78)
-#   - APK Build: 2 files (generic/cortex-a53), uses ca-bundle, WITHOUT mtime fix
+#   - IPK Build: 2 files (generic/cortex-a53) WITH mtime fix (0x78)
+#   - APK Build: 2 files (generic/cortex-a53) WITHOUT mtime fix
+#   - ZERO Dependencies: Relies on luci-app-telemt or firmware for certificates
+#   - Fixed post-install banner variable interpolation
 # ==============================================================================
 
 name: Build and Release Telemt (aarch64-musl)
@@ -88,12 +90,12 @@ jobs:
           export PKG_VER="${{ env.VERSION }}"
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           
-          # Create post-install script once
+          # Create post-install script once (removed backslash before PKG_VER)
           cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed telemt static executable version \$PKG_VER"
+          echo " Installed telemt static executable version ${PKG_VER}"
           echo " "
           echo " To configure it, you need the following package:"
           echo " https://github.com/Medvedolog/luci-app-telemt"
@@ -125,14 +127,12 @@ jobs:
                 mtime: 2024-01-01T00:00:00Z
           scripts:
             postinstall: ./postinst.sh
-          depends:
-            - ca-bundle
           EOF
             nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
           done
 
           # ------------------------------------------------------------------
-          # 2. Build APKs - WITHOUT mtime fix, WITH ca-bundle dependency
+          # 2. Build APKs - WITHOUT mtime fix (Native OpenWrt 25 apk format)
           # ------------------------------------------------------------------
           unset SOURCE_DATE_EPOCH
           for ARCH in "${ARCHS[@]}"; do
@@ -152,8 +152,6 @@ jobs:
                 mode: 0755
           scripts:
             postinstall: ./postinst.sh
-          depends:
-            - ca-bundle
           EOF
             nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
           done
