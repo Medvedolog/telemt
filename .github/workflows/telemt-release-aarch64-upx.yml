@@ -1,18 +1,16 @@
 # ==============================================================================
-# Build Script Version: 2.8 (Final)
-# Date of Creation: February 25, 2026
-# Description: Automated build and packaging (IPK/APK) for Telemt MTProxy.
+# Build Script Version: 3.3 (Smart Multi-Arch + Conditional Optimization)
+# Date of Creation: February 26, 2026
+# Description: Automated parallel build and packaging for ARM64 and MIPS(el)
 # Features: 
-#   - Rust cross-compilation (aarch64-unknown-linux-musl)
-#   - UPX binary compression (LZMA)
-#   - Appended version string (MTProxy vX.X.X) for luci-app-telemt parsing
-#   - IPK Build: 2 files (generic/cortex-a53) WITH mtime fix (0x78)
-#   - APK Build: 2 files (generic/cortex-a53) WITHOUT mtime fix
+#   - Parallel Matrix Build: aarch64, mipsel_24kc
+#   - Smart Rust Compiler: Max speed for ARM64, Extreme size compression for MIPS
+#   - IPK Build: All architectures (WITH mtime fix for 0x78 errors)
+#   - APK Build: aarch64 ONLY (WITHOUT mtime fix)
 #   - ZERO Dependencies: Relies on luci-app-telemt or firmware for certificates
-#   - Fixed post-install banner variable interpolation
 # ==============================================================================
 
-name: Build and Release Telemt (aarch64-musl)
+name: Build and Release Telemt
 
 on:
   push:
@@ -36,6 +34,14 @@ jobs:
     permissions:
       contents: write 
 
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            archs: "aarch64_generic aarch64_cortex-a53"
+          - target: mipsel-unknown-linux-musl
+            archs: "mipsel_24kc"
+
     steps:
       - name: Extract version
         id: vars
@@ -57,7 +63,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install cross and nFPM
         run: |
@@ -71,31 +77,43 @@ jobs:
 
       - name: Build binary with cross
         run: |
-          CARGO_PROFILE_RELEASE_STRIP=true cross build --release --target aarch64-unknown-linux-musl
+          # Включаем strip (удаление отладочных символов) для ВСЕХ архитектур
+          export CARGO_PROFILE_RELEASE_STRIP="true"
+          
+          # Включаем экстремальное сжатие ТОЛЬКО для MIPS (экономим RAM/Flash)
+          if [[ "${{ matrix.target }}" == *"mipsel"* ]]; then
+            echo "Target is MIPS. Applying extreme size optimizations..."
+            export CARGO_PROFILE_RELEASE_OPT_LEVEL="z"
+            export CARGO_PROFILE_RELEASE_LTO="true"
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="1"
+            export CARGO_PROFILE_RELEASE_PANIC="abort"
+          else
+            echo "Target is ARM64. Using default high-performance profile..."
+          fi
+          
+          cross build --release --target ${{ matrix.target }}
 
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
 
       - name: Compress with UPX
         run: |
-          upx --best --lzma target/aarch64-unknown-linux-musl/release/telemt
+          upx --best --lzma target/${{ matrix.target }}/release/telemt
 
       - name: Append version string
         run: |
-          echo -n "MTProxy v${{ env.VERSION }}" >> target/aarch64-unknown-linux-musl/release/telemt
-          mv target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
+          echo -n "MTProxy v${{ env.VERSION }}" >> target/${{ matrix.target }}/release/telemt
+          mv target/${{ matrix.target }}/release/telemt telemt-${{ matrix.target }}
 
       - name: Build IPK and APK packages with nFPM
         run: |
           export PKG_VER="${{ env.VERSION }}"
-          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           
-          # Create post-install script once (removed backslash before PKG_VER)
           cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed telemt static executable version ${PKG_VER}"
+          echo " Installed telemt static executable version \${PKG_VER}"
           echo " "
           echo " To configure it, you need the following package:"
           echo " https://github.com/Medvedolog/luci-app-telemt"
@@ -105,13 +123,14 @@ jobs:
           EOF
           chmod 755 postinst.sh
 
-          # ------------------------------------------------------------------
-          # 1. Build IPKs - WITH mtime fix (Saves older opkg from 0x78 errors)
-          # ------------------------------------------------------------------
-          export SOURCE_DATE_EPOCH=1704067200
+          ARCHS=(${{ matrix.archs }})
+          
           for ARCH in "${ARCHS[@]}"; do
             export PKG_ARCH=$ARCH
-            echo "Building IPK for $PKG_ARCH..."
+            echo "Building packages for $PKG_ARCH..."
+            
+            # --- 1. IPK (Для всех архитектур, с фиксом времени 0x78) ---
+            export SOURCE_DATE_EPOCH=1704067200
             cat > nfpm_ipk.yaml <<EOF
           name: telemt
           arch: $PKG_ARCH
@@ -120,7 +139,7 @@ jobs:
           maintainer: Community
           description: Telemt MTProxy static binary (Built for $PKG_ARCH)
           contents:
-            - src: ./telemt-aarch64-musl
+            - src: ./telemt-${{ matrix.target }}
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
@@ -129,16 +148,11 @@ jobs:
             postinstall: ./postinst.sh
           EOF
             nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
-          done
-
-          # ------------------------------------------------------------------
-          # 2. Build APKs - WITHOUT mtime fix (Native OpenWrt 25 apk format)
-          # ------------------------------------------------------------------
-          unset SOURCE_DATE_EPOCH
-          for ARCH in "${ARCHS[@]}"; do
-            export PKG_ARCH=$ARCH
-            echo "Building APK for $PKG_ARCH..."
-            cat > nfpm_apk.yaml <<EOF
+            
+            # --- 2. APK (Только для aarch64, без фикса времени) ---
+            if [[ "${{ matrix.target }}" == *"aarch64"* ]]; then
+              unset SOURCE_DATE_EPOCH
+              cat > nfpm_apk.yaml <<EOF
           name: telemt
           arch: $PKG_ARCH
           platform: linux
@@ -146,14 +160,18 @@ jobs:
           maintainer: Community
           description: Telemt MTProxy static binary (Built for $PKG_ARCH)
           contents:
-            - src: ./telemt-aarch64-musl
+            - src: ./telemt-${{ matrix.target }}
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
           scripts:
             postinstall: ./postinst.sh
           EOF
-            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+              nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+            else
+              echo "Skipping APK generation for non-aarch64 target: $PKG_ARCH"
+            fi
+            
           done
 
       - name: Create GitHub Release
@@ -161,10 +179,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           files: |
-            telemt-aarch64-musl
+            telemt-${{ matrix.target }}
             *.ipk
             *.apk
           name: Release ${{ env.VERSION }}
           tag_name: ${{ env.VERSION }}
           prerelease: ${{ env.VERSION == 'main' || env.VERSION == 'master' }}
           draft: false
+          append_body: true
