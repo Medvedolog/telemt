@@ -1,11 +1,10 @@
 # ==============================================================================
-# Build Script Version: 3.5 (Tier 3 MIPS Edition with Atomic Patch)
+# Build Script Version: 3.4 (Tier 3 MIPS Edition)
 # Date of Creation: February 26, 2026
 # Description: Automated parallel build and packaging for ARM64 and MIPS(el)
 # Features: 
 #   - Parallel Matrix Build: aarch64, mipsel_24kc
 #   - Tier 3 Support: Uses Nightly + build-std to compile missing MIPS std-libs
-#   - Atomic Polyfill: Automatically patches AtomicU64 to AtomicU32 for 32-bit MIPS
 #   - Smart Rust Compiler: Max speed for ARM64, Extreme size compression for MIPS
 #   - IPK Build: All architectures (WITH mtime fix for 0x78 errors)
 #   - APK Build: aarch64 ONLY (WITHOUT mtime fix)
@@ -70,14 +69,8 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rust-src
-
-      - name: Patch AtomicU64 for 32-bit MIPS
-        if: contains(matrix.target, 'mipsel')
-        run: |
-          echo "Patching source code: Replacing AtomicU64 with AtomicU32 for 32-bit architecture..."
-          find src -type f -name "*.rs" -exec sed -i 's/AtomicU64/AtomicU32/g' {} +
-          # Also need to patch any instances where u64 might be explicitly cast or used alongside the atomic
-          # This is a basic patch; complex usages might require more involved sed scripts.
+          # Обратите внимание: мы убрали 'targets', чтобы не злить rustup.
+          # Утилита 'cross' сама найдет нужный таргет внутри своего контейнера.
 
       - name: Install cross and nFPM
         run: |
@@ -103,6 +96,7 @@ jobs:
             echo "Target is ARM64. Using default high-performance profile..."
           fi
           
+          # Явно передаем toolchain (+stable или +nightly) и кастомные флаги сборки
           cross +${{ matrix.toolchain }} build --release --target ${{ matrix.target }} ${{ matrix.build_flags }}
 
       - name: Install UPX
