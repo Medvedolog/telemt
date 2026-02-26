@@ -4,7 +4,7 @@
 
 # === General Settings ===
 [general]
-use_middle_proxy = true
+use_middle_proxy = false
 # ad_tag = "00000000000000000000000000000000"
 
 # === Log Level ===
@@ -18,12 +18,19 @@ classic = false
 secure = false
 tls = true
 
+[general.links]
+show = "*"
+# show = ["alice", "bob"] # Only show links for alice and bob
+# show = "*"              # Show links for all users
+# public_host = "proxy.example.com"  # Host (IP or domain) for tg:// links
+# public_port = 443                  # Port for tg:// links (default: server.port)
+
 # === Server Binding ===
 [server]
 port = 443
 # proxy_protocol = false           # Enable if behind HAProxy/nginx with PROXY protocol
-metrics_port = 9090
-metrics_whitelist = ["127.0.0.1", "::1", "0.0.0.0/0"]
+# metrics_port = 9090
+# metrics_whitelist = ["127.0.0.1", "::1", "0.0.0.0/0"]
 
 # Listen on multiple interfaces/IPs - IPv4
 [[server.listeners]]
