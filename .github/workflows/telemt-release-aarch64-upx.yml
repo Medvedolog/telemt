@@ -1,13 +1,13 @@
 # ==============================================================================
-# Build Script Version: 3.3 (Smart Multi-Arch + Conditional Optimization)
+# Build Script Version: 3.4 (Tier 3 MIPS Edition)
 # Date of Creation: February 26, 2026
 # Description: Automated parallel build and packaging for ARM64 and MIPS(el)
 # Features: 
 #   - Parallel Matrix Build: aarch64, mipsel_24kc
+#   - Tier 3 Support: Uses Nightly + build-std to compile missing MIPS std-libs
 #   - Smart Rust Compiler: Max speed for ARM64, Extreme size compression for MIPS
 #   - IPK Build: All architectures (WITH mtime fix for 0x78 errors)
 #   - APK Build: aarch64 ONLY (WITHOUT mtime fix)
-#   - ZERO Dependencies: Relies on luci-app-telemt or firmware for certificates
 # ==============================================================================
 
 name: Build and Release Telemt
@@ -39,8 +39,12 @@ jobs:
         include:
           - target: aarch64-unknown-linux-musl
             archs: "aarch64_generic aarch64_cortex-a53"
+            toolchain: stable
+            build_flags: ""
           - target: mipsel-unknown-linux-musl
             archs: "mipsel_24kc"
+            toolchain: nightly
+            build_flags: "-Z build-std=std,panic_abort"
 
     steps:
       - name: Extract version
@@ -61,9 +65,12 @@ jobs:
           ref: ${{ env.VERSION }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.target }}
+          toolchain: ${{ matrix.toolchain }}
+          components: rust-src
+          # Обратите внимание: мы убрали 'targets', чтобы не злить rustup.
+          # Утилита 'cross' сама найдет нужный таргет внутри своего контейнера.
 
       - name: Install cross and nFPM
         run: |
@@ -77,10 +84,8 @@ jobs:
 
       - name: Build binary with cross
         run: |
-          # Включаем strip (удаление отладочных символов) для ВСЕХ архитектур
           export CARGO_PROFILE_RELEASE_STRIP="true"
           
-          # Включаем экстремальное сжатие ТОЛЬКО для MIPS (экономим RAM/Flash)
           if [[ "${{ matrix.target }}" == *"mipsel"* ]]; then
             echo "Target is MIPS. Applying extreme size optimizations..."
             export CARGO_PROFILE_RELEASE_OPT_LEVEL="z"
@@ -91,7 +96,8 @@ jobs:
             echo "Target is ARM64. Using default high-performance profile..."
           fi
           
-          cross build --release --target ${{ matrix.target }}
+          # Явно передаем toolchain (+stable или +nightly) и кастомные флаги сборки
+          cross +${{ matrix.toolchain }} build --release --target ${{ matrix.target }} ${{ matrix.build_flags }}
 
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
