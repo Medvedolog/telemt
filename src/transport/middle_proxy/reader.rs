@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -45,7 +46,11 @@ pub(crate) async fn reader_loop(
             _ = cancel.cancelled() => return Ok(()),
         };
         if n == 0 {
-            return Ok(());
+            stats.increment_me_reader_eof_total();
+            return Err(ProxyError::Io(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "ME socket closed by peer",
+            )));
         }
         raw.extend_from_slice(&tmp[..n]);
 
@@ -124,7 +129,14 @@ pub(crate) async fn reader_loop(
                     match routed {
                         RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
                         RouteResult::ChannelClosed => stats.increment_me_route_drop_channel_closed(),
-                        RouteResult::QueueFull => stats.increment_me_route_drop_queue_full(),
+                        RouteResult::QueueFullBase => {
+                            stats.increment_me_route_drop_queue_full();
+                            stats.increment_me_route_drop_queue_full_base();
+                        }
+                        RouteResult::QueueFullHigh => {
+                            stats.increment_me_route_drop_queue_full();
+                            stats.increment_me_route_drop_queue_full_high();
+                        }
                         RouteResult::Routed => {}
                     }
                     reg.unregister(cid).await;
@@ -140,7 +152,14 @@ pub(crate) async fn reader_loop(
                     match routed {
                         RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
                         RouteResult::ChannelClosed => stats.increment_me_route_drop_channel_closed(),
-                        RouteResult::QueueFull => stats.increment_me_route_drop_queue_full(),
+                        RouteResult::QueueFullBase => {
+                            stats.increment_me_route_drop_queue_full();
+                            stats.increment_me_route_drop_queue_full_base();
+                        }
+                        RouteResult::QueueFullHigh => {
+                            stats.increment_me_route_drop_queue_full();
+                            stats.increment_me_route_drop_queue_full_high();
+                        }
                         RouteResult::Routed => {}
                     }
                     reg.unregister(cid).await;

@@ -19,7 +19,7 @@ impl MePool {
             me_servers = self.proxy_map_v4.read().await.len(),
             pool_size,
             key_selector = format_args!("0x{ks:08x}"),
-            secret_len = self.proxy_secret.read().await.len(),
+            secret_len = self.proxy_secret.read().await.secret.len(),
             "Initializing ME pool"
         );
 

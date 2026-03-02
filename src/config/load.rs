@@ -75,6 +75,23 @@ fn push_unique_nonempty(target: &mut Vec<String>, value: String) {
     }
 }
 
+fn is_valid_ad_tag(tag: &str) -> bool {
+    tag.len() == 32 && tag.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn sanitize_ad_tag(ad_tag: &mut Option<String>) {
+    let Some(tag) = ad_tag.as_ref() else {
+        return;
+    };
+
+    if !is_valid_ad_tag(tag) {
+        warn!(
+            "Invalid general.ad_tag value, expected exactly 32 hex chars; ad_tag is disabled"
+        );
+        *ad_tag = None;
+    }
+}
+
 // ============= Main Config =============
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -184,6 +201,8 @@ impl ProxyConfig {
             }
         }
 
+        sanitize_ad_tag(&mut config.general.ad_tag);
+
         if let Some(update_every) = config.general.update_every {
             if update_every == 0 {
                 return Err(ProxyError::Config(
@@ -218,9 +237,47 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.upstream_connect_retry_attempts == 0 {
+            return Err(ProxyError::Config(
+                "general.upstream_connect_retry_attempts must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.upstream_unhealthy_fail_threshold == 0 {
+            return Err(ProxyError::Config(
+                "general.upstream_unhealthy_fail_threshold must be > 0".to_string(),
+            ));
+        }
+
         if config.general.me_reinit_every_secs == 0 {
             return Err(ProxyError::Config(
                 "general.me_reinit_every_secs must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_shadow_writers > 32 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_shadow_writers must be within [0, 32]".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_min_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_min_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_max_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_max_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_min_ms
+            > config.general.me_single_endpoint_outage_backoff_max_ms
+        {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_min_ms must be <= general.me_single_endpoint_outage_backoff_max_ms".to_string(),
             ));
         }
 
@@ -274,9 +331,21 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_snapshot_min_proxy_for_lines == 0 {
+            return Err(ProxyError::Config(
+                "general.me_snapshot_min_proxy_for_lines must be > 0".to_string(),
+            ));
+        }
+
         if config.general.proxy_secret_stable_snapshots == 0 {
             return Err(ProxyError::Config(
                 "general.proxy_secret_stable_snapshots must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_reinit_trigger_channel == 0 {
+            return Err(ProxyError::Config(
+                "general.me_reinit_trigger_channel must be > 0".to_string(),
             ));
         }
 
@@ -289,6 +358,26 @@ impl ProxyConfig {
         if !(0.0..=1.0).contains(&config.general.me_pool_min_fresh_ratio) {
             return Err(ProxyError::Config(
                 "general.me_pool_min_fresh_ratio must be within [0.0, 1.0]".to_string(),
+            ));
+        }
+
+        if config.general.me_route_backpressure_base_timeout_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_route_backpressure_base_timeout_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_route_backpressure_high_timeout_ms
+            < config.general.me_route_backpressure_base_timeout_ms
+        {
+            return Err(ProxyError::Config(
+                "general.me_route_backpressure_high_timeout_ms must be >= general.me_route_backpressure_base_timeout_ms".to_string(),
+            ));
+        }
+
+        if !(1..=100).contains(&config.general.me_route_backpressure_high_watermark_pct) {
+            return Err(ProxyError::Config(
+                "general.me_route_backpressure_high_watermark_pct must be within [1, 100]".to_string(),
             ));
         }
 
@@ -380,6 +469,7 @@ impl ProxyConfig {
         }
 
         validate_network_cfg(&mut config.network)?;
+        crate::network::dns_overrides::validate_entries(&config.network.dns_overrides)?;
 
         if config.general.use_middle_proxy && config.network.ipv6 == Some(true) {
             warn!("IPv6 with Middle Proxy is experimental and may cause KDF address mismatch; consider disabling IPv6 or ME");
@@ -480,15 +570,20 @@ impl ProxyConfig {
             )));
         }
 
-        if let Some(tag) = &self.general.ad_tag {
+        for (user, tag) in &self.access.user_ad_tags {
             let zeros = "00000000000000000000000000000000";
-            if tag == zeros {
-                warn!("ad_tag is all zeros; register a valid proxy tag via @MTProxybot to enable sponsored channel");
+            if !is_valid_ad_tag(tag) {
+                return Err(ProxyError::Config(format!(
+                    "access.user_ad_tags['{}'] must be exactly 32 hex characters",
+                    user
+                )));
             }
-            if tag.len() != 32 || tag.chars().any(|c| !c.is_ascii_hexdigit()) {
-                warn!("ad_tag is not a 32-char hex string; ensure you use value issued by @MTProxybot");
+            if tag == zeros {
+                warn!(user = %user, "user ad_tag is all zeros; register a valid proxy tag via @MTProxybot to enable sponsored channel");
             }
         }
+
+        crate::network::dns_overrides::validate_entries(&self.network.dns_overrides)?;
 
         Ok(())
     }
@@ -509,6 +604,7 @@ mod tests {
         let cfg: ProxyConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(cfg.network.ipv6, default_network_ipv6());
+        assert_eq!(cfg.network.stun_use, default_true());
         assert_eq!(cfg.network.stun_tcp_fallback, default_stun_tcp_fallback());
         assert_eq!(
             cfg.general.middle_proxy_warm_standby,
@@ -522,6 +618,42 @@ mod tests {
             cfg.general.me_reconnect_fast_retry_count,
             default_me_reconnect_fast_retry_count()
         );
+        assert_eq!(
+            cfg.general.me_single_endpoint_shadow_writers,
+            default_me_single_endpoint_shadow_writers()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_mode_enabled,
+            default_me_single_endpoint_outage_mode_enabled()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_disable_quarantine,
+            default_me_single_endpoint_outage_disable_quarantine()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_backoff_min_ms,
+            default_me_single_endpoint_outage_backoff_min_ms()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_backoff_max_ms,
+            default_me_single_endpoint_outage_backoff_max_ms()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_shadow_rotate_every_secs,
+            default_me_single_endpoint_shadow_rotate_every_secs()
+        );
+        assert_eq!(
+            cfg.general.upstream_connect_retry_attempts,
+            default_upstream_connect_retry_attempts()
+        );
+        assert_eq!(
+            cfg.general.upstream_connect_retry_backoff_ms,
+            default_upstream_connect_retry_backoff_ms()
+        );
+        assert_eq!(
+            cfg.general.upstream_unhealthy_fail_threshold,
+            default_upstream_unhealthy_fail_threshold()
+        );
         assert_eq!(cfg.general.update_every, default_update_every());
         assert_eq!(cfg.server.listen_addr_ipv4, default_listen_addr_ipv4());
         assert_eq!(cfg.server.listen_addr_ipv6, default_listen_addr_ipv6_opt());
@@ -532,6 +664,7 @@ mod tests {
     fn impl_defaults_are_sourced_from_default_helpers() {
         let network = NetworkConfig::default();
         assert_eq!(network.ipv6, default_network_ipv6());
+        assert_eq!(network.stun_use, default_true());
         assert_eq!(network.stun_tcp_fallback, default_stun_tcp_fallback());
 
         let general = GeneralConfig::default();
@@ -546,6 +679,42 @@ mod tests {
         assert_eq!(
             general.me_reconnect_fast_retry_count,
             default_me_reconnect_fast_retry_count()
+        );
+        assert_eq!(
+            general.me_single_endpoint_shadow_writers,
+            default_me_single_endpoint_shadow_writers()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_mode_enabled,
+            default_me_single_endpoint_outage_mode_enabled()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_disable_quarantine,
+            default_me_single_endpoint_outage_disable_quarantine()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_backoff_min_ms,
+            default_me_single_endpoint_outage_backoff_min_ms()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_backoff_max_ms,
+            default_me_single_endpoint_outage_backoff_max_ms()
+        );
+        assert_eq!(
+            general.me_single_endpoint_shadow_rotate_every_secs,
+            default_me_single_endpoint_shadow_rotate_every_secs()
+        );
+        assert_eq!(
+            general.upstream_connect_retry_attempts,
+            default_upstream_connect_retry_attempts()
+        );
+        assert_eq!(
+            general.upstream_connect_retry_backoff_ms,
+            default_upstream_connect_retry_backoff_ms()
+        );
+        assert_eq!(
+            general.upstream_unhealthy_fail_threshold,
+            default_upstream_unhealthy_fail_threshold()
         );
         assert_eq!(general.update_every, default_update_every());
 
@@ -716,6 +885,89 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("general.me_reinit_every_secs must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_single_endpoint_outage_backoff_range_is_validated() {
+        let toml = r#"
+            [general]
+            me_single_endpoint_outage_backoff_min_ms = 4000
+            me_single_endpoint_outage_backoff_max_ms = 3000
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_single_endpoint_outage_backoff_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains(
+            "general.me_single_endpoint_outage_backoff_min_ms must be <= general.me_single_endpoint_outage_backoff_max_ms"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_single_endpoint_shadow_writers_too_large_is_rejected() {
+        let toml = r#"
+            [general]
+            me_single_endpoint_shadow_writers = 33
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_single_endpoint_shadow_writers_limit_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_single_endpoint_shadow_writers must be within [0, 32]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upstream_connect_retry_attempts_zero_is_rejected() {
+        let toml = r#"
+            [general]
+            upstream_connect_retry_attempts = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_upstream_connect_retry_attempts_zero_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.upstream_connect_retry_attempts must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upstream_unhealthy_fail_threshold_zero_is_rejected() {
+        let toml = r#"
+            [general]
+            upstream_unhealthy_fail_threshold = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_upstream_unhealthy_fail_threshold_zero_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.upstream_unhealthy_fail_threshold must be > 0"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -932,6 +1184,110 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let cfg = ProxyConfig::load(&path).unwrap();
         assert_eq!(cfg.general.me_reinit_drain_timeout_secs, 90);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_ad_tag_is_disabled_during_load() {
+        let toml = r#"
+            [general]
+            ad_tag = "not_hex"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_invalid_ad_tag_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert!(cfg.general.ad_tag.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn valid_ad_tag_is_preserved_during_load() {
+        let toml = r#"
+            [general]
+            ad_tag = "00112233445566778899aabbccddeeff"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_valid_ad_tag_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.general.ad_tag.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_user_ad_tag_reports_access_user_ad_tags_key() {
+        let toml = r#"
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            alice = "00000000000000000000000000000000"
+
+            [access.user_ad_tags]
+            alice = "not_hex"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_invalid_user_ad_tag_message_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("access.user_ad_tags['alice'] must be exactly 32 hex characters"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_dns_override_is_rejected() {
+        let toml = r#"
+            [network]
+            dns_overrides = ["example.com:443:2001:db8::10"]
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_invalid_dns_override_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("must be bracketed"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn valid_dns_override_is_accepted() {
+        let toml = r#"
+            [network]
+            dns_overrides = ["example.com:443:127.0.0.1", "example.net:443:[2001:db8::10]"]
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_valid_dns_override_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(cfg.network.dns_overrides.len(), 2);
         let _ = std::fs::remove_file(path);
     }
 }

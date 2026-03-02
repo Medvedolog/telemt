@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing::debug;
 use crate::config::ProxyConfig;
+use crate::network::dns_overrides::resolve_socket_addr;
 use crate::stats::beobachten::BeobachtenStore;
 use crate::transport::proxy_protocol::{ProxyProtocolV1Builder, ProxyProtocolV2Builder};
 
@@ -54,6 +55,7 @@ pub async fn handle_bad_client<R, W>(
     writer: W,
     initial_data: &[u8],
     peer: SocketAddr,
+    local_addr: SocketAddr,
     config: &ProxyConfig,
     beobachten: &BeobachtenStore,
 )
@@ -86,7 +88,29 @@ where
         let connect_result = timeout(MASK_TIMEOUT, UnixStream::connect(sock_path)).await;
         match connect_result {
             Ok(Ok(stream)) => {
-                let (mask_read, mask_write) = stream.into_split();
+                let (mask_read, mut mask_write) = stream.into_split();
+                let proxy_header: Option<Vec<u8>> = match config.censorship.mask_proxy_protocol {
+                    0 => None,
+                    version => {
+                        let header = match version {
+                            2 => ProxyProtocolV2Builder::new().with_addrs(peer, local_addr).build(),
+                            _ => match (peer, local_addr) {
+                                (SocketAddr::V4(src), SocketAddr::V4(dst)) =>
+                                    ProxyProtocolV1Builder::new().tcp4(src.into(), dst.into()).build(),
+                                (SocketAddr::V6(src), SocketAddr::V6(dst)) =>
+                                    ProxyProtocolV1Builder::new().tcp6(src.into(), dst.into()).build(),
+                                _ =>
+                                    ProxyProtocolV1Builder::new().build(),
+                            },
+                        };
+                        Some(header)
+                    }
+                };
+                if let Some(header) = proxy_header {
+                    if mask_write.write_all(&header).await.is_err() {
+                        return;
+                    }
+                }
                 if timeout(MASK_RELAY_TIMEOUT, relay_to_mask(reader, writer, mask_read, mask_write, initial_data)).await.is_err() {
                     debug!("Mask relay timed out (unix socket)");
                 }
@@ -115,31 +139,26 @@ where
         "Forwarding bad client to mask host"
     );
 
-    // Connect to mask host
-    let mask_addr = format!("{}:{}", mask_host, mask_port);
+    // Apply runtime DNS override for mask target when configured.
+    let mask_addr = resolve_socket_addr(mask_host, mask_port)
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| format!("{}:{}", mask_host, mask_port));
     let connect_result = timeout(MASK_TIMEOUT, TcpStream::connect(&mask_addr)).await;
     match connect_result {
         Ok(Ok(stream)) => {
             let proxy_header: Option<Vec<u8>> = match config.censorship.mask_proxy_protocol {
                 0 => None,
                 version => {
-                    let header = if let Ok(local_addr) = stream.local_addr() {
-                        match version {
-                            2 => ProxyProtocolV2Builder::new().with_addrs(peer, local_addr).build(),
-                            _ => match (peer, local_addr) {
-                                (SocketAddr::V4(src), SocketAddr::V4(dst)) =>
-                                    ProxyProtocolV1Builder::new().tcp4(src.into(), dst.into()).build(),
-                                (SocketAddr::V6(src), SocketAddr::V6(dst)) =>
-                                    ProxyProtocolV1Builder::new().tcp6(src.into(), dst.into()).build(),
-                                _ =>
-                                    ProxyProtocolV1Builder::new().build(),
-                            },
-                        }
-                    } else {
-                        match version {
-                            2 => ProxyProtocolV2Builder::new().build(),
-                            _ => ProxyProtocolV1Builder::new().build(),
-                        }
+                    let header = match version {
+                        2 => ProxyProtocolV2Builder::new().with_addrs(peer, local_addr).build(),
+                        _ => match (peer, local_addr) {
+                            (SocketAddr::V4(src), SocketAddr::V4(dst)) =>
+                                ProxyProtocolV1Builder::new().tcp4(src.into(), dst.into()).build(),
+                            (SocketAddr::V6(src), SocketAddr::V6(dst)) =>
+                                ProxyProtocolV1Builder::new().tcp6(src.into(), dst.into()).build(),
+                            _ =>
+                                ProxyProtocolV1Builder::new().build(),
+                        },
                     };
                     Some(header)
                 }

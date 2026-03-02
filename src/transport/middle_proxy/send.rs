@@ -1,8 +1,10 @@
+use std::cmp::Reverse;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
 use crate::error::{ProxyError, Result};
@@ -11,11 +13,13 @@ use crate::protocol::constants::RPC_CLOSE_EXT_U32;
 
 use super::MePool;
 use super::codec::WriterCommand;
+use super::pool::WriterContour;
 use super::wire::build_proxy_req_payload;
 use rand::seq::SliceRandom;
 use super::registry::ConnMeta;
 
 impl MePool {
+    /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
     pub async fn send_proxy_req(
         self: &Arc<Self>,
         conn_id: u64,
@@ -24,13 +28,15 @@ impl MePool {
         our_addr: SocketAddr,
         data: &[u8],
         proto_flags: u32,
+        tag_override: Option<&[u8]>,
     ) -> Result<()> {
+        let tag = tag_override.or(self.proxy_tag.as_deref());
         let payload = build_proxy_req_payload(
             conn_id,
             client_addr,
             our_addr,
             data,
-            self.proxy_tag.as_deref(),
+            tag,
             proto_flags,
         );
         let meta = ConnMeta {
@@ -43,15 +49,17 @@ impl MePool {
 
         loop {
             if let Some(current) = self.registry.get_writer(conn_id).await {
-                let send_res = {
-                    current
-                        .tx
-                        .send(WriterCommand::Data(payload.clone()))
-                        .await
-                };
-                match send_res {
+                match current.tx.try_send(WriterCommand::Data(payload.clone())) {
                     Ok(()) => return Ok(()),
-                    Err(_) => {
+                    Err(TrySendError::Full(cmd)) => {
+                        if current.tx.send(cmd).await.is_ok() {
+                            return Ok(());
+                        }
+                        warn!(writer_id = current.writer_id, "ME writer channel closed");
+                        self.remove_writer_and_close_clients(current.writer_id).await;
+                        continue;
+                    }
+                    Err(TrySendError::Closed(_)) => {
                         warn!(writer_id = current.writer_id, "ME writer channel closed");
                         self.remove_writer_and_close_clients(current.writer_id).await;
                         continue;
@@ -94,7 +102,14 @@ impl MePool {
                 ws.clone()
             };
 
-            let mut candidate_indices = self.candidate_indices_for_dc(&writers_snapshot, target_dc).await;
+            let mut candidate_indices = self
+                .candidate_indices_for_dc(&writers_snapshot, target_dc, false)
+                .await;
+            if candidate_indices.is_empty() {
+                candidate_indices = self
+                    .candidate_indices_for_dc(&writers_snapshot, target_dc, true)
+                    .await;
+            }
             if candidate_indices.is_empty() {
                 // Emergency connect-on-demand
                 if emergency_attempts >= 3 {
@@ -120,7 +135,14 @@ impl MePool {
                         let ws2 = self.writers.read().await;
                         writers_snapshot = ws2.clone();
                         drop(ws2);
-                        candidate_indices = self.candidate_indices_for_dc(&writers_snapshot, target_dc).await;
+                        candidate_indices = self
+                            .candidate_indices_for_dc(&writers_snapshot, target_dc, false)
+                            .await;
+                        if candidate_indices.is_empty() {
+                            candidate_indices = self
+                                .candidate_indices_for_dc(&writers_snapshot, target_dc, true)
+                                .await;
+                        }
                         if !candidate_indices.is_empty() {
                             break;
                         }
@@ -131,14 +153,44 @@ impl MePool {
                 }
             }
 
-            candidate_indices.sort_by_key(|idx| {
-                let w = &writers_snapshot[*idx];
-                let degraded = w.degraded.load(Ordering::Relaxed);
-                let stale = (w.generation < self.current_generation()) as usize;
-                (stale, degraded as usize)
-            });
+            if self.me_deterministic_writer_sort.load(Ordering::Relaxed) {
+                candidate_indices.sort_by(|lhs, rhs| {
+                    let left = &writers_snapshot[*lhs];
+                    let right = &writers_snapshot[*rhs];
+                    let left_key = (
+                        self.writer_contour_rank_for_selection(left),
+                        (left.generation < self.current_generation()) as usize,
+                        left.degraded.load(Ordering::Relaxed) as usize,
+                        Reverse(left.tx.capacity()),
+                        left.addr,
+                        left.id,
+                    );
+                    let right_key = (
+                        self.writer_contour_rank_for_selection(right),
+                        (right.generation < self.current_generation()) as usize,
+                        right.degraded.load(Ordering::Relaxed) as usize,
+                        Reverse(right.tx.capacity()),
+                        right.addr,
+                        right.id,
+                    );
+                    left_key.cmp(&right_key)
+                });
+            } else {
+                candidate_indices.sort_by_key(|idx| {
+                    let w = &writers_snapshot[*idx];
+                    let degraded = w.degraded.load(Ordering::Relaxed);
+                    let stale = (w.generation < self.current_generation()) as usize;
+                    (
+                        self.writer_contour_rank_for_selection(w),
+                        stale,
+                        degraded as usize,
+                        Reverse(w.tx.capacity()),
+                    )
+                });
+            }
 
             let start = self.rr.fetch_add(1, Ordering::Relaxed) as usize % candidate_indices.len();
+            let mut fallback_blocking_idx: Option<usize> = None;
 
             for offset in 0..candidate_indices.len() {
                 let idx = candidate_indices[(start + offset) % candidate_indices.len()];
@@ -146,29 +198,41 @@ impl MePool {
                 if !self.writer_accepts_new_binding(w) {
                     continue;
                 }
-                if w.tx.send(WriterCommand::Data(payload.clone())).await.is_ok() {
-                    self.registry
-                        .bind_writer(conn_id, w.id, w.tx.clone(), meta.clone())
-                        .await;
-                    if w.generation < self.current_generation() {
-                        self.stats.increment_pool_stale_pick_total();
-                        debug!(
-                            conn_id,
-                            writer_id = w.id,
-                            writer_generation = w.generation,
-                            current_generation = self.current_generation(),
-                            "Selected stale ME writer for fallback bind"
-                        );
+                match w.tx.try_send(WriterCommand::Data(payload.clone())) {
+                    Ok(()) => {
+                        self.registry
+                            .bind_writer(conn_id, w.id, w.tx.clone(), meta.clone())
+                            .await;
+                        if w.generation < self.current_generation() {
+                            self.stats.increment_pool_stale_pick_total();
+                            debug!(
+                                conn_id,
+                                writer_id = w.id,
+                                writer_generation = w.generation,
+                                current_generation = self.current_generation(),
+                                "Selected stale ME writer for fallback bind"
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                } else {
-                    warn!(writer_id = w.id, "ME writer channel closed");
-                    self.remove_writer_and_close_clients(w.id).await;
-                    continue;
+                    Err(TrySendError::Full(_)) => {
+                        if fallback_blocking_idx.is_none() {
+                            fallback_blocking_idx = Some(idx);
+                        }
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!(writer_id = w.id, "ME writer channel closed");
+                        self.remove_writer_and_close_clients(w.id).await;
+                        continue;
+                    }
                 }
             }
 
-            let w = writers_snapshot[candidate_indices[start]].clone();
+            let Some(blocking_idx) = fallback_blocking_idx else {
+                continue;
+            };
+
+            let w = writers_snapshot[blocking_idx].clone();
             if !self.writer_accepts_new_binding(&w) {
                 continue;
             }
@@ -215,6 +279,7 @@ impl MePool {
         &self,
         writers: &[super::pool::MeWriter],
         target_dc: i16,
+        include_warm: bool,
     ) -> Vec<usize> {
         let key = target_dc as i32;
         let mut preferred = Vec::<SocketAddr>::new();
@@ -258,13 +323,13 @@ impl MePool {
 
         if preferred.is_empty() {
             return (0..writers.len())
-                .filter(|i| self.writer_accepts_new_binding(&writers[*i]))
+                .filter(|i| self.writer_eligible_for_selection(&writers[*i], include_warm))
                 .collect();
         }
 
         let mut out = Vec::new();
         for (idx, w) in writers.iter().enumerate() {
-            if !self.writer_accepts_new_binding(w) {
+            if !self.writer_eligible_for_selection(w, include_warm) {
                 continue;
             }
             if preferred.contains(&w.addr) {
@@ -273,10 +338,33 @@ impl MePool {
         }
         if out.is_empty() {
             return (0..writers.len())
-                .filter(|i| self.writer_accepts_new_binding(&writers[*i]))
+                .filter(|i| self.writer_eligible_for_selection(&writers[*i], include_warm))
                 .collect();
         }
         out
     }
 
+    fn writer_eligible_for_selection(
+        &self,
+        writer: &super::pool::MeWriter,
+        include_warm: bool,
+    ) -> bool {
+        if !self.writer_accepts_new_binding(writer) {
+            return false;
+        }
+
+        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
+            WriterContour::Active => true,
+            WriterContour::Warm => include_warm,
+            WriterContour::Draining => true,
+        }
+    }
+
+    fn writer_contour_rank_for_selection(&self, writer: &super::pool::MeWriter) -> usize {
+        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
+            WriterContour::Active => 0,
+            WriterContour::Warm => 1,
+            WriterContour::Draining => 2,
+        }
+    }
 }

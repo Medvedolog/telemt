@@ -1,5 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use socket2::{SockRef, TcpKeepalive};
 #[cfg(target_os = "linux")]
 use libc;
@@ -14,13 +17,16 @@ use tokio::net::{TcpStream, TcpSocket};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::config::MeSocksKdfPolicy;
 use crate::crypto::{SecureRandom, build_middleproxy_prekey, derive_middleproxy_keys, sha256};
 use crate::error::{ProxyError, Result};
 use crate::network::IpFamily;
+use crate::network::probe::is_bogon;
 use crate::protocol::constants::{
     ME_CONNECT_TIMEOUT_SECS, ME_HANDSHAKE_TIMEOUT_SECS, RPC_CRYPTO_AES_U32,
     RPC_HANDSHAKE_ERROR_U32, rpc_crypto_flags,
 };
+use crate::transport::{UpstreamEgressInfo, UpstreamRouteKind};
 
 use super::codec::{
     RpcChecksumMode, build_handshake_payload, build_nonce_payload, build_rpc_frame,
@@ -29,6 +35,8 @@ use super::codec::{
 };
 use super::wire::{extract_ip_material, IpMaterial};
 use super::MePool;
+
+const ME_KDF_DRIFT_STRICT: bool = false;
 
 /// Result of a successful ME handshake with timings.
 pub(crate) struct HandshakeOutput {
@@ -43,33 +51,141 @@ pub(crate) struct HandshakeOutput {
 }
 
 impl MePool {
-    /// TCP connect with timeout + return RTT in milliseconds.
-    pub(crate) async fn connect_tcp(&self, addr: SocketAddr) -> Result<(TcpStream, f64)> {
-        let start = Instant::now();
-        let connect_fut = async {
-            if addr.is_ipv6()
-                && let Some(v6) = self.detected_ipv6
-            {
-                match TcpSocket::new_v6() {
-                    Ok(sock) => {
-                        if let Err(e) = sock.bind(SocketAddr::new(IpAddr::V6(v6), 0)) {
-                            debug!(error = %e, bind_ip = %v6, "ME IPv6 bind failed, falling back to default bind");
-                        } else {
-                            match sock.connect(addr).await {
-                                Ok(stream) => return Ok(stream),
-                                Err(e) => debug!(error = %e, target = %addr, "ME IPv6 bound connect failed, retrying default connect"),
-                            }
-                        }
+    fn kdf_material_fingerprint(
+        local_addr_nat: SocketAddr,
+        peer_addr_nat: SocketAddr,
+        client_port_for_kdf: u16,
+        reflected: Option<SocketAddr>,
+        socks_bound_addr: Option<SocketAddr>,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        local_addr_nat.hash(&mut hasher);
+        peer_addr_nat.hash(&mut hasher);
+        client_port_for_kdf.hash(&mut hasher);
+        reflected.hash(&mut hasher);
+        socks_bound_addr.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    async fn resolve_dc_idx_for_endpoint(&self, addr: SocketAddr) -> Option<i16> {
+        if addr.is_ipv4() {
+            let map = self.proxy_map_v4.read().await;
+            for (dc, addrs) in map.iter() {
+                if addrs
+                    .iter()
+                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
+                {
+                    let abs_dc = dc.abs();
+                    if abs_dc > 0
+                        && let Ok(dc_idx) = i16::try_from(abs_dc)
+                    {
+                        return Some(dc_idx);
                     }
-                    Err(e) => debug!(error = %e, "ME IPv6 socket creation failed, falling back to default connect"),
                 }
             }
-            TcpStream::connect(addr).await
+        } else {
+            let map = self.proxy_map_v6.read().await;
+            for (dc, addrs) in map.iter() {
+                if addrs
+                    .iter()
+                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
+                {
+                    let abs_dc = dc.abs();
+                    if abs_dc > 0
+                        && let Ok(dc_idx) = i16::try_from(abs_dc)
+                    {
+                        return Some(dc_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn direct_bind_ip_for_stun(
+        family: IpFamily,
+        upstream_egress: Option<UpstreamEgressInfo>,
+    ) -> Option<IpAddr> {
+        let info = upstream_egress?;
+        if info.route_kind != UpstreamRouteKind::Direct {
+            return None;
+        }
+        match (family, info.direct_bind_ip) {
+            (IpFamily::V4, Some(IpAddr::V4(ip))) => Some(IpAddr::V4(ip)),
+            (IpFamily::V6, Some(IpAddr::V6(ip))) => Some(IpAddr::V6(ip)),
+            _ => None,
+        }
+    }
+
+    fn select_socks_bound_addr(
+        family: IpFamily,
+        upstream_egress: Option<UpstreamEgressInfo>,
+    ) -> Option<SocketAddr> {
+        let info = upstream_egress?;
+        if !matches!(
+            info.route_kind,
+            UpstreamRouteKind::Socks4 | UpstreamRouteKind::Socks5
+        ) {
+            return None;
+        }
+        let bound = info.socks_bound_addr?;
+        let family_matches = matches!(
+            (family, bound.ip()),
+            (IpFamily::V4, IpAddr::V4(_)) | (IpFamily::V6, IpAddr::V6(_))
+        );
+        if !family_matches || is_bogon(bound.ip()) || bound.ip().is_unspecified() {
+            return None;
+        }
+        Some(bound)
+    }
+
+    fn is_socks_route(upstream_egress: Option<UpstreamEgressInfo>) -> bool {
+        matches!(
+            upstream_egress.map(|info| info.route_kind),
+            Some(UpstreamRouteKind::Socks4 | UpstreamRouteKind::Socks5)
+        )
+    }
+
+    /// TCP connect with timeout + return RTT in milliseconds.
+    pub(crate) async fn connect_tcp(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(TcpStream, f64, Option<UpstreamEgressInfo>)> {
+        let start = Instant::now();
+        let (stream, upstream_egress) = if let Some(upstream) = &self.upstream {
+            let dc_idx = self.resolve_dc_idx_for_endpoint(addr).await;
+            let (stream, egress) = upstream.connect_with_details(addr, dc_idx, None).await?;
+            (stream, Some(egress))
+        } else {
+            let connect_fut = async {
+                if addr.is_ipv6()
+                    && let Some(v6) = self.detected_ipv6
+                {
+                    match TcpSocket::new_v6() {
+                        Ok(sock) => {
+                            if let Err(e) = sock.bind(SocketAddr::new(IpAddr::V6(v6), 0)) {
+                                debug!(error = %e, bind_ip = %v6, "ME IPv6 bind failed, falling back to default bind");
+                            } else {
+                                match sock.connect(addr).await {
+                                    Ok(stream) => return Ok(stream),
+                                    Err(e) => debug!(error = %e, target = %addr, "ME IPv6 bound connect failed, retrying default connect"),
+                                }
+                            }
+                        }
+                        Err(e) => debug!(error = %e, "ME IPv6 socket creation failed, falling back to default connect"),
+                    }
+                }
+                TcpStream::connect(addr).await
+            };
+
+            let stream = timeout(Duration::from_secs(ME_CONNECT_TIMEOUT_SECS), connect_fut)
+                .await
+                .map_err(|_| ProxyError::ConnectionTimeout {
+                    addr: addr.to_string(),
+                })??;
+            (stream, None)
         };
 
-        let stream = timeout(Duration::from_secs(ME_CONNECT_TIMEOUT_SECS), connect_fut)
-            .await
-            .map_err(|_| ProxyError::ConnectionTimeout { addr: addr.to_string() })??;
         let connect_ms = start.elapsed().as_secs_f64() * 1000.0;
         stream.set_nodelay(true).ok();
         if let Err(e) = Self::configure_keepalive(&stream) {
@@ -79,7 +195,7 @@ impl MePool {
         if let Err(e) = Self::configure_user_timeout(stream.as_raw_fd()) {
             warn!(error = %e, "ME TCP_USER_TIMEOUT setup failed");
         }
-        Ok((stream, connect_ms))
+        Ok((stream, connect_ms, upstream_egress))
     }
 
     fn configure_keepalive(stream: &TcpStream) -> std::io::Result<()> {
@@ -117,12 +233,14 @@ impl MePool {
         &self,
         stream: TcpStream,
         addr: SocketAddr,
+        upstream_egress: Option<UpstreamEgressInfo>,
         rng: &SecureRandom,
     ) -> Result<HandshakeOutput> {
         let hs_start = Instant::now();
 
         let local_addr = stream.local_addr().map_err(ProxyError::Io)?;
-        let peer_addr = stream.peer_addr().map_err(ProxyError::Io)?;
+        let transport_peer_addr = stream.peer_addr().map_err(ProxyError::Io)?;
+        let peer_addr = addr;
 
         let _ = self.maybe_detect_nat_ip(local_addr.ip()).await;
         let family = if local_addr.ip().is_ipv4() {
@@ -130,8 +248,32 @@ impl MePool {
         } else {
             IpFamily::V6
         };
-        let reflected = if self.nat_probe {
-            self.maybe_reflect_public_addr(family).await
+        let is_socks_route = Self::is_socks_route(upstream_egress);
+        let socks_bound_addr = Self::select_socks_bound_addr(family, upstream_egress);
+        let reflected = if let Some(bound) = socks_bound_addr {
+            Some(bound)
+        } else if is_socks_route {
+            match self.socks_kdf_policy() {
+                MeSocksKdfPolicy::Strict => {
+                    self.stats.increment_me_socks_kdf_strict_reject();
+                    return Err(ProxyError::InvalidHandshake(
+                        "SOCKS route returned no valid BND.ADDR for ME KDF (strict policy)"
+                            .to_string(),
+                    ));
+                }
+                MeSocksKdfPolicy::Compat => {
+                    self.stats.increment_me_socks_kdf_compat_fallback();
+                    if self.nat_probe {
+                        let bind_ip = Self::direct_bind_ip_for_stun(family, upstream_egress);
+                        self.maybe_reflect_public_addr(family, bind_ip).await
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else if self.nat_probe {
+            let bind_ip = Self::direct_bind_ip_for_stun(family, upstream_egress);
+            self.maybe_reflect_public_addr(family, bind_ip).await
         } else {
             None
         };
@@ -146,7 +288,16 @@ impl MePool {
             .unwrap_or_default()
             .as_secs() as u32;
 
-        let ks = self.key_selector().await;
+        let secret_atomic_snapshot = self.secret_atomic_snapshot.load(Ordering::Relaxed);
+        let (ks, secret) = if secret_atomic_snapshot {
+            let snapshot = self.secret_snapshot().await;
+            (snapshot.key_selector, snapshot.secret)
+        } else {
+            // Backward-compatible mode: key selector and secret may come from different updates.
+            let key_selector = self.key_selector().await;
+            let secret = self.secret_snapshot().await.secret;
+            (key_selector, secret)
+        };
         let nonce_payload = build_nonce_payload(ks, crypto_ts, &my_nonce);
         let nonce_frame = build_rpc_frame(-2, &nonce_payload, RpcChecksumMode::Crc32);
         let dump = hex_dump(&nonce_frame[..nonce_frame.len().min(44)]);
@@ -197,7 +348,9 @@ impl MePool {
             %local_addr_nat,
             reflected_ip = reflected.map(|r| r.ip()).as_ref().map(ToString::to_string),
             %peer_addr,
+            %transport_peer_addr,
             %peer_addr_nat,
+            socks_bound_addr = socks_bound_addr.map(|v| v.to_string()),
             key_selector = format_args!("0x{ks:08x}"),
             crypto_schema = format_args!("0x{schema:08x}"),
             skew_secs = skew,
@@ -206,7 +359,38 @@ impl MePool {
 
         let ts_bytes = crypto_ts.to_le_bytes();
         let server_port_bytes = peer_addr_nat.port().to_le_bytes();
-        let client_port_bytes = local_addr_nat.port().to_le_bytes();
+        let client_port_for_kdf = socks_bound_addr
+            .map(|bound| bound.port())
+            .filter(|port| *port != 0)
+            .unwrap_or(local_addr_nat.port());
+        let kdf_fingerprint = Self::kdf_material_fingerprint(
+            local_addr_nat,
+            peer_addr_nat,
+            client_port_for_kdf,
+            reflected,
+            socks_bound_addr,
+        );
+        let mut kdf_fingerprint_guard = self.kdf_material_fingerprint.lock().await;
+        if let Some(prev_fingerprint) = kdf_fingerprint_guard.get(&peer_addr_nat).copied()
+            && prev_fingerprint != kdf_fingerprint
+        {
+            self.stats.increment_me_kdf_drift_total();
+            warn!(
+                %peer_addr_nat,
+                %local_addr_nat,
+                client_port_for_kdf,
+                "ME KDF input drift detected for endpoint"
+            );
+            if ME_KDF_DRIFT_STRICT {
+                return Err(ProxyError::InvalidHandshake(
+                    "ME KDF input drift detected (strict mode)".to_string(),
+                ));
+            }
+        }
+        kdf_fingerprint_guard.insert(peer_addr_nat, kdf_fingerprint);
+        drop(kdf_fingerprint_guard);
+
+        let client_port_bytes = client_port_for_kdf.to_le_bytes();
 
         let server_ip = extract_ip_material(peer_addr_nat);
         let client_ip = extract_ip_material(local_addr_nat);
@@ -229,8 +413,6 @@ impl MePool {
         };
 
         let diag_level: u8 = std::env::var("ME_DIAG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-
-        let secret: Vec<u8> = self.proxy_secret.read().await.clone();
 
         let prekey_client = build_middleproxy_prekey(
             &srv_nonce,
@@ -405,6 +587,8 @@ impl MePool {
                     } else {
                         -1
                     };
+                    self.stats.increment_me_handshake_reject_total();
+                    self.stats.increment_me_handshake_error_code(err_code);
                     return Err(ProxyError::InvalidHandshake(format!(
                         "ME rejected handshake (error={err_code})"
                     )));

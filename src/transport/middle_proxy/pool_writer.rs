@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -9,12 +9,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::config::MeBindStaleMode;
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::RPC_PING_U32;
 
 use super::codec::{RpcWriter, WriterCommand};
-use super::pool::{MePool, MeWriter};
+use super::pool::{MePool, MeWriter, WriterContour};
 use super::reader::reader_loop;
 use super::registry::BoundConn;
 
@@ -42,16 +43,32 @@ impl MePool {
     }
 
     pub(crate) async fn connect_one(self: &Arc<Self>, addr: SocketAddr, rng: &SecureRandom) -> Result<()> {
-        let secret_len = self.proxy_secret.read().await.len();
+        self.connect_one_with_generation_contour(
+            addr,
+            rng,
+            self.current_generation(),
+            WriterContour::Active,
+        )
+        .await
+    }
+
+    pub(super) async fn connect_one_with_generation_contour(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        rng: &SecureRandom,
+        generation: u64,
+        contour: WriterContour,
+    ) -> Result<()> {
+        let secret_len = self.proxy_secret.read().await.secret.len();
         if secret_len < 32 {
             return Err(ProxyError::Proxy("proxy-secret too short for ME auth".into()));
         }
 
-        let (stream, _connect_ms) = self.connect_tcp(addr).await?;
-        let hs = self.handshake_only(stream, addr, rng).await?;
+        let (stream, _connect_ms, upstream_egress) = self.connect_tcp(addr).await?;
+        let hs = self.handshake_only(stream, addr, upstream_egress, rng).await?;
 
         let writer_id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
-        let generation = self.current_generation();
+        let contour = Arc::new(AtomicU8::new(contour.as_u8()));
         let cancel = CancellationToken::new();
         let degraded = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
@@ -88,6 +105,8 @@ impl MePool {
             id: writer_id,
             addr,
             generation,
+            contour: contour.clone(),
+            created_at: Instant::now(),
             tx: tx.clone(),
             cancel: cancel.clone(),
             degraded: degraded.clone(),
@@ -248,6 +267,7 @@ impl MePool {
     async fn remove_writer_only(self: &Arc<Self>, writer_id: u64) -> Vec<BoundConn> {
         let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         let mut removed_addr: Option<SocketAddr> = None;
+        let mut removed_uptime: Option<Duration> = None;
         let mut trigger_refill = false;
         {
             let mut ws = self.writers.write().await;
@@ -260,6 +280,7 @@ impl MePool {
                 self.stats.increment_me_writer_removed_total();
                 w.cancel.cancel();
                 removed_addr = Some(w.addr);
+                removed_uptime = Some(w.created_at.elapsed());
                 trigger_refill = !was_draining;
                 if trigger_refill {
                     self.stats.increment_me_writer_removed_unexpected_total();
@@ -274,6 +295,9 @@ impl MePool {
         if trigger_refill
             && let Some(addr) = removed_addr
         {
+            if let Some(uptime) = removed_uptime {
+                self.maybe_quarantine_flapping_endpoint(addr, uptime).await;
+            }
             self.trigger_immediate_refill(addr);
         }
         self.rtt_stats.lock().await.remove(&writer_id);
@@ -298,6 +322,8 @@ impl MePool {
                 if !already_draining {
                     self.stats.increment_pool_drain_active();
                 }
+                w.contour
+                    .store(WriterContour::Draining.as_u8(), Ordering::Relaxed);
                 w.draining.store(true, Ordering::Relaxed);
                 true
             } else {
@@ -351,16 +377,22 @@ impl MePool {
             return false;
         }
 
-        let ttl_secs = self.me_pool_drain_ttl_secs.load(Ordering::Relaxed);
-        if ttl_secs == 0 {
-            return true;
-        }
+        match self.bind_stale_mode() {
+            MeBindStaleMode::Never => false,
+            MeBindStaleMode::Always => true,
+            MeBindStaleMode::Ttl => {
+                let ttl_secs = self.me_bind_stale_ttl_secs.load(Ordering::Relaxed);
+                if ttl_secs == 0 {
+                    return true;
+                }
 
-        let started = writer.draining_started_at_epoch_secs.load(Ordering::Relaxed);
-        if started == 0 {
-            return false;
-        }
+                let started = writer.draining_started_at_epoch_secs.load(Ordering::Relaxed);
+                if started == 0 {
+                    return false;
+                }
 
-        Self::now_epoch_secs().saturating_sub(started) <= ttl_secs
+                Self::now_epoch_secs().saturating_sub(started) <= ttl_secs
+            }
+        }
     }
 }

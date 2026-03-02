@@ -8,6 +8,9 @@ const DEFAULT_STUN_TCP_FALLBACK: bool = true;
 const DEFAULT_MIDDLE_PROXY_WARM_STANDBY: usize = 16;
 const DEFAULT_ME_RECONNECT_MAX_CONCURRENT_PER_DC: u32 = 8;
 const DEFAULT_ME_RECONNECT_FAST_RETRY_COUNT: u32 = 16;
+const DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS: u8 = 2;
+const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 4;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
 const DEFAULT_ACCESS_USER: &str = "default";
 const DEFAULT_ACCESS_SECRET: &str = "00000000000000000000000000000000";
@@ -158,6 +161,42 @@ pub(crate) fn default_me_reconnect_fast_retry_count() -> u32 {
     DEFAULT_ME_RECONNECT_FAST_RETRY_COUNT
 }
 
+pub(crate) fn default_me_single_endpoint_shadow_writers() -> u8 {
+    DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS
+}
+
+pub(crate) fn default_me_single_endpoint_outage_mode_enabled() -> bool {
+    true
+}
+
+pub(crate) fn default_me_single_endpoint_outage_disable_quarantine() -> bool {
+    true
+}
+
+pub(crate) fn default_me_single_endpoint_outage_backoff_min_ms() -> u64 {
+    250
+}
+
+pub(crate) fn default_me_single_endpoint_outage_backoff_max_ms() -> u64 {
+    3000
+}
+
+pub(crate) fn default_me_single_endpoint_shadow_rotate_every_secs() -> u64 {
+    900
+}
+
+pub(crate) fn default_upstream_connect_retry_attempts() -> u32 {
+    DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS
+}
+
+pub(crate) fn default_upstream_connect_retry_backoff_ms() -> u64 {
+    250
+}
+
+pub(crate) fn default_upstream_unhealthy_fail_threshold() -> u32 {
+    DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD
+}
+
 pub(crate) fn default_crypto_pending_buffer() -> usize {
     256 * 1024
 }
@@ -168,6 +207,18 @@ pub(crate) fn default_max_client_frame() -> usize {
 
 pub(crate) fn default_desync_all_full() -> bool {
     false
+}
+
+pub(crate) fn default_me_route_backpressure_base_timeout_ms() -> u64 {
+    25
+}
+
+pub(crate) fn default_me_route_backpressure_high_timeout_ms() -> u64 {
+    120
+}
+
+pub(crate) fn default_me_route_backpressure_high_watermark_pct() -> u8 {
+    80
 }
 
 pub(crate) fn default_beobachten_minutes() -> u64 {
@@ -251,6 +302,18 @@ pub(crate) fn default_me_reinit_every_secs() -> u64 {
     15 * 60
 }
 
+pub(crate) fn default_me_reinit_singleflight() -> bool {
+    true
+}
+
+pub(crate) fn default_me_reinit_trigger_channel() -> usize {
+    64
+}
+
+pub(crate) fn default_me_reinit_coalesce_window_ms() -> u64 {
+    200
+}
+
 pub(crate) fn default_me_hardswap_warmup_delay_min_ms() -> u64 {
     1000
 }
@@ -275,11 +338,27 @@ pub(crate) fn default_me_config_apply_cooldown_secs() -> u64 {
     300
 }
 
+pub(crate) fn default_me_snapshot_require_http_2xx() -> bool {
+    true
+}
+
+pub(crate) fn default_me_snapshot_reject_empty_map() -> bool {
+    true
+}
+
+pub(crate) fn default_me_snapshot_min_proxy_for_lines() -> u32 {
+    1
+}
+
 pub(crate) fn default_proxy_secret_stable_snapshots() -> u8 {
     2
 }
 
 pub(crate) fn default_proxy_secret_rotate_runtime() -> bool {
+    true
+}
+
+pub(crate) fn default_me_secret_atomic_snapshot() -> bool {
     true
 }
 
@@ -295,8 +374,16 @@ pub(crate) fn default_me_pool_drain_ttl_secs() -> u64 {
     90
 }
 
+pub(crate) fn default_me_bind_stale_ttl_secs() -> u64 {
+    default_me_pool_drain_ttl_secs()
+}
+
 pub(crate) fn default_me_pool_min_fresh_ratio() -> f32 {
     0.8
+}
+
+pub(crate) fn default_me_deterministic_writer_sort() -> bool {
+    true
 }
 
 pub(crate) fn default_hardswap() -> bool {
