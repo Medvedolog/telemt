@@ -158,6 +158,31 @@ impl MeBindStaleMode {
     }
 }
 
+/// Middle-End writer floor policy mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeFloorMode {
+    Static,
+    #[default]
+    Adaptive,
+}
+
+impl MeFloorMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            MeFloorMode::Static => 0,
+            MeFloorMode::Adaptive => 1,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => MeFloorMode::Adaptive,
+            _ => MeFloorMode::Static,
+        }
+    }
+}
+
 /// Telemetry controls for hot-path counters and ME diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryConfig {
@@ -331,6 +356,11 @@ pub struct GeneralConfig {
     #[serde(default = "default_true")]
     pub me_keepalive_payload_random: bool,
 
+    /// Interval in seconds for service RPC_PROXY_REQ activity signals to ME.
+    /// 0 disables service activity signals.
+    #[serde(default = "default_rpc_proxy_req_every")]
+    pub rpc_proxy_req_every: u64,
+
     /// Max pending ciphertext buffer per client writer (bytes).
     /// Controls FakeTLS backpressure vs throughput.
     #[serde(default = "default_crypto_pending_buffer")]
@@ -419,6 +449,22 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_single_endpoint_shadow_rotate_every_secs")]
     pub me_single_endpoint_shadow_rotate_every_secs: u64,
 
+    /// Floor policy mode for ME writer targets.
+    #[serde(default)]
+    pub me_floor_mode: MeFloorMode,
+
+    /// Idle time in seconds before adaptive floor can reduce single-endpoint writer target.
+    #[serde(default = "default_me_adaptive_floor_idle_secs")]
+    pub me_adaptive_floor_idle_secs: u64,
+
+    /// Minimum writer target for single-endpoint DC groups in adaptive floor mode.
+    #[serde(default = "default_me_adaptive_floor_min_writers_single_endpoint")]
+    pub me_adaptive_floor_min_writers_single_endpoint: u8,
+
+    /// Grace period in seconds to hold static floor after activity in adaptive mode.
+    #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
+    pub me_adaptive_floor_recover_grace_secs: u64,
+
     /// Connect attempts for the selected upstream before returning error/fallback.
     #[serde(default = "default_upstream_connect_retry_attempts")]
     pub upstream_connect_retry_attempts: u32,
@@ -430,6 +476,10 @@ pub struct GeneralConfig {
     /// Consecutive failed requests before upstream is marked unhealthy.
     #[serde(default = "default_upstream_unhealthy_fail_threshold")]
     pub upstream_unhealthy_fail_threshold: u32,
+
+    /// Skip additional retries for hard non-transient upstream connect errors.
+    #[serde(default = "default_upstream_connect_failfast_hard_errors")]
+    pub upstream_connect_failfast_hard_errors: bool,
 
     /// Ignore STUN/interface IP mismatch (keep using Middle Proxy even if NAT detected).
     #[serde(default)]
@@ -621,6 +671,7 @@ impl Default for GeneralConfig {
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),
             me_keepalive_payload_random: default_true(),
+            rpc_proxy_req_every: default_rpc_proxy_req_every(),
             me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
@@ -634,9 +685,14 @@ impl Default for GeneralConfig {
             me_single_endpoint_outage_backoff_min_ms: default_me_single_endpoint_outage_backoff_min_ms(),
             me_single_endpoint_outage_backoff_max_ms: default_me_single_endpoint_outage_backoff_max_ms(),
             me_single_endpoint_shadow_rotate_every_secs: default_me_single_endpoint_shadow_rotate_every_secs(),
+            me_floor_mode: MeFloorMode::default(),
+            me_adaptive_floor_idle_secs: default_me_adaptive_floor_idle_secs(),
+            me_adaptive_floor_min_writers_single_endpoint: default_me_adaptive_floor_min_writers_single_endpoint(),
+            me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),
+            upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
             unknown_dc_log_path: default_unknown_dc_log_path(),
             log_level: LogLevel::Normal,
@@ -737,6 +793,58 @@ impl Default for LinksConfig {
     }
 }
 
+/// API settings for control-plane endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApiConfig {
+    /// Enable or disable REST API.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Listen address for API in `IP:PORT` format.
+    #[serde(default = "default_api_listen")]
+    pub listen: String,
+
+    /// CIDR whitelist allowed to access API.
+    #[serde(default = "default_api_whitelist")]
+    pub whitelist: Vec<IpNetwork>,
+
+    /// Optional static value for `Authorization` header validation.
+    /// Empty string disables header auth.
+    #[serde(default)]
+    pub auth_header: String,
+
+    /// Maximum accepted HTTP request body size in bytes.
+    #[serde(default = "default_api_request_body_limit_bytes")]
+    pub request_body_limit_bytes: usize,
+
+    /// Enable runtime snapshots that require read-lock aggregation on API request path.
+    #[serde(default = "default_api_minimal_runtime_enabled")]
+    pub minimal_runtime_enabled: bool,
+
+    /// Cache TTL for minimal runtime snapshots in milliseconds (0 disables caching).
+    #[serde(default = "default_api_minimal_runtime_cache_ttl_ms")]
+    pub minimal_runtime_cache_ttl_ms: u64,
+
+    /// Read-only mode: mutating endpoints are rejected.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_api_listen(),
+            whitelist: default_api_whitelist(),
+            auth_header: String::new(),
+            request_body_limit_bytes: default_api_request_body_limit_bytes(),
+            minimal_runtime_enabled: default_api_minimal_runtime_enabled(),
+            minimal_runtime_cache_ttl_ms: default_api_minimal_runtime_cache_ttl_ms(),
+            read_only: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_port")]
@@ -772,6 +880,9 @@ pub struct ServerConfig {
     #[serde(default = "default_metrics_whitelist")]
     pub metrics_whitelist: Vec<IpNetwork>,
 
+    #[serde(default, alias = "admin_api")]
+    pub api: ApiConfig,
+
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
 }
@@ -788,6 +899,7 @@ impl Default for ServerConfig {
             proxy_protocol: false,
             metrics_port: None,
             metrics_whitelist: default_metrics_whitelist(),
+            api: ApiConfig::default(),
             listeners: Vec::new(),
         }
     }

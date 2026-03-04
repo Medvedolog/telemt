@@ -1,0 +1,424 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use super::pool::{MePool, WriterContour};
+use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
+use crate::transport::upstream::IpPreference;
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiWriterStatusSnapshot {
+    pub writer_id: u64,
+    pub dc: Option<i16>,
+    pub endpoint: SocketAddr,
+    pub generation: u64,
+    pub state: &'static str,
+    pub draining: bool,
+    pub degraded: bool,
+    pub bound_clients: usize,
+    pub idle_for_secs: Option<u64>,
+    pub rtt_ema_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiDcStatusSnapshot {
+    pub dc: i16,
+    pub endpoints: Vec<SocketAddr>,
+    pub available_endpoints: usize,
+    pub available_pct: f64,
+    pub required_writers: usize,
+    pub alive_writers: usize,
+    pub coverage_pct: f64,
+    pub rtt_ms: Option<f64>,
+    pub load: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiStatusSnapshot {
+    pub generated_at_epoch_secs: u64,
+    pub configured_dc_groups: usize,
+    pub configured_endpoints: usize,
+    pub available_endpoints: usize,
+    pub available_pct: f64,
+    pub required_writers: usize,
+    pub alive_writers: usize,
+    pub coverage_pct: f64,
+    pub writers: Vec<MeApiWriterStatusSnapshot>,
+    pub dcs: Vec<MeApiDcStatusSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiQuarantinedEndpointSnapshot {
+    pub endpoint: SocketAddr,
+    pub remaining_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiDcPathSnapshot {
+    pub dc: i16,
+    pub ip_preference: Option<&'static str>,
+    pub selected_addr_v4: Option<SocketAddr>,
+    pub selected_addr_v6: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiRuntimeSnapshot {
+    pub active_generation: u64,
+    pub warm_generation: u64,
+    pub pending_hardswap_generation: u64,
+    pub pending_hardswap_age_secs: Option<u64>,
+    pub hardswap_enabled: bool,
+    pub floor_mode: &'static str,
+    pub adaptive_floor_idle_secs: u64,
+    pub adaptive_floor_min_writers_single_endpoint: u8,
+    pub adaptive_floor_recover_grace_secs: u64,
+    pub me_keepalive_enabled: bool,
+    pub me_keepalive_interval_secs: u64,
+    pub me_keepalive_jitter_secs: u64,
+    pub me_keepalive_payload_random: bool,
+    pub rpc_proxy_req_every_secs: u64,
+    pub me_reconnect_max_concurrent_per_dc: u32,
+    pub me_reconnect_backoff_base_ms: u64,
+    pub me_reconnect_backoff_cap_ms: u64,
+    pub me_reconnect_fast_retry_count: u32,
+    pub me_pool_drain_ttl_secs: u64,
+    pub me_pool_force_close_secs: u64,
+    pub me_pool_min_fresh_ratio: f32,
+    pub me_bind_stale_mode: &'static str,
+    pub me_bind_stale_ttl_secs: u64,
+    pub me_single_endpoint_shadow_writers: u8,
+    pub me_single_endpoint_outage_mode_enabled: bool,
+    pub me_single_endpoint_outage_disable_quarantine: bool,
+    pub me_single_endpoint_outage_backoff_min_ms: u64,
+    pub me_single_endpoint_outage_backoff_max_ms: u64,
+    pub me_single_endpoint_shadow_rotate_every_secs: u64,
+    pub me_deterministic_writer_sort: bool,
+    pub me_socks_kdf_policy: &'static str,
+    pub quarantined_endpoints: Vec<MeApiQuarantinedEndpointSnapshot>,
+    pub network_path: Vec<MeApiDcPathSnapshot>,
+}
+
+impl MePool {
+    pub(crate) async fn api_status_snapshot(&self) -> MeApiStatusSnapshot {
+        let now_epoch_secs = Self::now_epoch_secs();
+
+        let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
+        if self.decision.ipv4_me {
+            let map = self.proxy_map_v4.read().await.clone();
+            for (dc, addrs) in map {
+                let abs_dc = dc.abs();
+                if abs_dc == 0 {
+                    continue;
+                }
+                let Ok(dc_idx) = i16::try_from(abs_dc) else {
+                    continue;
+                };
+                let entry = endpoints_by_dc.entry(dc_idx).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        if self.decision.ipv6_me {
+            let map = self.proxy_map_v6.read().await.clone();
+            for (dc, addrs) in map {
+                let abs_dc = dc.abs();
+                if abs_dc == 0 {
+                    continue;
+                }
+                let Ok(dc_idx) = i16::try_from(abs_dc) else {
+                    continue;
+                };
+                let entry = endpoints_by_dc.entry(dc_idx).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+
+        let mut endpoint_to_dc = HashMap::<SocketAddr, i16>::new();
+        for (dc, endpoints) in &endpoints_by_dc {
+            for endpoint in endpoints {
+                endpoint_to_dc.entry(*endpoint).or_insert(*dc);
+            }
+        }
+
+        let configured_dc_groups = endpoints_by_dc.len();
+        let configured_endpoints = endpoints_by_dc.values().map(BTreeSet::len).sum();
+
+        let required_writers = endpoints_by_dc
+            .values()
+            .map(|endpoints| self.required_writers_for_dc_with_floor_mode(endpoints.len(), false))
+            .sum();
+
+        let idle_since = self.registry.writer_idle_since_snapshot().await;
+        let activity = self.registry.writer_activity_snapshot().await;
+        let rtt = self.rtt_stats.lock().await.clone();
+        let writers = self.writers.read().await.clone();
+
+        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        let mut live_writers_by_dc = HashMap::<i16, usize>::new();
+        let mut dc_rtt_agg = HashMap::<i16, (f64, u64)>::new();
+        let mut writer_rows = Vec::<MeApiWriterStatusSnapshot>::with_capacity(writers.len());
+
+        for writer in writers {
+            let endpoint = writer.addr;
+            let dc = endpoint_to_dc.get(&endpoint).copied();
+            let draining = writer.draining.load(Ordering::Relaxed);
+            let degraded = writer.degraded.load(Ordering::Relaxed);
+            let bound_clients = activity
+                .bound_clients_by_writer
+                .get(&writer.id)
+                .copied()
+                .unwrap_or(0);
+            let idle_for_secs = idle_since
+                .get(&writer.id)
+                .map(|idle_ts| now_epoch_secs.saturating_sub(*idle_ts));
+            let rtt_ema_ms = rtt.get(&writer.id).map(|(_, ema)| *ema);
+            let state = match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
+                WriterContour::Warm => "warm",
+                WriterContour::Active => "active",
+                WriterContour::Draining => "draining",
+            };
+
+            if !draining {
+                *live_writers_by_endpoint.entry(endpoint).or_insert(0) += 1;
+                if let Some(dc_idx) = dc {
+                    *live_writers_by_dc.entry(dc_idx).or_insert(0) += 1;
+                    if let Some(ema_ms) = rtt_ema_ms {
+                        let entry = dc_rtt_agg.entry(dc_idx).or_insert((0.0, 0));
+                        entry.0 += ema_ms;
+                        entry.1 += 1;
+                    }
+                }
+            }
+
+            writer_rows.push(MeApiWriterStatusSnapshot {
+                writer_id: writer.id,
+                dc,
+                endpoint,
+                generation: writer.generation,
+                state,
+                draining,
+                degraded,
+                bound_clients,
+                idle_for_secs,
+                rtt_ema_ms,
+            });
+        }
+
+        writer_rows.sort_by_key(|row| (row.dc.unwrap_or(i16::MAX), row.endpoint, row.writer_id));
+
+        let mut dcs = Vec::<MeApiDcStatusSnapshot>::with_capacity(endpoints_by_dc.len());
+        let mut available_endpoints = 0usize;
+        let mut alive_writers = 0usize;
+        for (dc, endpoints) in endpoints_by_dc {
+            let endpoint_count = endpoints.len();
+            let dc_available_endpoints = endpoints
+                .iter()
+                .filter(|endpoint| live_writers_by_endpoint.contains_key(endpoint))
+                .count();
+            let dc_required_writers =
+                self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
+            let dc_alive_writers = live_writers_by_dc.get(&dc).copied().unwrap_or(0);
+            let dc_load = activity
+                .active_sessions_by_target_dc
+                .get(&dc)
+                .copied()
+                .unwrap_or(0);
+            let dc_rtt_ms = dc_rtt_agg
+                .get(&dc)
+                .and_then(|(sum, count)| (*count > 0).then_some(*sum / (*count as f64)));
+
+            available_endpoints += dc_available_endpoints;
+            alive_writers += dc_alive_writers;
+
+            dcs.push(MeApiDcStatusSnapshot {
+                dc,
+                endpoints: endpoints.into_iter().collect(),
+                available_endpoints: dc_available_endpoints,
+                available_pct: ratio_pct(dc_available_endpoints, endpoint_count),
+                required_writers: dc_required_writers,
+                alive_writers: dc_alive_writers,
+                coverage_pct: ratio_pct(dc_alive_writers, dc_required_writers),
+                rtt_ms: dc_rtt_ms,
+                load: dc_load,
+            });
+        }
+
+        MeApiStatusSnapshot {
+            generated_at_epoch_secs: now_epoch_secs,
+            configured_dc_groups,
+            configured_endpoints,
+            available_endpoints,
+            available_pct: ratio_pct(available_endpoints, configured_endpoints),
+            required_writers,
+            alive_writers,
+            coverage_pct: ratio_pct(alive_writers, required_writers),
+            writers: writer_rows,
+            dcs,
+        }
+    }
+
+    pub(crate) async fn api_runtime_snapshot(&self) -> MeApiRuntimeSnapshot {
+        let now = Instant::now();
+        let now_epoch_secs = Self::now_epoch_secs();
+        let pending_started_at = self
+            .pending_hardswap_started_at_epoch_secs
+            .load(Ordering::Relaxed);
+        let pending_hardswap_age_secs = (pending_started_at > 0)
+            .then_some(now_epoch_secs.saturating_sub(pending_started_at));
+
+        let mut quarantined_endpoints = Vec::<MeApiQuarantinedEndpointSnapshot>::new();
+        {
+            let guard = self.endpoint_quarantine.lock().await;
+            for (endpoint, expires_at) in guard.iter() {
+                if *expires_at <= now {
+                    continue;
+                }
+                let remaining_ms = expires_at.duration_since(now).as_millis() as u64;
+                quarantined_endpoints.push(MeApiQuarantinedEndpointSnapshot {
+                    endpoint: *endpoint,
+                    remaining_ms,
+                });
+            }
+        }
+        quarantined_endpoints.sort_by_key(|entry| entry.endpoint);
+
+        let mut network_path = Vec::<MeApiDcPathSnapshot>::new();
+        if let Some(upstream) = &self.upstream {
+            for dc in 1..=5 {
+                let dc_idx = dc as i16;
+                let ip_preference = upstream
+                    .get_dc_ip_preference(dc_idx)
+                    .await
+                    .map(ip_preference_label);
+                let selected_addr_v4 = upstream.get_dc_addr(dc_idx, false).await;
+                let selected_addr_v6 = upstream.get_dc_addr(dc_idx, true).await;
+                network_path.push(MeApiDcPathSnapshot {
+                    dc: dc_idx,
+                    ip_preference,
+                    selected_addr_v4,
+                    selected_addr_v6,
+                });
+            }
+        }
+
+        MeApiRuntimeSnapshot {
+            active_generation: self.active_generation.load(Ordering::Relaxed),
+            warm_generation: self.warm_generation.load(Ordering::Relaxed),
+            pending_hardswap_generation: self.pending_hardswap_generation.load(Ordering::Relaxed),
+            pending_hardswap_age_secs,
+            hardswap_enabled: self.hardswap.load(Ordering::Relaxed),
+            floor_mode: floor_mode_label(self.floor_mode()),
+            adaptive_floor_idle_secs: self.me_adaptive_floor_idle_secs.load(Ordering::Relaxed),
+            adaptive_floor_min_writers_single_endpoint: self
+                .me_adaptive_floor_min_writers_single_endpoint
+                .load(Ordering::Relaxed),
+            adaptive_floor_recover_grace_secs: self
+                .me_adaptive_floor_recover_grace_secs
+                .load(Ordering::Relaxed),
+            me_keepalive_enabled: self.me_keepalive_enabled,
+            me_keepalive_interval_secs: self.me_keepalive_interval.as_secs(),
+            me_keepalive_jitter_secs: self.me_keepalive_jitter.as_secs(),
+            me_keepalive_payload_random: self.me_keepalive_payload_random,
+            rpc_proxy_req_every_secs: self.rpc_proxy_req_every_secs.load(Ordering::Relaxed),
+            me_reconnect_max_concurrent_per_dc: self.me_reconnect_max_concurrent_per_dc,
+            me_reconnect_backoff_base_ms: self.me_reconnect_backoff_base.as_millis() as u64,
+            me_reconnect_backoff_cap_ms: self.me_reconnect_backoff_cap.as_millis() as u64,
+            me_reconnect_fast_retry_count: self.me_reconnect_fast_retry_count,
+            me_pool_drain_ttl_secs: self.me_pool_drain_ttl_secs.load(Ordering::Relaxed),
+            me_pool_force_close_secs: self.me_pool_force_close_secs.load(Ordering::Relaxed),
+            me_pool_min_fresh_ratio: Self::permille_to_ratio(
+                self.me_pool_min_fresh_ratio_permille.load(Ordering::Relaxed),
+            ),
+            me_bind_stale_mode: bind_stale_mode_label(self.bind_stale_mode()),
+            me_bind_stale_ttl_secs: self.me_bind_stale_ttl_secs.load(Ordering::Relaxed),
+            me_single_endpoint_shadow_writers: self
+                .me_single_endpoint_shadow_writers
+                .load(Ordering::Relaxed),
+            me_single_endpoint_outage_mode_enabled: self
+                .me_single_endpoint_outage_mode_enabled
+                .load(Ordering::Relaxed),
+            me_single_endpoint_outage_disable_quarantine: self
+                .me_single_endpoint_outage_disable_quarantine
+                .load(Ordering::Relaxed),
+            me_single_endpoint_outage_backoff_min_ms: self
+                .me_single_endpoint_outage_backoff_min_ms
+                .load(Ordering::Relaxed),
+            me_single_endpoint_outage_backoff_max_ms: self
+                .me_single_endpoint_outage_backoff_max_ms
+                .load(Ordering::Relaxed),
+            me_single_endpoint_shadow_rotate_every_secs: self
+                .me_single_endpoint_shadow_rotate_every_secs
+                .load(Ordering::Relaxed),
+            me_deterministic_writer_sort: self
+                .me_deterministic_writer_sort
+                .load(Ordering::Relaxed),
+            me_socks_kdf_policy: socks_kdf_policy_label(self.socks_kdf_policy()),
+            quarantined_endpoints,
+            network_path,
+        }
+    }
+}
+
+fn ratio_pct(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let pct = ((part as f64) / (total as f64)) * 100.0;
+    pct.clamp(0.0, 100.0)
+}
+
+fn floor_mode_label(mode: MeFloorMode) -> &'static str {
+    match mode {
+        MeFloorMode::Static => "static",
+        MeFloorMode::Adaptive => "adaptive",
+    }
+}
+
+fn bind_stale_mode_label(mode: MeBindStaleMode) -> &'static str {
+    match mode {
+        MeBindStaleMode::Never => "never",
+        MeBindStaleMode::Ttl => "ttl",
+        MeBindStaleMode::Always => "always",
+    }
+}
+
+fn socks_kdf_policy_label(policy: MeSocksKdfPolicy) -> &'static str {
+    match policy {
+        MeSocksKdfPolicy::Strict => "strict",
+        MeSocksKdfPolicy::Compat => "compat",
+    }
+}
+
+fn ip_preference_label(preference: IpPreference) -> &'static str {
+    match preference {
+        IpPreference::Unknown => "unknown",
+        IpPreference::PreferV6 => "prefer_v6",
+        IpPreference::PreferV4 => "prefer_v4",
+        IpPreference::BothWork => "both",
+        IpPreference::Unavailable => "unavailable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ratio_pct;
+
+    #[test]
+    fn ratio_pct_is_zero_when_denominator_is_zero() {
+        assert_eq!(ratio_pct(1, 0), 0.0);
+    }
+
+    #[test]
+    fn ratio_pct_is_capped_at_100() {
+        assert_eq!(ratio_pct(7, 3), 100.0);
+    }
+
+    #[test]
+    fn ratio_pct_reports_expected_value() {
+        assert_eq!(ratio_pct(1, 4), 25.0);
+    }
+}

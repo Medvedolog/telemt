@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::mpsc::error::TrySendError;
@@ -45,12 +45,20 @@ pub struct ConnWriter {
     pub tx: mpsc::Sender<WriterCommand>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct WriterActivitySnapshot {
+    pub bound_clients_by_writer: HashMap<u64, usize>,
+    pub active_sessions_by_target_dc: HashMap<i16, usize>,
+}
+
 struct RegistryInner {
     map: HashMap<u64, mpsc::Sender<MeResponse>>,
     writers: HashMap<u64, mpsc::Sender<WriterCommand>>,
     writer_for_conn: HashMap<u64, u64>,
     conns_for_writer: HashMap<u64, HashSet<u64>>,
     meta: HashMap<u64, ConnMeta>,
+    last_meta_for_writer: HashMap<u64, ConnMeta>,
+    writer_idle_since_epoch_secs: HashMap<u64, u64>,
 }
 
 impl RegistryInner {
@@ -61,6 +69,8 @@ impl RegistryInner {
             writer_for_conn: HashMap::new(),
             conns_for_writer: HashMap::new(),
             meta: HashMap::new(),
+            last_meta_for_writer: HashMap::new(),
+            writer_idle_since_epoch_secs: HashMap::new(),
         }
     }
 }
@@ -74,6 +84,13 @@ pub struct ConnRegistry {
 }
 
 impl ConnRegistry {
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     pub fn new() -> Self {
         let start = rand::random::<u64>() | 1;
         Self {
@@ -121,8 +138,16 @@ impl ConnRegistry {
         inner.map.remove(&id);
         inner.meta.remove(&id);
         if let Some(writer_id) = inner.writer_for_conn.remove(&id) {
-            if let Some(set) = inner.conns_for_writer.get_mut(&writer_id) {
+            let became_empty = if let Some(set) = inner.conns_for_writer.get_mut(&writer_id) {
                 set.remove(&id);
+                set.is_empty()
+            } else {
+                false
+            };
+            if became_empty {
+                inner
+                    .writer_idle_since_epoch_secs
+                    .insert(writer_id, Self::now_epoch_secs());
             }
             return Some(writer_id);
         }
@@ -191,14 +216,59 @@ impl ConnRegistry {
         meta: ConnMeta,
     ) {
         let mut inner = self.inner.write().await;
-        inner.meta.entry(conn_id).or_insert(meta);
+        inner.meta.entry(conn_id).or_insert(meta.clone());
         inner.writer_for_conn.insert(conn_id, writer_id);
+        inner.last_meta_for_writer.insert(writer_id, meta);
+        inner.writer_idle_since_epoch_secs.remove(&writer_id);
         inner.writers.entry(writer_id).or_insert_with(|| tx.clone());
         inner
             .conns_for_writer
             .entry(writer_id)
             .or_insert_with(HashSet::new)
             .insert(conn_id);
+    }
+
+    pub async fn mark_writer_idle(&self, writer_id: u64) {
+        let mut inner = self.inner.write().await;
+        inner.conns_for_writer.entry(writer_id).or_insert_with(HashSet::new);
+        inner
+            .writer_idle_since_epoch_secs
+            .entry(writer_id)
+            .or_insert(Self::now_epoch_secs());
+    }
+
+    pub async fn get_last_writer_meta(&self, writer_id: u64) -> Option<ConnMeta> {
+        let inner = self.inner.read().await;
+        inner.last_meta_for_writer.get(&writer_id).cloned()
+    }
+
+    pub async fn writer_idle_since_snapshot(&self) -> HashMap<u64, u64> {
+        let inner = self.inner.read().await;
+        inner.writer_idle_since_epoch_secs.clone()
+    }
+
+    pub(super) async fn writer_activity_snapshot(&self) -> WriterActivitySnapshot {
+        let inner = self.inner.read().await;
+        let mut bound_clients_by_writer = HashMap::<u64, usize>::new();
+        let mut active_sessions_by_target_dc = HashMap::<i16, usize>::new();
+
+        for (writer_id, conn_ids) in &inner.conns_for_writer {
+            bound_clients_by_writer.insert(*writer_id, conn_ids.len());
+        }
+        for conn_meta in inner.meta.values() {
+            let dc_u16 = conn_meta.target_dc.unsigned_abs();
+            if dc_u16 == 0 {
+                continue;
+            }
+            if let Ok(dc) = i16::try_from(dc_u16) {
+                *active_sessions_by_target_dc.entry(dc).or_insert(0) += 1;
+            }
+        }
+
+        WriterActivitySnapshot {
+            bound_clients_by_writer,
+            active_sessions_by_target_dc,
+        }
     }
 
     pub async fn get_writer(&self, conn_id: u64) -> Option<ConnWriter> {
@@ -211,6 +281,8 @@ impl ConnRegistry {
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
         let mut inner = self.inner.write().await;
         inner.writers.remove(&writer_id);
+        inner.last_meta_for_writer.remove(&writer_id);
+        inner.writer_idle_since_epoch_secs.remove(&writer_id);
         let conns = inner
             .conns_for_writer
             .remove(&writer_id)
@@ -244,5 +316,71 @@ impl ConnRegistry {
             .get(&writer_id)
             .map(|s| s.is_empty())
             .unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::ConnMeta;
+    use super::ConnRegistry;
+
+    #[tokio::test]
+    async fn writer_activity_snapshot_tracks_writer_and_dc_load() {
+        let registry = ConnRegistry::new();
+
+        let (conn_a, _rx_a) = registry.register().await;
+        let (conn_b, _rx_b) = registry.register().await;
+        let (conn_c, _rx_c) = registry.register().await;
+        let (writer_tx_a, _writer_rx_a) = tokio::sync::mpsc::channel(8);
+        let (writer_tx_b, _writer_rx_b) = tokio::sync::mpsc::channel(8);
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        registry
+            .bind_writer(
+                conn_a,
+                10,
+                writer_tx_a.clone(),
+                ConnMeta {
+                    target_dc: 2,
+                    client_addr: addr,
+                    our_addr: addr,
+                    proto_flags: 0,
+                },
+            )
+            .await;
+        registry
+            .bind_writer(
+                conn_b,
+                10,
+                writer_tx_a,
+                ConnMeta {
+                    target_dc: -2,
+                    client_addr: addr,
+                    our_addr: addr,
+                    proto_flags: 0,
+                },
+            )
+            .await;
+        registry
+            .bind_writer(
+                conn_c,
+                20,
+                writer_tx_b,
+                ConnMeta {
+                    target_dc: 4,
+                    client_addr: addr,
+                    our_addr: addr,
+                    proto_flags: 0,
+                },
+            )
+            .await;
+
+        let snapshot = registry.writer_activity_snapshot().await;
+        assert_eq!(snapshot.bound_clients_by_writer.get(&10), Some(&2));
+        assert_eq!(snapshot.bound_clients_by_writer.get(&20), Some(&1));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&2), Some(&2));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&4), Some(&1));
     }
 }

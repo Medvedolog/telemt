@@ -1,5 +1,7 @@
 # Telemt - MTProxy on Rust + Tokio
 
+***Löst Probleme, bevor andere überhaupt wissen, dass sie existieren*** / ***It solves problems before others even realize they exist***
+
 **Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as connection pooling, replay protection, detailed statistics, masking from "prying" eyes
 
 [**Telemt Chat in Telegram**](https://t.me/telemtrs)
@@ -110,110 +112,11 @@ We welcome ideas, architectural feedback, and pull requests.
 - Extensive logging via `trace` and `debug` with `RUST_LOG` method
 
 ## Quick Start Guide
-**This software is designed for Debian-based OS: in addition to Debian, these are Ubuntu, Mint, Kali, MX and many other Linux**
-1. Download release
-```bash
-wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-$(uname -m)-linux-$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu).tar.gz" | tar -xz
-```
-2. Move to Bin Folder
-```bash
-mv telemt /bin
-```
-4. Make Executable
-```bash
-chmod +x /bin/telemt
-```
-5. Go to [How to use?](#how-to-use) section for for further steps
 
-## How to use?
-### Telemt via Systemd
-**This instruction "assume" that you:**
-- logged in as root or executed `su -` / `sudo su`
-- you already have an assembled and executable `telemt` in /bin folder as a result of the [Quick Start Guide](#quick-start-guide) or [Build](#build)
+### [Quick Start Guid RU](docs/QUICK_START_GUIDE.ru.md)  
+### [Quick Start Guid EN](docs/QUICK_START_GUIDE.en.md)
 
-**0. Check port and generate secrets**
 
-The port you have selected for use should be MISSING from the list, when:
-```bash
-netstat -lnp
-```
-
-Generate 16 bytes/32 characters HEX with OpenSSL or another way:
-```bash
-openssl rand -hex 16
-```
-OR
-```bash
-xxd -l 16 -p /dev/urandom
-```
-OR
-```bash
-python3 -c 'import os; print(os.urandom(16).hex())'
-```
-
-**1. Place your config to /etc/telemt.toml**
-
-Open nano
-```bash
-nano /etc/telemt.toml
-```
-paste your config from [Configuration](#configuration) section
-
-then Ctrl+X -> Y -> Enter to save
-
-**2. Create service on /etc/systemd/system/telemt.service**
-
-Open nano
-```bash
-nano /etc/systemd/system/telemt.service
-```
-paste this Systemd Module
-```bash
-[Unit]
-Description=Telemt
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/bin
-ExecStart=/bin/telemt /etc/telemt.toml
-Restart=on-failure
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-then Ctrl+X -> Y -> Enter to save
-
-**3.**  In Shell type `systemctl start telemt` - it must start with zero exit-code
-
-**4.** In Shell type `systemctl status telemt` - there you can reach info about current MTProxy status
-
-**5.** In Shell type `systemctl enable telemt` - then telemt will start with system startup, after the network is up
-
-**6.** In Shell type `journalctl -u telemt -n -g "links" --no-pager -o cat | tac` - get the connection links
-
-## Configuration
-### Minimal Configuration for First Start
-```toml
-# === General Settings ===
-[general]
-# ad_tag = "00000000000000000000000000000000"
-
-[general.modes]
-classic = false
-secure = false
-tls = true
-
-# === Anti-Censorship & Masking ===
-[censorship]
-tls_domain = "petrovich.ru"
-
-[access.users]
-# format: "username" = "32_hex_chars_secret"
-hello = "00000000000000000000000000000000"
-
-```
 ### Advanced
 #### Adtag (per-user)
 To use channel advertising and usage statistics from Telegram, get an Adtag from [@mtproxybot](https://t.me/mtproxybot). Set it per user in `[access.user_ad_tags]` (32 hex chars):

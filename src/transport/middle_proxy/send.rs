@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,6 +18,9 @@ use super::pool::WriterContour;
 use super::wire::build_proxy_req_payload;
 use rand::seq::SliceRandom;
 use super::registry::ConnMeta;
+
+const IDLE_WRITER_PENALTY_MID_SECS: u64 = 45;
+const IDLE_WRITER_PENALTY_HIGH_SECS: u64 = 55;
 
 impl MePool {
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
@@ -152,6 +156,8 @@ impl MePool {
                     return Err(ProxyError::Proxy("No ME writers available for target DC".into()));
                 }
             }
+            let writer_idle_since = self.registry.writer_idle_since_snapshot().await;
+            let now_epoch_secs = Self::now_epoch_secs();
 
             if self.me_deterministic_writer_sort.load(Ordering::Relaxed) {
                 candidate_indices.sort_by(|lhs, rhs| {
@@ -161,6 +167,11 @@ impl MePool {
                         self.writer_contour_rank_for_selection(left),
                         (left.generation < self.current_generation()) as usize,
                         left.degraded.load(Ordering::Relaxed) as usize,
+                        self.writer_idle_rank_for_selection(
+                            left,
+                            &writer_idle_since,
+                            now_epoch_secs,
+                        ),
                         Reverse(left.tx.capacity()),
                         left.addr,
                         left.id,
@@ -169,6 +180,11 @@ impl MePool {
                         self.writer_contour_rank_for_selection(right),
                         (right.generation < self.current_generation()) as usize,
                         right.degraded.load(Ordering::Relaxed) as usize,
+                        self.writer_idle_rank_for_selection(
+                            right,
+                            &writer_idle_since,
+                            now_epoch_secs,
+                        ),
                         Reverse(right.tx.capacity()),
                         right.addr,
                         right.id,
@@ -184,6 +200,11 @@ impl MePool {
                         self.writer_contour_rank_for_selection(w),
                         stale,
                         degraded as usize,
+                        self.writer_idle_rank_for_selection(
+                            w,
+                            &writer_idle_since,
+                            now_epoch_secs,
+                        ),
                         Reverse(w.tx.capacity()),
                     )
                 });
@@ -365,6 +386,25 @@ impl MePool {
             WriterContour::Active => 0,
             WriterContour::Warm => 1,
             WriterContour::Draining => 2,
+        }
+    }
+
+    fn writer_idle_rank_for_selection(
+        &self,
+        writer: &super::pool::MeWriter,
+        idle_since_by_writer: &HashMap<u64, u64>,
+        now_epoch_secs: u64,
+    ) -> usize {
+        let Some(idle_since) = idle_since_by_writer.get(&writer.id).copied() else {
+            return 0;
+        };
+        let idle_age_secs = now_epoch_secs.saturating_sub(idle_since);
+        if idle_age_secs >= IDLE_WRITER_PENALTY_HIGH_SECS {
+            2
+        } else if idle_age_secs >= IDLE_WRITER_PENALTY_MID_SECS {
+            1
+        } else {
+            0
         }
     }
 }

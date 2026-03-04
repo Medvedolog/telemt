@@ -26,18 +26,41 @@ pub struct Stats {
     connects_all: AtomicU64,
     connects_bad: AtomicU64,
     handshake_timeouts: AtomicU64,
+    upstream_connect_attempt_total: AtomicU64,
+    upstream_connect_success_total: AtomicU64,
+    upstream_connect_fail_total: AtomicU64,
+    upstream_connect_failfast_hard_error_total: AtomicU64,
+    upstream_connect_attempts_bucket_1: AtomicU64,
+    upstream_connect_attempts_bucket_2: AtomicU64,
+    upstream_connect_attempts_bucket_3_4: AtomicU64,
+    upstream_connect_attempts_bucket_gt_4: AtomicU64,
+    upstream_connect_duration_success_bucket_le_100ms: AtomicU64,
+    upstream_connect_duration_success_bucket_101_500ms: AtomicU64,
+    upstream_connect_duration_success_bucket_501_1000ms: AtomicU64,
+    upstream_connect_duration_success_bucket_gt_1000ms: AtomicU64,
+    upstream_connect_duration_fail_bucket_le_100ms: AtomicU64,
+    upstream_connect_duration_fail_bucket_101_500ms: AtomicU64,
+    upstream_connect_duration_fail_bucket_501_1000ms: AtomicU64,
+    upstream_connect_duration_fail_bucket_gt_1000ms: AtomicU64,
     me_keepalive_sent: AtomicU64,
     me_keepalive_failed: AtomicU64,
     me_keepalive_pong: AtomicU64,
     me_keepalive_timeout: AtomicU64,
+    me_rpc_proxy_req_signal_sent_total: AtomicU64,
+    me_rpc_proxy_req_signal_failed_total: AtomicU64,
+    me_rpc_proxy_req_signal_skipped_no_meta_total: AtomicU64,
+    me_rpc_proxy_req_signal_response_total: AtomicU64,
+    me_rpc_proxy_req_signal_close_sent_total: AtomicU64,
     me_reconnect_attempts: AtomicU64,
     me_reconnect_success: AtomicU64,
     me_handshake_reject_total: AtomicU64,
     me_reader_eof_total: AtomicU64,
+    me_idle_close_by_peer_total: AtomicU64,
     me_crc_mismatch: AtomicU64,
     me_seq_mismatch: AtomicU64,
     me_endpoint_quarantine_total: AtomicU64,
     me_kdf_drift_total: AtomicU64,
+    me_kdf_port_only_drift_total: AtomicU64,
     me_hardswap_pending_reuse_total: AtomicU64,
     me_hardswap_pending_ttl_expired_total: AtomicU64,
     me_single_endpoint_outage_enter_total: AtomicU64,
@@ -46,6 +69,10 @@ pub struct Stats {
     me_single_endpoint_outage_reconnect_success_total: AtomicU64,
     me_single_endpoint_quarantine_bypass_total: AtomicU64,
     me_single_endpoint_shadow_rotate_total: AtomicU64,
+    me_single_endpoint_shadow_rotate_skipped_quarantine_total: AtomicU64,
+    me_floor_mode_switch_total: AtomicU64,
+    me_floor_mode_switch_static_to_adaptive_total: AtomicU64,
+    me_floor_mode_switch_adaptive_to_static_total: AtomicU64,
     me_handshake_error_codes: DashMap<i32, AtomicU64>,
     me_route_drop_no_conn: AtomicU64,
     me_route_drop_channel_closed: AtomicU64,
@@ -150,6 +177,99 @@ impl Stats {
             self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_upstream_connect_attempt_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.upstream_connect_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_upstream_connect_success_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.upstream_connect_success_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_upstream_connect_fail_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.upstream_connect_fail_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_upstream_connect_failfast_hard_error_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.upstream_connect_failfast_hard_error_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn observe_upstream_connect_attempts_per_request(&self, attempts: u32) {
+        if !self.telemetry_core_enabled() {
+            return;
+        }
+        match attempts {
+            0 => {}
+            1 => {
+                self.upstream_connect_attempts_bucket_1
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            2 => {
+                self.upstream_connect_attempts_bucket_2
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            3..=4 => {
+                self.upstream_connect_attempts_bucket_3_4
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.upstream_connect_attempts_bucket_gt_4
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn observe_upstream_connect_duration_ms(&self, duration_ms: u64, success: bool) {
+        if !self.telemetry_core_enabled() {
+            return;
+        }
+        let bucket = match duration_ms {
+            0..=100 => 0u8,
+            101..=500 => 1u8,
+            501..=1000 => 2u8,
+            _ => 3u8,
+        };
+        match (success, bucket) {
+            (true, 0) => {
+                self.upstream_connect_duration_success_bucket_le_100ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (true, 1) => {
+                self.upstream_connect_duration_success_bucket_101_500ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (true, 2) => {
+                self.upstream_connect_duration_success_bucket_501_1000ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (true, _) => {
+                self.upstream_connect_duration_success_bucket_gt_1000ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (false, 0) => {
+                self.upstream_connect_duration_fail_bucket_le_100ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (false, 1) => {
+                self.upstream_connect_duration_fail_bucket_101_500ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (false, 2) => {
+                self.upstream_connect_duration_fail_bucket_501_1000ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (false, _) => {
+                self.upstream_connect_duration_fail_bucket_gt_1000ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     pub fn increment_me_keepalive_sent(&self) {
         if self.telemetry_me_allows_debug() {
             self.me_keepalive_sent.fetch_add(1, Ordering::Relaxed);
@@ -173,6 +293,36 @@ impl Stats {
     pub fn increment_me_keepalive_timeout_by(&self, value: u64) {
         if self.telemetry_me_allows_normal() {
             self.me_keepalive_timeout.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_sent_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_sent_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_failed_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_skipped_no_meta_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_skipped_no_meta_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_response_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_response_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_close_sent_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_close_sent_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_reconnect_attempt(&self) {
@@ -203,6 +353,12 @@ impl Stats {
     pub fn increment_me_reader_eof_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_reader_eof_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_idle_close_by_peer_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_idle_close_by_peer_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_crc_mismatch(&self) {
@@ -290,7 +446,7 @@ impl Stats {
         }
     }
     pub fn increment_pool_swap_total(&self) {
-        if self.telemetry_me_allows_debug() {
+        if self.telemetry_me_allows_normal() {
             self.pool_swap_total.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -377,6 +533,12 @@ impl Stats {
             self.me_kdf_drift_total.fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_kdf_port_only_drift_total(&self) {
+        if self.telemetry_me_allows_debug() {
+            self.me_kdf_port_only_drift_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_hardswap_pending_reuse_total(&self) {
         if self.telemetry_me_allows_debug() {
             self.me_hardswap_pending_reuse_total
@@ -425,12 +587,56 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_single_endpoint_shadow_rotate_skipped_quarantine_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_shadow_rotate_skipped_quarantine_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_mode_switch_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_mode_switch_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_mode_switch_static_to_adaptive_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_mode_switch_static_to_adaptive_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_mode_switch_adaptive_to_static_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_mode_switch_adaptive_to_static_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn get_connects_all(&self) -> u64 { self.connects_all.load(Ordering::Relaxed) }
     pub fn get_connects_bad(&self) -> u64 { self.connects_bad.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_sent(&self) -> u64 { self.me_keepalive_sent.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_failed(&self) -> u64 { self.me_keepalive_failed.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_pong(&self) -> u64 { self.me_keepalive_pong.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_timeout(&self) -> u64 { self.me_keepalive_timeout.load(Ordering::Relaxed) }
+    pub fn get_me_rpc_proxy_req_signal_sent_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_sent_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_failed_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_failed_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_skipped_no_meta_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_skipped_no_meta_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_response_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_response_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_close_sent_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_close_sent_total
+            .load(Ordering::Relaxed)
+    }
     pub fn get_me_reconnect_attempts(&self) -> u64 { self.me_reconnect_attempts.load(Ordering::Relaxed) }
     pub fn get_me_reconnect_success(&self) -> u64 { self.me_reconnect_success.load(Ordering::Relaxed) }
     pub fn get_me_handshake_reject_total(&self) -> u64 {
@@ -439,6 +645,9 @@ impl Stats {
     pub fn get_me_reader_eof_total(&self) -> u64 {
         self.me_reader_eof_total.load(Ordering::Relaxed)
     }
+    pub fn get_me_idle_close_by_peer_total(&self) -> u64 {
+        self.me_idle_close_by_peer_total.load(Ordering::Relaxed)
+    }
     pub fn get_me_crc_mismatch(&self) -> u64 { self.me_crc_mismatch.load(Ordering::Relaxed) }
     pub fn get_me_seq_mismatch(&self) -> u64 { self.me_seq_mismatch.load(Ordering::Relaxed) }
     pub fn get_me_endpoint_quarantine_total(&self) -> u64 {
@@ -446,6 +655,9 @@ impl Stats {
     }
     pub fn get_me_kdf_drift_total(&self) -> u64 {
         self.me_kdf_drift_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_kdf_port_only_drift_total(&self) -> u64 {
+        self.me_kdf_port_only_drift_total.load(Ordering::Relaxed)
     }
     pub fn get_me_hardswap_pending_reuse_total(&self) -> u64 {
         self.me_hardswap_pending_reuse_total
@@ -477,6 +689,21 @@ impl Stats {
     }
     pub fn get_me_single_endpoint_shadow_rotate_total(&self) -> u64 {
         self.me_single_endpoint_shadow_rotate_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_shadow_rotate_skipped_quarantine_total(&self) -> u64 {
+        self.me_single_endpoint_shadow_rotate_skipped_quarantine_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_mode_switch_total(&self) -> u64 {
+        self.me_floor_mode_switch_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_mode_switch_static_to_adaptive_total(&self) -> u64 {
+        self.me_floor_mode_switch_static_to_adaptive_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_mode_switch_adaptive_to_static_total(&self) -> u64 {
+        self.me_floor_mode_switch_adaptive_to_static_total
             .load(Ordering::Relaxed)
     }
     pub fn get_me_handshake_error_code_counts(&self) -> Vec<(i32, u64)> {
@@ -650,6 +877,65 @@ impl Stats {
     }
     
     pub fn get_handshake_timeouts(&self) -> u64 { self.handshake_timeouts.load(Ordering::Relaxed) }
+    pub fn get_upstream_connect_attempt_total(&self) -> u64 {
+        self.upstream_connect_attempt_total.load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_success_total(&self) -> u64 {
+        self.upstream_connect_success_total.load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_fail_total(&self) -> u64 {
+        self.upstream_connect_fail_total.load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_failfast_hard_error_total(&self) -> u64 {
+        self.upstream_connect_failfast_hard_error_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_attempts_bucket_1(&self) -> u64 {
+        self.upstream_connect_attempts_bucket_1.load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_attempts_bucket_2(&self) -> u64 {
+        self.upstream_connect_attempts_bucket_2.load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_attempts_bucket_3_4(&self) -> u64 {
+        self.upstream_connect_attempts_bucket_3_4
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_attempts_bucket_gt_4(&self) -> u64 {
+        self.upstream_connect_attempts_bucket_gt_4
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_success_bucket_le_100ms(&self) -> u64 {
+        self.upstream_connect_duration_success_bucket_le_100ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_success_bucket_101_500ms(&self) -> u64 {
+        self.upstream_connect_duration_success_bucket_101_500ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_success_bucket_501_1000ms(&self) -> u64 {
+        self.upstream_connect_duration_success_bucket_501_1000ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_success_bucket_gt_1000ms(&self) -> u64 {
+        self.upstream_connect_duration_success_bucket_gt_1000ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_fail_bucket_le_100ms(&self) -> u64 {
+        self.upstream_connect_duration_fail_bucket_le_100ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_fail_bucket_101_500ms(&self) -> u64 {
+        self.upstream_connect_duration_fail_bucket_101_500ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_fail_bucket_501_1000ms(&self) -> u64 {
+        self.upstream_connect_duration_fail_bucket_501_1000ms
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_upstream_connect_duration_fail_bucket_gt_1000ms(&self) -> u64 {
+        self.upstream_connect_duration_fail_bucket_gt_1000ms
+            .load(Ordering::Relaxed)
+    }
 
     pub fn iter_user_stats(&self) -> dashmap::iter::Iter<'_, String, UserStats> {
         self.user_stats.iter()

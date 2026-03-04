@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 use tokio::net::UnixListener;
 
 mod cli;
+mod api;
 mod config;
 mod crypto;
 mod error;
@@ -261,11 +262,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         warn!("Using default tls_domain. Consider setting a custom domain.");
     }
 
+    let stats = Arc::new(Stats::new());
+    stats.apply_telemetry_policy(TelemetryPolicy::from_config(&config.general.telemetry));
+
     let upstream_manager = Arc::new(UpstreamManager::new(
         config.upstreams.clone(),
         config.general.upstream_connect_retry_attempts,
         config.general.upstream_connect_retry_backoff_ms,
         config.general.upstream_unhealthy_fail_threshold,
+        config.general.upstream_connect_failfast_hard_errors,
+        stats.clone(),
     ));
 
     let mut tls_domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
@@ -411,8 +417,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let prefer_ipv6 = decision.prefer_ipv6();
     let mut use_middle_proxy = config.general.use_middle_proxy && (decision.ipv4_me || decision.ipv6_me);
-    let stats = Arc::new(Stats::new());
-    stats.apply_telemetry_policy(TelemetryPolicy::from_config(&config.general.telemetry));
     let beobachten = Arc::new(BeobachtenStore::new());
     let rng = Arc::new(SecureRandom::new());
 
@@ -531,6 +535,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     config.general.me_keepalive_interval_secs,
                     config.general.me_keepalive_jitter_secs,
                     config.general.me_keepalive_payload_random,
+                    config.general.rpc_proxy_req_every,
                     config.general.me_warmup_stagger_enabled,
                     config.general.me_warmup_step_delay_ms,
                     config.general.me_warmup_step_jitter_ms,
@@ -544,6 +549,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     config.general.me_single_endpoint_outage_backoff_min_ms,
                     config.general.me_single_endpoint_outage_backoff_max_ms,
                     config.general.me_single_endpoint_shadow_rotate_every_secs,
+                    config.general.me_floor_mode,
+                    config.general.me_adaptive_floor_idle_secs,
+                    config.general.me_adaptive_floor_min_writers_single_endpoint,
+                    config.general.me_adaptive_floor_recover_grace_secs,
                     config.general.hardswap,
                     config.general.me_pool_drain_ttl_secs,
                     config.general.effective_me_pool_force_close_secs(),
@@ -1142,6 +1151,44 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )
             .await;
         });
+    }
+
+    if config.server.api.enabled {
+        let listen = match config.server.api.listen.parse::<SocketAddr>() {
+            Ok(listen) => listen,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    listen = %config.server.api.listen,
+                    "Invalid server.api.listen; API is disabled"
+                );
+                SocketAddr::from(([127, 0, 0, 1], 0))
+            }
+        };
+        if listen.port() != 0 {
+            let stats = stats.clone();
+            let ip_tracker_api = ip_tracker.clone();
+            let me_pool_api = me_pool.clone();
+            let upstream_manager_api = upstream_manager.clone();
+            let config_rx_api = config_rx.clone();
+            let config_path_api = std::path::PathBuf::from(&config_path);
+            let startup_detected_ip_v4 = detected_ip_v4;
+            let startup_detected_ip_v6 = detected_ip_v6;
+            tokio::spawn(async move {
+                api::serve(
+                    listen,
+                    stats,
+                    ip_tracker_api,
+                    me_pool_api,
+                    upstream_manager_api,
+                    config_rx_api,
+                    config_path_api,
+                    startup_detected_ip_v4,
+                    startup_detected_ip_v6,
+                )
+                .await;
+            });
+        }
     }
 
     for (listener, listener_proxy_protocol) in listeners {

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::io::ErrorKind;
 
 use bytes::BytesMut;
 use rand::Rng;
@@ -12,16 +13,22 @@ use tracing::{debug, info, warn};
 use crate::config::MeBindStaleMode;
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
-use crate::protocol::constants::RPC_PING_U32;
+use crate::protocol::constants::{RPC_CLOSE_EXT_U32, RPC_PING_U32};
 
 use super::codec::{RpcWriter, WriterCommand};
 use super::pool::{MePool, MeWriter, WriterContour};
 use super::reader::reader_loop;
 use super::registry::BoundConn;
+use super::wire::build_proxy_req_payload;
 
 const ME_ACTIVE_PING_SECS: u64 = 25;
 const ME_ACTIVE_PING_JITTER_SECS: i64 = 5;
 const ME_IDLE_KEEPALIVE_MAX_SECS: u64 = 5;
+const ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS: u64 = 700;
+
+fn is_me_peer_closed_error(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::Io(ioe) if ioe.kind() == ErrorKind::UnexpectedEof)
+}
 
 impl MePool {
     pub(crate) async fn prune_closed_writers(self: &Arc<Self>) {
@@ -115,6 +122,7 @@ impl MePool {
             allow_drain_fallback: allow_drain_fallback.clone(),
         };
         self.writers.write().await.push(writer.clone());
+        self.registry.mark_writer_idle(writer_id).await;
         self.conn_count.fetch_add(1, Ordering::Relaxed);
         self.writer_available.notify_one();
 
@@ -124,6 +132,7 @@ impl MePool {
         let ping_tracker_reader = ping_tracker.clone();
         let rtt_stats = self.rtt_stats.clone();
         let stats_reader = self.stats.clone();
+        let stats_reader_close = self.stats.clone();
         let stats_ping = self.stats.clone();
         let pool = Arc::downgrade(self);
         let cancel_ping = cancel.clone();
@@ -135,6 +144,13 @@ impl MePool {
         let keepalive_enabled = self.me_keepalive_enabled;
         let keepalive_interval = self.me_keepalive_interval;
         let keepalive_jitter = self.me_keepalive_jitter;
+        let rpc_proxy_req_every_secs = self.rpc_proxy_req_every_secs.load(Ordering::Relaxed);
+        let tx_signal = tx.clone();
+        let stats_signal = self.stats.clone();
+        let cancel_signal = cancel.clone();
+        let cleanup_for_signal = cleanup_done.clone();
+        let pool_signal = Arc::downgrade(self);
+        let keepalive_jitter_signal = self.me_keepalive_jitter;
         let cancel_reader_token = cancel.clone();
         let cancel_ping_token = cancel_ping.clone();
 
@@ -156,6 +172,15 @@ impl MePool {
                 cancel_reader_token.clone(),
             )
             .await;
+            let idle_close_by_peer = if let Err(e) = res.as_ref() {
+                is_me_peer_closed_error(e) && reg.is_writer_empty(writer_id).await
+            } else {
+                false
+            };
+            if idle_close_by_peer {
+                stats_reader_close.increment_me_idle_close_by_peer_total();
+                info!(writer_id, "ME socket closed by peer on idle writer");
+            }
             if let Some(pool) = pool.upgrade()
                 && cleanup_for_reader
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -164,7 +189,9 @@ impl MePool {
                 pool.remove_writer_and_close_clients(writer_id).await;
             }
             if let Err(e) = res {
-                warn!(error = %e, "ME reader ended");
+                if !idle_close_by_peer {
+                    warn!(error = %e, "ME reader ended");
+                }
             }
             let mut ws = writers_arc.write().await;
             ws.retain(|w| w.id != writer_id);
@@ -250,6 +277,116 @@ impl MePool {
                     }
                     break;
                 }
+            }
+        });
+
+        tokio::spawn(async move {
+            if rpc_proxy_req_every_secs == 0 {
+                return;
+            }
+
+            let interval = Duration::from_secs(rpc_proxy_req_every_secs);
+            let startup_jitter_ms = {
+                let jitter_cap_ms = interval.as_millis() / 2;
+                let effective_jitter_ms = keepalive_jitter_signal
+                    .as_millis()
+                    .min(jitter_cap_ms)
+                    .max(1);
+                rand::rng().random_range(0..=effective_jitter_ms as u64)
+            };
+
+            tokio::select! {
+                _ = cancel_signal.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(startup_jitter_ms)) => {}
+            }
+
+            loop {
+                let wait = {
+                    let jitter_cap_ms = interval.as_millis() / 2;
+                    let effective_jitter_ms = keepalive_jitter_signal
+                        .as_millis()
+                        .min(jitter_cap_ms)
+                        .max(1);
+                    interval + Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
+                };
+
+                tokio::select! {
+                    _ = cancel_signal.cancelled() => break,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+
+                let Some(pool) = pool_signal.upgrade() else {
+                    break;
+                };
+
+                let Some(meta) = pool.registry.get_last_writer_meta(writer_id).await else {
+                    stats_signal.increment_me_rpc_proxy_req_signal_skipped_no_meta_total();
+                    continue;
+                };
+
+                let (conn_id, mut service_rx) = pool.registry.register().await;
+                pool.registry
+                    .bind_writer(conn_id, writer_id, tx_signal.clone(), meta.clone())
+                    .await;
+
+                let payload = build_proxy_req_payload(
+                    conn_id,
+                    meta.client_addr,
+                    meta.our_addr,
+                    &[],
+                    pool.proxy_tag.as_deref(),
+                    meta.proto_flags,
+                );
+
+                if tx_signal.send(WriterCommand::DataAndFlush(payload)).await.is_err() {
+                    stats_signal.increment_me_rpc_proxy_req_signal_failed_total();
+                    let _ = pool.registry.unregister(conn_id).await;
+                    cancel_signal.cancel();
+                    if cleanup_for_signal
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        pool.remove_writer_and_close_clients(writer_id).await;
+                    }
+                    break;
+                }
+
+                stats_signal.increment_me_rpc_proxy_req_signal_sent_total();
+
+                if matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS),
+                        service_rx.recv(),
+                    )
+                    .await,
+                    Ok(Some(_))
+                ) {
+                    stats_signal.increment_me_rpc_proxy_req_signal_response_total();
+                }
+
+                let mut close_payload = Vec::with_capacity(12);
+                close_payload.extend_from_slice(&RPC_CLOSE_EXT_U32.to_le_bytes());
+                close_payload.extend_from_slice(&conn_id.to_le_bytes());
+
+                if tx_signal
+                    .send(WriterCommand::DataAndFlush(close_payload))
+                    .await
+                    .is_err()
+                {
+                    stats_signal.increment_me_rpc_proxy_req_signal_failed_total();
+                    let _ = pool.registry.unregister(conn_id).await;
+                    cancel_signal.cancel();
+                    if cleanup_for_signal
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        pool.remove_writer_and_close_clients(writer_id).await;
+                    }
+                    break;
+                }
+
+                stats_signal.increment_me_rpc_proxy_req_signal_close_sent_total();
+                let _ = pool.registry.unregister(conn_id).await;
             }
         });
 

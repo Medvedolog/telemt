@@ -32,7 +32,7 @@ use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::config::{LogLevel, MeSocksKdfPolicy, MeTelemetryLevel};
+use crate::config::{LogLevel, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel};
 use super::load::ProxyConfig;
 
 // ── Hot fields ────────────────────────────────────────────────────────────────
@@ -58,6 +58,10 @@ pub struct HotFields {
     pub telemetry_user_enabled: bool,
     pub telemetry_me_level: MeTelemetryLevel,
     pub me_socks_kdf_policy: MeSocksKdfPolicy,
+    pub me_floor_mode: MeFloorMode,
+    pub me_adaptive_floor_idle_secs: u64,
+    pub me_adaptive_floor_min_writers_single_endpoint: u8,
+    pub me_adaptive_floor_recover_grace_secs: u64,
     pub me_route_backpressure_base_timeout_ms: u64,
     pub me_route_backpressure_high_timeout_ms: u64,
     pub me_route_backpressure_high_watermark_pct: u8,
@@ -85,6 +89,14 @@ impl HotFields {
             telemetry_user_enabled: cfg.general.telemetry.user_enabled,
             telemetry_me_level: cfg.general.telemetry.me_level,
             me_socks_kdf_policy: cfg.general.me_socks_kdf_policy,
+            me_floor_mode: cfg.general.me_floor_mode,
+            me_adaptive_floor_idle_secs: cfg.general.me_adaptive_floor_idle_secs,
+            me_adaptive_floor_min_writers_single_endpoint: cfg
+                .general
+                .me_adaptive_floor_min_writers_single_endpoint,
+            me_adaptive_floor_recover_grace_secs: cfg
+                .general
+                .me_adaptive_floor_recover_grace_secs,
             me_route_backpressure_base_timeout_ms: cfg.general.me_route_backpressure_base_timeout_ms,
             me_route_backpressure_high_timeout_ms: cfg.general.me_route_backpressure_high_timeout_ms,
             me_route_backpressure_high_watermark_pct: cfg.general.me_route_backpressure_high_watermark_pct,
@@ -102,6 +114,18 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
             "config reload: server.port changed ({} → {}); restart required",
             old.server.port, new.server.port
         );
+    }
+    if old.server.api.enabled != new.server.api.enabled
+        || old.server.api.listen != new.server.api.listen
+        || old.server.api.whitelist != new.server.api.whitelist
+        || old.server.api.auth_header != new.server.api.auth_header
+        || old.server.api.request_body_limit_bytes != new.server.api.request_body_limit_bytes
+        || old.server.api.minimal_runtime_enabled != new.server.api.minimal_runtime_enabled
+        || old.server.api.minimal_runtime_cache_ttl_ms
+            != new.server.api.minimal_runtime_cache_ttl_ms
+        || old.server.api.read_only != new.server.api.read_only
+    {
+        warn!("config reload: server.api changed; restart required");
     }
     if old.censorship.tls_domain != new.censorship.tls_domain {
         warn!(
@@ -123,6 +147,9 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
             != new.general.upstream_connect_retry_backoff_ms
         || old.general.upstream_unhealthy_fail_threshold
             != new.general.upstream_unhealthy_fail_threshold
+        || old.general.upstream_connect_failfast_hard_errors
+            != new.general.upstream_connect_failfast_hard_errors
+        || old.general.rpc_proxy_req_every != new.general.rpc_proxy_req_every
     {
         warn!("config reload: general.upstream_* changed; restart required");
     }
@@ -306,6 +333,22 @@ fn log_changes(
             "config reload: me_socks_kdf_policy: {:?} → {:?}",
             old_hot.me_socks_kdf_policy,
             new_hot.me_socks_kdf_policy,
+        );
+    }
+
+    if old_hot.me_floor_mode != new_hot.me_floor_mode
+        || old_hot.me_adaptive_floor_idle_secs != new_hot.me_adaptive_floor_idle_secs
+        || old_hot.me_adaptive_floor_min_writers_single_endpoint
+            != new_hot.me_adaptive_floor_min_writers_single_endpoint
+        || old_hot.me_adaptive_floor_recover_grace_secs
+            != new_hot.me_adaptive_floor_recover_grace_secs
+    {
+        info!(
+            "config reload: me_floor: mode={:?} idle={}s min_single={} recover_grace={}s",
+            new_hot.me_floor_mode,
+            new_hot.me_adaptive_floor_idle_secs,
+            new_hot.me_adaptive_floor_min_writers_single_endpoint,
+            new_hot.me_adaptive_floor_recover_grace_secs,
         );
     }
 

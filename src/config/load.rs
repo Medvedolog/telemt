@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use rand::Rng;
@@ -249,6 +249,14 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.rpc_proxy_req_every != 0
+            && !(10..=300).contains(&config.general.rpc_proxy_req_every)
+        {
+            return Err(ProxyError::Config(
+                "general.rpc_proxy_req_every must be 0 or within [10, 300]".to_string(),
+            ));
+        }
+
         if config.general.me_reinit_every_secs == 0 {
             return Err(ProxyError::Config(
                 "general.me_reinit_every_secs must be > 0".to_string(),
@@ -258,6 +266,15 @@ impl ProxyConfig {
         if config.general.me_single_endpoint_shadow_writers > 32 {
             return Err(ProxyError::Config(
                 "general.me_single_endpoint_shadow_writers must be within [0, 32]".to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_min_writers_single_endpoint == 0
+            || config.general.me_adaptive_floor_min_writers_single_endpoint > 32
+        {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_min_writers_single_endpoint must be within [1, 32]"
+                    .to_string(),
             ));
         }
 
@@ -378,6 +395,24 @@ impl ProxyConfig {
         if !(1..=100).contains(&config.general.me_route_backpressure_high_watermark_pct) {
             return Err(ProxyError::Config(
                 "general.me_route_backpressure_high_watermark_pct must be within [1, 100]".to_string(),
+            ));
+        }
+
+        if config.server.api.request_body_limit_bytes == 0 {
+            return Err(ProxyError::Config(
+                "server.api.request_body_limit_bytes must be > 0".to_string(),
+            ));
+        }
+
+        if config.server.api.minimal_runtime_cache_ttl_ms > 60_000 {
+            return Err(ProxyError::Config(
+                "server.api.minimal_runtime_cache_ttl_ms must be within [0, 60000]".to_string(),
+            ));
+        }
+
+        if config.server.api.listen.parse::<SocketAddr>().is_err() {
+            return Err(ProxyError::Config(
+                "server.api.listen must be in IP:PORT format".to_string(),
             ));
         }
 
@@ -642,6 +677,19 @@ mod tests {
             cfg.general.me_single_endpoint_shadow_rotate_every_secs,
             default_me_single_endpoint_shadow_rotate_every_secs()
         );
+        assert_eq!(cfg.general.me_floor_mode, MeFloorMode::default());
+        assert_eq!(
+            cfg.general.me_adaptive_floor_idle_secs,
+            default_me_adaptive_floor_idle_secs()
+        );
+        assert_eq!(
+            cfg.general.me_adaptive_floor_min_writers_single_endpoint,
+            default_me_adaptive_floor_min_writers_single_endpoint()
+        );
+        assert_eq!(
+            cfg.general.me_adaptive_floor_recover_grace_secs,
+            default_me_adaptive_floor_recover_grace_secs()
+        );
         assert_eq!(
             cfg.general.upstream_connect_retry_attempts,
             default_upstream_connect_retry_attempts()
@@ -654,9 +702,31 @@ mod tests {
             cfg.general.upstream_unhealthy_fail_threshold,
             default_upstream_unhealthy_fail_threshold()
         );
+        assert_eq!(
+            cfg.general.upstream_connect_failfast_hard_errors,
+            default_upstream_connect_failfast_hard_errors()
+        );
+        assert_eq!(
+            cfg.general.rpc_proxy_req_every,
+            default_rpc_proxy_req_every()
+        );
         assert_eq!(cfg.general.update_every, default_update_every());
         assert_eq!(cfg.server.listen_addr_ipv4, default_listen_addr_ipv4());
         assert_eq!(cfg.server.listen_addr_ipv6, default_listen_addr_ipv6_opt());
+        assert_eq!(cfg.server.api.listen, default_api_listen());
+        assert_eq!(cfg.server.api.whitelist, default_api_whitelist());
+        assert_eq!(
+            cfg.server.api.request_body_limit_bytes,
+            default_api_request_body_limit_bytes()
+        );
+        assert_eq!(
+            cfg.server.api.minimal_runtime_enabled,
+            default_api_minimal_runtime_enabled()
+        );
+        assert_eq!(
+            cfg.server.api.minimal_runtime_cache_ttl_ms,
+            default_api_minimal_runtime_cache_ttl_ms()
+        );
         assert_eq!(cfg.access.users, default_access_users());
     }
 
@@ -704,6 +774,19 @@ mod tests {
             general.me_single_endpoint_shadow_rotate_every_secs,
             default_me_single_endpoint_shadow_rotate_every_secs()
         );
+        assert_eq!(general.me_floor_mode, MeFloorMode::default());
+        assert_eq!(
+            general.me_adaptive_floor_idle_secs,
+            default_me_adaptive_floor_idle_secs()
+        );
+        assert_eq!(
+            general.me_adaptive_floor_min_writers_single_endpoint,
+            default_me_adaptive_floor_min_writers_single_endpoint()
+        );
+        assert_eq!(
+            general.me_adaptive_floor_recover_grace_secs,
+            default_me_adaptive_floor_recover_grace_secs()
+        );
         assert_eq!(
             general.upstream_connect_retry_attempts,
             default_upstream_connect_retry_attempts()
@@ -716,10 +799,29 @@ mod tests {
             general.upstream_unhealthy_fail_threshold,
             default_upstream_unhealthy_fail_threshold()
         );
+        assert_eq!(
+            general.upstream_connect_failfast_hard_errors,
+            default_upstream_connect_failfast_hard_errors()
+        );
+        assert_eq!(general.rpc_proxy_req_every, default_rpc_proxy_req_every());
         assert_eq!(general.update_every, default_update_every());
 
         let server = ServerConfig::default();
         assert_eq!(server.listen_addr_ipv6, Some(default_listen_addr_ipv6()));
+        assert_eq!(server.api.listen, default_api_listen());
+        assert_eq!(server.api.whitelist, default_api_whitelist());
+        assert_eq!(
+            server.api.request_body_limit_bytes,
+            default_api_request_body_limit_bytes()
+        );
+        assert_eq!(
+            server.api.minimal_runtime_enabled,
+            default_api_minimal_runtime_enabled()
+        );
+        assert_eq!(
+            server.api.minimal_runtime_cache_ttl_ms,
+            default_api_minimal_runtime_cache_ttl_ms()
+        );
 
         let access = AccessConfig::default();
         assert_eq!(access.users, default_access_users());
@@ -932,6 +1034,50 @@ mod tests {
     }
 
     #[test]
+    fn me_adaptive_floor_min_writers_out_of_range_is_rejected() {
+        let toml = r#"
+            [general]
+            me_adaptive_floor_min_writers_single_endpoint = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_adaptive_floor_min_writers_out_of_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "general.me_adaptive_floor_min_writers_single_endpoint must be within [1, 32]"
+            )
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_floor_mode_adaptive_is_parsed() {
+        let toml = r#"
+            [general]
+            me_floor_mode = "adaptive"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_floor_mode_adaptive_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(cfg.general.me_floor_mode, MeFloorMode::Adaptive);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn upstream_connect_retry_attempts_zero_is_rejected() {
         let toml = r#"
             [general]
@@ -969,6 +1115,62 @@ mod tests {
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("general.upstream_unhealthy_fail_threshold must be > 0"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rpc_proxy_req_every_out_of_range_is_rejected() {
+        let toml = r#"
+            [general]
+            rpc_proxy_req_every = 9
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_rpc_proxy_req_every_out_of_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.rpc_proxy_req_every must be 0 or within [10, 300]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rpc_proxy_req_every_zero_and_valid_range_are_accepted() {
+        let toml_zero = r#"
+            [general]
+            rpc_proxy_req_every = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path_zero = dir.join("telemt_rpc_proxy_req_every_zero_ok_test.toml");
+        std::fs::write(&path_zero, toml_zero).unwrap();
+        let cfg_zero = ProxyConfig::load(&path_zero).unwrap();
+        assert_eq!(cfg_zero.general.rpc_proxy_req_every, 0);
+        let _ = std::fs::remove_file(path_zero);
+
+        let toml_valid = r#"
+            [general]
+            rpc_proxy_req_every = 40
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let path_valid = dir.join("telemt_rpc_proxy_req_every_valid_ok_test.toml");
+        std::fs::write(&path_valid, toml_valid).unwrap();
+        let cfg_valid = ProxyConfig::load(&path_valid).unwrap();
+        assert_eq!(cfg_valid.general.rpc_proxy_req_every, 40);
+        let _ = std::fs::remove_file(path_valid);
     }
 
     #[test]
@@ -1163,6 +1365,28 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("general.me_pool_min_fresh_ratio must be within [0.0, 1.0]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_minimal_runtime_cache_ttl_out_of_range_is_rejected() {
+        let toml = r#"
+            [server.api]
+            enabled = true
+            listen = "127.0.0.1:9091"
+            minimal_runtime_cache_ttl_ms = 70000
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_api_minimal_runtime_cache_ttl_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("server.api.minimal_runtime_cache_ttl_ms must be within [0, 60000]"));
         let _ = std::fs::remove_file(path);
     }
 

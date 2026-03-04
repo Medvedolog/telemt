@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{MeBindStaleMode, MeSocksKdfPolicy};
+use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
 use crate::crypto::SecureRandom;
 use crate::network::IpFamily;
 use crate::network::probe::NetworkDecision;
@@ -94,6 +94,7 @@ pub struct MePool {
     pub(super) me_keepalive_interval: Duration,
     pub(super) me_keepalive_jitter: Duration,
     pub(super) me_keepalive_payload_random: bool,
+    pub(super) rpc_proxy_req_every_secs: AtomicU64,
     pub(super) me_warmup_stagger_enabled: bool,
     pub(super) me_warmup_step_delay: Duration,
     pub(super) me_warmup_step_jitter: Duration,
@@ -107,6 +108,10 @@ pub struct MePool {
     pub(super) me_single_endpoint_outage_backoff_min_ms: AtomicU64,
     pub(super) me_single_endpoint_outage_backoff_max_ms: AtomicU64,
     pub(super) me_single_endpoint_shadow_rotate_every_secs: AtomicU64,
+    pub(super) me_floor_mode: AtomicU8,
+    pub(super) me_adaptive_floor_idle_secs: AtomicU64,
+    pub(super) me_adaptive_floor_min_writers_single_endpoint: AtomicU8,
+    pub(super) me_adaptive_floor_recover_grace_secs: AtomicU64,
     pub(super) proxy_map_v4: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
     pub(super) proxy_map_v6: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
     pub(super) default_dc: AtomicI32,
@@ -127,7 +132,7 @@ pub struct MePool {
     pub(super) pending_hardswap_map_hash: AtomicU64,
     pub(super) hardswap: AtomicBool,
     pub(super) endpoint_quarantine: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
-    pub(super) kdf_material_fingerprint: Arc<Mutex<HashMap<SocketAddr, u64>>>,
+    pub(super) kdf_material_fingerprint: Arc<Mutex<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
@@ -188,6 +193,7 @@ impl MePool {
         me_keepalive_interval_secs: u64,
         me_keepalive_jitter_secs: u64,
         me_keepalive_payload_random: bool,
+        rpc_proxy_req_every_secs: u64,
         me_warmup_stagger_enabled: bool,
         me_warmup_step_delay_ms: u64,
         me_warmup_step_jitter_ms: u64,
@@ -201,6 +207,10 @@ impl MePool {
         me_single_endpoint_outage_backoff_min_ms: u64,
         me_single_endpoint_outage_backoff_max_ms: u64,
         me_single_endpoint_shadow_rotate_every_secs: u64,
+        me_floor_mode: MeFloorMode,
+        me_adaptive_floor_idle_secs: u64,
+        me_adaptive_floor_min_writers_single_endpoint: u8,
+        me_adaptive_floor_recover_grace_secs: u64,
         hardswap: bool,
         me_pool_drain_ttl_secs: u64,
         me_pool_force_close_secs: u64,
@@ -264,6 +274,7 @@ impl MePool {
             me_keepalive_interval: Duration::from_secs(me_keepalive_interval_secs),
             me_keepalive_jitter: Duration::from_secs(me_keepalive_jitter_secs),
             me_keepalive_payload_random,
+            rpc_proxy_req_every_secs: AtomicU64::new(rpc_proxy_req_every_secs),
             me_warmup_stagger_enabled,
             me_warmup_step_delay: Duration::from_millis(me_warmup_step_delay_ms),
             me_warmup_step_jitter: Duration::from_millis(me_warmup_step_jitter_ms),
@@ -286,6 +297,14 @@ impl MePool {
             ),
             me_single_endpoint_shadow_rotate_every_secs: AtomicU64::new(
                 me_single_endpoint_shadow_rotate_every_secs,
+            ),
+            me_floor_mode: AtomicU8::new(me_floor_mode.as_u8()),
+            me_adaptive_floor_idle_secs: AtomicU64::new(me_adaptive_floor_idle_secs),
+            me_adaptive_floor_min_writers_single_endpoint: AtomicU8::new(
+                me_adaptive_floor_min_writers_single_endpoint,
+            ),
+            me_adaptive_floor_recover_grace_secs: AtomicU64::new(
+                me_adaptive_floor_recover_grace_secs,
             ),
             pool_size: 2,
             proxy_map_v4: Arc::new(RwLock::new(proxy_map_v4)),
@@ -351,6 +370,10 @@ impl MePool {
         single_endpoint_outage_backoff_min_ms: u64,
         single_endpoint_outage_backoff_max_ms: u64,
         single_endpoint_shadow_rotate_every_secs: u64,
+        floor_mode: MeFloorMode,
+        adaptive_floor_idle_secs: u64,
+        adaptive_floor_min_writers_single_endpoint: u8,
+        adaptive_floor_recover_grace_secs: u64,
     ) {
         self.hardswap.store(hardswap, Ordering::Relaxed);
         self.me_pool_drain_ttl_secs
@@ -387,6 +410,29 @@ impl MePool {
             .store(single_endpoint_outage_backoff_max_ms, Ordering::Relaxed);
         self.me_single_endpoint_shadow_rotate_every_secs
             .store(single_endpoint_shadow_rotate_every_secs, Ordering::Relaxed);
+        let previous_floor_mode = self.floor_mode();
+        self.me_floor_mode
+            .store(floor_mode.as_u8(), Ordering::Relaxed);
+        self.me_adaptive_floor_idle_secs
+            .store(adaptive_floor_idle_secs, Ordering::Relaxed);
+        self.me_adaptive_floor_min_writers_single_endpoint
+            .store(adaptive_floor_min_writers_single_endpoint, Ordering::Relaxed);
+        self.me_adaptive_floor_recover_grace_secs
+            .store(adaptive_floor_recover_grace_secs, Ordering::Relaxed);
+        if previous_floor_mode != floor_mode {
+            self.stats.increment_me_floor_mode_switch_total();
+            match (previous_floor_mode, floor_mode) {
+                (MeFloorMode::Static, MeFloorMode::Adaptive) => {
+                    self.stats
+                        .increment_me_floor_mode_switch_static_to_adaptive_total();
+                }
+                (MeFloorMode::Adaptive, MeFloorMode::Static) => {
+                    self.stats
+                        .increment_me_floor_mode_switch_adaptive_to_static_total();
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn reset_stun_state(&self) {
@@ -462,6 +508,40 @@ impl MePool {
             return (1 + shadow).max(3);
         }
         endpoint_count.max(3)
+    }
+
+    pub(super) fn floor_mode(&self) -> MeFloorMode {
+        MeFloorMode::from_u8(self.me_floor_mode.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn adaptive_floor_idle_duration(&self) -> Duration {
+        Duration::from_secs(self.me_adaptive_floor_idle_secs.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn adaptive_floor_recover_grace_duration(&self) -> Duration {
+        Duration::from_secs(
+            self.me_adaptive_floor_recover_grace_secs
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) fn required_writers_for_dc_with_floor_mode(
+        &self,
+        endpoint_count: usize,
+        reduce_for_idle: bool,
+    ) -> usize {
+        let base_required = self.required_writers_for_dc(endpoint_count);
+        if !reduce_for_idle {
+            return base_required;
+        }
+        if endpoint_count != 1 || self.floor_mode() != MeFloorMode::Adaptive {
+            return base_required;
+        }
+        let min_writers = (self
+            .me_adaptive_floor_min_writers_single_endpoint
+            .load(Ordering::Relaxed) as usize)
+            .max(1);
+        base_required.min(min_writers)
     }
 
     pub(super) fn single_endpoint_outage_mode_enabled(&self) -> bool {

@@ -282,6 +282,10 @@ async fn run_update_cycle(
         cfg.general.me_single_endpoint_outage_backoff_min_ms,
         cfg.general.me_single_endpoint_outage_backoff_max_ms,
         cfg.general.me_single_endpoint_shadow_rotate_every_secs,
+        cfg.general.me_floor_mode,
+        cfg.general.me_adaptive_floor_idle_secs,
+        cfg.general.me_adaptive_floor_min_writers_single_endpoint,
+        cfg.general.me_adaptive_floor_recover_grace_secs,
     );
 
     let required_cfg_snapshots = cfg.general.me_config_stable_snapshots.max(1);
@@ -490,6 +494,10 @@ pub async fn me_config_updater(
                     cfg.general.me_single_endpoint_outage_backoff_min_ms,
                     cfg.general.me_single_endpoint_outage_backoff_max_ms,
                     cfg.general.me_single_endpoint_shadow_rotate_every_secs,
+                    cfg.general.me_floor_mode,
+                    cfg.general.me_adaptive_floor_idle_secs,
+                    cfg.general.me_adaptive_floor_min_writers_single_endpoint,
+                    cfg.general.me_adaptive_floor_recover_grace_secs,
                 );
                 let new_secs = cfg.general.effective_update_every_secs().max(1);
                 if new_secs == update_every_secs {

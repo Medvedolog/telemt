@@ -60,6 +60,7 @@ paste your config
 # === General Settings ===
 [general]
 # ad_tag = "00000000000000000000000000000000"
+use_middle_proxy = false
 
 [general.modes]
 classic = false

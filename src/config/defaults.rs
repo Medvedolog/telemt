@@ -9,8 +9,11 @@ const DEFAULT_MIDDLE_PROXY_WARM_STANDBY: usize = 16;
 const DEFAULT_ME_RECONNECT_MAX_CONCURRENT_PER_DC: u32 = 8;
 const DEFAULT_ME_RECONNECT_FAST_RETRY_COUNT: u32 = 16;
 const DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS: u8 = 2;
-const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 3;
-const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 4;
+const DEFAULT_ME_ADAPTIVE_FLOOR_IDLE_SECS: u64 = 90;
+const DEFAULT_ME_ADAPTIVE_FLOOR_MIN_WRITERS_SINGLE_ENDPOINT: u8 = 1;
+const DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS: u64 = 180;
+const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 2;
+const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
 const DEFAULT_ACCESS_USER: &str = "default";
 const DEFAULT_ACCESS_SECRET: &str = "00000000000000000000000000000000";
@@ -89,6 +92,26 @@ pub(crate) fn default_metrics_whitelist() -> Vec<IpNetwork> {
     ]
 }
 
+pub(crate) fn default_api_listen() -> String {
+    "127.0.0.1:9091".to_string()
+}
+
+pub(crate) fn default_api_whitelist() -> Vec<IpNetwork> {
+    default_metrics_whitelist()
+}
+
+pub(crate) fn default_api_request_body_limit_bytes() -> usize {
+    64 * 1024
+}
+
+pub(crate) fn default_api_minimal_runtime_enabled() -> bool {
+    false
+}
+
+pub(crate) fn default_api_minimal_runtime_cache_ttl_ms() -> u64 {
+    1000
+}
+
 pub(crate) fn default_prefer_4() -> u8 {
     4
 }
@@ -130,11 +153,11 @@ pub(crate) fn default_middle_proxy_warm_standby() -> usize {
 }
 
 pub(crate) fn default_keepalive_interval() -> u64 {
-    25
+    8
 }
 
 pub(crate) fn default_keepalive_jitter() -> u64 {
-    5
+    2
 }
 
 pub(crate) fn default_warmup_step_delay_ms() -> u64 {
@@ -185,16 +208,36 @@ pub(crate) fn default_me_single_endpoint_shadow_rotate_every_secs() -> u64 {
     900
 }
 
+pub(crate) fn default_me_adaptive_floor_idle_secs() -> u64 {
+    DEFAULT_ME_ADAPTIVE_FLOOR_IDLE_SECS
+}
+
+pub(crate) fn default_me_adaptive_floor_min_writers_single_endpoint() -> u8 {
+    DEFAULT_ME_ADAPTIVE_FLOOR_MIN_WRITERS_SINGLE_ENDPOINT
+}
+
+pub(crate) fn default_me_adaptive_floor_recover_grace_secs() -> u64 {
+    DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS
+}
+
 pub(crate) fn default_upstream_connect_retry_attempts() -> u32 {
     DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS
 }
 
 pub(crate) fn default_upstream_connect_retry_backoff_ms() -> u64 {
-    250
+    100
 }
 
 pub(crate) fn default_upstream_unhealthy_fail_threshold() -> u32 {
     DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD
+}
+
+pub(crate) fn default_upstream_connect_failfast_hard_errors() -> bool {
+    false
+}
+
+pub(crate) fn default_rpc_proxy_req_every() -> u64 {
+    0
 }
 
 pub(crate) fn default_crypto_pending_buffer() -> usize {
