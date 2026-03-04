@@ -20,6 +20,7 @@ use crate::config::ProxyConfig;
 use crate::ip_tracker::UserIpTracker;
 use crate::stats::Stats;
 use crate::transport::middle_proxy::MePool;
+use crate::transport::UpstreamManager;
 
 mod config_store;
 mod model;
@@ -33,7 +34,7 @@ use model::{
 };
 use runtime_stats::{
     MinimalCacheEntry, build_dcs_data, build_me_writers_data, build_minimal_all_data,
-    build_zero_all_data,
+    build_upstreams_data, build_zero_all_data,
 };
 use users::{create_user, delete_user, patch_user, rotate_secret, users_from_config};
 
@@ -42,6 +43,7 @@ pub(super) struct ApiShared {
     pub(super) stats: Arc<Stats>,
     pub(super) ip_tracker: Arc<UserIpTracker>,
     pub(super) me_pool: Option<Arc<MePool>>,
+    pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
     pub(super) startup_detected_ip_v4: Option<IpAddr>,
     pub(super) startup_detected_ip_v6: Option<IpAddr>,
@@ -61,6 +63,7 @@ pub async fn serve(
     stats: Arc<Stats>,
     ip_tracker: Arc<UserIpTracker>,
     me_pool: Option<Arc<MePool>>,
+    upstream_manager: Arc<UpstreamManager>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     config_path: PathBuf,
     startup_detected_ip_v4: Option<IpAddr>,
@@ -84,6 +87,7 @@ pub async fn serve(
         stats,
         ip_tracker,
         me_pool,
+        upstream_manager,
         config_path,
         startup_detected_ip_v4,
         startup_detected_ip_v6,
@@ -199,6 +203,11 @@ async fn handle(
             ("GET", "/v1/stats/zero/all") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = build_zero_all_data(&shared.stats, cfg.access.users.len());
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/stats/upstreams") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_upstreams_data(shared.as_ref(), api_cfg);
                 Ok(success_response(StatusCode::OK, data, revision))
             }
             ("GET", "/v1/stats/minimal/all") => {

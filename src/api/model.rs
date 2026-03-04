@@ -104,6 +104,50 @@ pub(super) struct ZeroUpstreamData {
 }
 
 #[derive(Serialize, Clone)]
+pub(super) struct UpstreamDcStatus {
+    pub(super) dc: i16,
+    pub(super) latency_ema_ms: Option<f64>,
+    pub(super) ip_preference: &'static str,
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct UpstreamStatus {
+    pub(super) upstream_id: usize,
+    pub(super) route_kind: &'static str,
+    pub(super) address: String,
+    pub(super) weight: u16,
+    pub(super) scopes: String,
+    pub(super) healthy: bool,
+    pub(super) fails: u32,
+    pub(super) last_check_age_secs: u64,
+    pub(super) effective_latency_ms: Option<f64>,
+    pub(super) dc: Vec<UpstreamDcStatus>,
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct UpstreamSummaryData {
+    pub(super) configured_total: usize,
+    pub(super) healthy_total: usize,
+    pub(super) unhealthy_total: usize,
+    pub(super) direct_total: usize,
+    pub(super) socks4_total: usize,
+    pub(super) socks5_total: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct UpstreamsData {
+    pub(super) enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<&'static str>,
+    pub(super) generated_at_epoch_secs: u64,
+    pub(super) zero: ZeroUpstreamData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) summary: Option<UpstreamSummaryData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) upstreams: Option<Vec<UpstreamStatus>>,
+}
+
+#[derive(Serialize, Clone)]
 pub(super) struct ZeroMiddleProxyData {
     pub(super) keepalive_sent_total: u64,
     pub(super) keepalive_failed_total: u64,

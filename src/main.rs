@@ -1169,6 +1169,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let stats = stats.clone();
             let ip_tracker_api = ip_tracker.clone();
             let me_pool_api = me_pool.clone();
+            let upstream_manager_api = upstream_manager.clone();
             let config_rx_api = config_rx.clone();
             let config_path_api = std::path::PathBuf::from(&config_path);
             let startup_detected_ip_v4 = detected_ip_v4;
@@ -1179,6 +1180,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     stats,
                     ip_tracker_api,
                     me_pool_api,
+                    upstream_manager_api,
                     config_rx_api,
                     config_path_api,
                     startup_detected_ip_v4,

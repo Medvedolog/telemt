@@ -165,6 +165,43 @@ pub enum UpstreamRouteKind {
     Socks5,
 }
 
+#[derive(Debug, Clone)]
+pub struct UpstreamApiDcSnapshot {
+    pub dc: i16,
+    pub latency_ema_ms: Option<f64>,
+    pub ip_preference: IpPreference,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamApiItemSnapshot {
+    pub upstream_id: usize,
+    pub route_kind: UpstreamRouteKind,
+    pub address: String,
+    pub weight: u16,
+    pub scopes: String,
+    pub healthy: bool,
+    pub fails: u32,
+    pub last_check_age_secs: u64,
+    pub effective_latency_ms: Option<f64>,
+    pub dc: Vec<UpstreamApiDcSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamApiSummarySnapshot {
+    pub configured_total: usize,
+    pub healthy_total: usize,
+    pub unhealthy_total: usize,
+    pub direct_total: usize,
+    pub socks4_total: usize,
+    pub socks5_total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamApiSnapshot {
+    pub summary: UpstreamApiSummarySnapshot,
+    pub upstreams: Vec<UpstreamApiItemSnapshot>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpstreamEgressInfo {
     pub route_kind: UpstreamRouteKind,
@@ -215,6 +252,64 @@ impl UpstreamManager {
             connect_failfast_hard_errors,
             stats,
         }
+    }
+
+    pub fn try_api_snapshot(&self) -> Option<UpstreamApiSnapshot> {
+        let guard = self.upstreams.try_read().ok()?;
+        let now = std::time::Instant::now();
+
+        let mut summary = UpstreamApiSummarySnapshot {
+            configured_total: guard.len(),
+            ..UpstreamApiSummarySnapshot::default()
+        };
+        let mut upstreams = Vec::with_capacity(guard.len());
+
+        for (idx, upstream) in guard.iter().enumerate() {
+            if upstream.healthy {
+                summary.healthy_total += 1;
+            } else {
+                summary.unhealthy_total += 1;
+            }
+
+            let (route_kind, address) = match &upstream.config.upstream_type {
+                UpstreamType::Direct { .. } => {
+                    summary.direct_total += 1;
+                    (UpstreamRouteKind::Direct, "direct".to_string())
+                }
+                UpstreamType::Socks4 { address, .. } => {
+                    summary.socks4_total += 1;
+                    (UpstreamRouteKind::Socks4, address.clone())
+                }
+                UpstreamType::Socks5 { address, .. } => {
+                    summary.socks5_total += 1;
+                    (UpstreamRouteKind::Socks5, address.clone())
+                }
+            };
+
+            let mut dc = Vec::with_capacity(NUM_DCS);
+            for dc_idx in 0..NUM_DCS {
+                dc.push(UpstreamApiDcSnapshot {
+                    dc: (dc_idx + 1) as i16,
+                    latency_ema_ms: upstream.dc_latency[dc_idx].get(),
+                    ip_preference: upstream.dc_ip_pref[dc_idx],
+                });
+            }
+
+            upstreams.push(UpstreamApiItemSnapshot {
+                upstream_id: idx,
+                route_kind,
+                address,
+                weight: upstream.config.weight,
+                scopes: upstream.config.scopes.clone(),
+                healthy: upstream.healthy,
+                fails: upstream.fails,
+                last_check_age_secs: now.saturating_duration_since(upstream.last_check).as_secs(),
+                effective_latency_ms: upstream.effective_latency(None),
+                dc,
+            });
+        }
+
+        Some(UpstreamApiSnapshot { summary, upstreams })
     }
 
     #[cfg(unix)]
