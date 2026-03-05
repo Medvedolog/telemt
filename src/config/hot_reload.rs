@@ -381,6 +381,14 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
         warned = true;
         warn!("config reload: general.middle_proxy_pool_size changed; restart required");
     }
+    if old.general.me_init_retry_attempts != new.general.me_init_retry_attempts {
+        warned = true;
+        warn!("config reload: general.me_init_retry_attempts changed; restart required");
+    }
+    if old.general.me2dc_fallback != new.general.me2dc_fallback {
+        warned = true;
+        warn!("config reload: general.me2dc_fallback changed; restart required");
+    }
     if old.general.me_keepalive_enabled != new.general.me_keepalive_enabled
         || old.general.me_keepalive_interval_secs != new.general.me_keepalive_interval_secs
         || old.general.me_keepalive_jitter_secs != new.general.me_keepalive_jitter_secs

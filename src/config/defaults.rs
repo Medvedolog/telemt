@@ -153,6 +153,14 @@ pub(crate) fn default_middle_proxy_warm_standby() -> usize {
     DEFAULT_MIDDLE_PROXY_WARM_STANDBY
 }
 
+pub(crate) fn default_me_init_retry_attempts() -> u32 {
+    0
+}
+
+pub(crate) fn default_me2dc_fallback() -> bool {
+    true
+}
+
 pub(crate) fn default_keepalive_interval() -> u64 {
     8
 }

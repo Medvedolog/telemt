@@ -353,6 +353,15 @@ pub struct GeneralConfig {
     #[serde(default = "default_middle_proxy_warm_standby")]
     pub middle_proxy_warm_standby: usize,
 
+    /// Startup retries for Middle-End pool initialization before ME→Direct fallback.
+    /// 0 means unlimited retries.
+    #[serde(default = "default_me_init_retry_attempts")]
+    pub me_init_retry_attempts: u32,
+
+    /// Allow fallback from Middle-End mode to direct DC when ME startup cannot be initialized.
+    #[serde(default = "default_me2dc_fallback")]
+    pub me2dc_fallback: bool,
+
     /// Enable ME keepalive padding frames.
     #[serde(default = "default_true")]
     pub me_keepalive_enabled: bool,
@@ -680,6 +689,8 @@ impl Default for GeneralConfig {
             stun_nat_probe_concurrency: default_stun_nat_probe_concurrency(),
             middle_proxy_pool_size: default_pool_size(),
             middle_proxy_warm_standby: default_middle_proxy_warm_standby(),
+            me_init_retry_attempts: default_me_init_retry_attempts(),
+            me2dc_fallback: default_me2dc_fallback(),
             me_keepalive_enabled: default_true(),
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),

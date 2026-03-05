@@ -237,6 +237,12 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_init_retry_attempts > 1_000_000 {
+            return Err(ProxyError::Config(
+                "general.me_init_retry_attempts must be within [0, 1000000]".to_string(),
+            ));
+        }
+
         if config.general.upstream_connect_retry_attempts == 0 {
             return Err(ProxyError::Config(
                 "general.upstream_connect_retry_attempts must be > 0".to_string(),
@@ -660,6 +666,14 @@ mod tests {
             default_me_reconnect_fast_retry_count()
         );
         assert_eq!(
+            cfg.general.me_init_retry_attempts,
+            default_me_init_retry_attempts()
+        );
+        assert_eq!(
+            cfg.general.me2dc_fallback,
+            default_me2dc_fallback()
+        );
+        assert_eq!(
             cfg.general.me_single_endpoint_shadow_writers,
             default_me_single_endpoint_shadow_writers()
         );
@@ -764,6 +778,11 @@ mod tests {
             general.me_reconnect_fast_retry_count,
             default_me_reconnect_fast_retry_count()
         );
+        assert_eq!(
+            general.me_init_retry_attempts,
+            default_me_init_retry_attempts()
+        );
+        assert_eq!(general.me2dc_fallback, default_me2dc_fallback());
         assert_eq!(
             general.me_single_endpoint_shadow_writers,
             default_me_single_endpoint_shadow_writers()
