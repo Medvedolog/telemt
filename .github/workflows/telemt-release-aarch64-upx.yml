@@ -27,7 +27,7 @@ on:
       build_target:
         description: 'Enter tag (e.g., 3.0.15) or branch (main)'
         required: true
-        default: '3.3.3'
+        default: '3.3.5'
 
 jobs:
   release:
