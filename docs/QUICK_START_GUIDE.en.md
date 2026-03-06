@@ -67,6 +67,12 @@ classic = false
 secure = false
 tls = true
 
+[server.api]
+enabled = true
+# listen = "127.0.0.1:9091"
+# whitelist = ["127.0.0.1/32"]
+# read_only = true
+
 # === Anti-Censorship & Masking ===
 [censorship]
 tls_domain = "petrovich.ru"
@@ -75,6 +81,7 @@ tls_domain = "petrovich.ru"
 # format: "username" = "32_hex_chars_secret"
 hello = "00000000000000000000000000000000"
 ```
+
 then Ctrl+S -> Ctrl+X to save
 
 > [!WARNING]
@@ -115,7 +122,12 @@ then Ctrl+S -> Ctrl+X to save
 
 **5.** For automatic startup at system boot, enter `systemctl enable telemt`
 
-**6.** To get the links, enter `journalctl -u telemt -n -g "links" --no-pager -o cat | tac`
+**6.** To get the link(s), enter
+```bash
+curl -s http://127.0.0.1:9091/v1/users | jq
+```
+
+> Any number of people can use one link.
 
 ---
 

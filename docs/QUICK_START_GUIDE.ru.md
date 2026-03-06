@@ -67,6 +67,12 @@ classic = false
 secure = false
 tls = true
 
+[server.api]
+enabled = true
+# listen = "127.0.0.1:9091"
+# whitelist = ["127.0.0.1/32"]
+# read_only = true
+
 # === Anti-Censorship & Masking ===
 [censorship]
 tls_domain = "petrovich.ru"
@@ -75,6 +81,7 @@ tls_domain = "petrovich.ru"
 # format: "username" = "32_hex_chars_secret"
 hello = "00000000000000000000000000000000"
 ```
+
 Затем нажмите Ctrl+S -> Ctrl+X, чтобы сохранить
 
 > [!WARNING]
@@ -115,9 +122,14 @@ WantedBy=multi-user.target
 
 **5.** Для автоматического запуска при запуске системы в введите `systemctl enable telemt`
 
-**6.** Для получения ссылки введите `journalctl -u telemt -n -g "links" --no-pager -o cat | tac`
+**6.** Для получения ссылки/ссылок введите 
+```bash
+curl -s http://127.0.0.1:9091/v1/users | jq
+```
+> Одной ссылкой модет пользоваться сколько угодно человек.
+
 > [!WARNING]
-> Рабочую ссылку может выдать только команда из 6 пункта. Не пытайтесь делать ее самостоятельно или копировать откуда-либо!
+> Рабочую ссылку может выдать только команда из 6 пункта. Не пытайтесь делать ее самостоятельно или копировать откуда-либо если вы не уверены в том, что делаете!
 
 ---
 

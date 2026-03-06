@@ -19,18 +19,24 @@
 
 ### 🇷🇺 RU
 
-#### Релиз 3.3.3 LTS - 6 марта
+#### Релиз 3.3.5 LTS - 6 марта
 
-6 марта мы выпустили Telemt **3.3.3**
+6 марта мы выпустили Telemt **3.3.5**
 
-Это первая версия telemt работающая в комплексных условиях и при этом предоставляющая API
+Это [3.3.5 - первая LTS-версия telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)!
 
-В ней используется новый алгоритм - ME NoWait, который вместе с Adaptive Floor и моделью усовершенствованного доступа к KDF Fingerprint на RwLock позволяет достигать максимальную производительность, даже в условиях lossy-сети
+В ней используется:
+- новый алгоритм ME NoWait для непревзойдённо быстрого восстановления пула
+- Adaptive Floor, поддерживающий количество ME Writer на оптимальном уровне
+- модель усовершенствованного доступа к KDF Fingerprint на RwLock
+- строгая привязка Middle-End к DC-ID с предсказуемым алгоритмом деградации и самовосстановления
 
-Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **статистики** и **UX**
+Telemt Control API V1 в 3.3.5 включает:
+- несколько режимов работы в зависимости от доступных ресурсов
+- снапшот-модель для живых метрик без вмешательства в hot-path
+- минималистичный набор запросов для управления пользователями
 
-Релиз:  
-[3.3.3](https://github.com/telemt/telemt/releases/tag/3.3.3)
+Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **API**, **статистики**, **UX**
 
 ---
 
@@ -47,18 +53,24 @@
 
 ### 🇬🇧 EN
 
-#### Release 3.3.3 LTS - March 6
+#### Release 3.3.5 LTS - March 6
 
 On March 6, we released Telemt **3.3.3**
 
-This is the first telemt's version designed to operate reliably in complex network conditions while also providing a runtime API!
+This is [3.3.5 - the first LTS release of telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)
 
-The release introduces a new algorithm — ME NoWait, which combined with Adaptive Floor and an improved KDF Fingerprint access model based on RwLock, it enables the system to achieve maximum performance even in lossy network environments
+It introduces:
+- the new ME NoWait algorithm for exceptionally fast pool recovery
+- Adaptive Floor, which maintains the number of ME Writers at an optimal level
+- an improved KDF Fingerprint access model based on RwLock
+- strict binding of Middle-End instances to DC-ID with a predictable degradation and self-recovery algorithm
 
-We are looking forward to your feedback and improvement proposals — especially regarding **statistics** and **UX**
+Telemt Control API V1 in version 3.3.5 includes:
+- multiple operating modes depending on available resources
+- a snapshot-based model for live metrics without interfering with the hot path
+- a minimalistic request set for user management
 
-Release:  
-[3.3.3](https://github.com/telemt/telemt/releases/tag/3.3.3)
+We are looking forward to your feedback and improvement proposals — especially regarding **API**, **statistics**, **UX**
 
 ---
 
