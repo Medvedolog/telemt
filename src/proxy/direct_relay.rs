@@ -57,6 +57,7 @@ where
 
     stats.increment_user_connects(user);
     stats.increment_user_curr_connects(user);
+    stats.increment_current_connections_direct();
 
     let relay_result = relay_bidirectional(
         client_reader,
@@ -69,6 +70,7 @@ where
     )
     .await;
 
+    stats.decrement_current_connections_direct();
     stats.decrement_user_curr_connects(user);
 
     match &relay_result {
