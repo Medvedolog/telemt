@@ -25,6 +25,8 @@ use self::telemetry::TelemetryPolicy;
 pub struct Stats {
     connects_all: AtomicU64,
     connects_bad: AtomicU64,
+    current_connections_direct: AtomicU64,
+    current_connections_me: AtomicU64,
     handshake_timeouts: AtomicU64,
     upstream_connect_attempt_total: AtomicU64,
     upstream_connect_success_total: AtomicU64,
@@ -100,6 +102,11 @@ pub struct Stats {
     me_refill_failed_total: AtomicU64,
     me_writer_restored_same_endpoint_total: AtomicU64,
     me_writer_restored_fallback_total: AtomicU64,
+    me_no_writer_failfast_total: AtomicU64,
+    me_async_recovery_trigger_total: AtomicU64,
+    me_inline_recovery_total: AtomicU64,
+    ip_reservation_rollback_tcp_limit_total: AtomicU64,
+    ip_reservation_rollback_quota_limit_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
@@ -145,6 +152,24 @@ impl Stats {
         self.telemetry_me_level().allows_debug()
     }
 
+    fn decrement_atomic_saturating(counter: &AtomicU64) {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                break;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     pub fn apply_telemetry_policy(&self, policy: TelemetryPolicy) {
         self.telemetry_core_enabled
             .store(policy.core_enabled, Ordering::Relaxed);
@@ -171,6 +196,18 @@ impl Stats {
         if self.telemetry_core_enabled() {
             self.connects_bad.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    pub fn increment_current_connections_direct(&self) {
+        self.current_connections_direct.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn decrement_current_connections_direct(&self) {
+        Self::decrement_atomic_saturating(&self.current_connections_direct);
+    }
+    pub fn increment_current_connections_me(&self) {
+        self.current_connections_me.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn decrement_current_connections_me(&self) {
+        Self::decrement_atomic_saturating(&self.current_connections_me);
     }
     pub fn increment_handshake_timeouts(&self) {
         if self.telemetry_core_enabled() {
@@ -522,6 +559,34 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_no_writer_failfast_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_no_writer_failfast_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_async_recovery_trigger_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_async_recovery_trigger_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_inline_recovery_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_inline_recovery_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_ip_reservation_rollback_tcp_limit_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.ip_reservation_rollback_tcp_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_ip_reservation_rollback_quota_limit_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.ip_reservation_rollback_quota_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_endpoint_quarantine_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_endpoint_quarantine_total
@@ -613,6 +678,16 @@ impl Stats {
     }
     pub fn get_connects_all(&self) -> u64 { self.connects_all.load(Ordering::Relaxed) }
     pub fn get_connects_bad(&self) -> u64 { self.connects_bad.load(Ordering::Relaxed) }
+    pub fn get_current_connections_direct(&self) -> u64 {
+        self.current_connections_direct.load(Ordering::Relaxed)
+    }
+    pub fn get_current_connections_me(&self) -> u64 {
+        self.current_connections_me.load(Ordering::Relaxed)
+    }
+    pub fn get_current_connections_total(&self) -> u64 {
+        self.get_current_connections_direct()
+            .saturating_add(self.get_current_connections_me())
+    }
     pub fn get_me_keepalive_sent(&self) -> u64 { self.me_keepalive_sent.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_failed(&self) -> u64 { self.me_keepalive_failed.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_pong(&self) -> u64 { self.me_keepalive_pong.load(Ordering::Relaxed) }
@@ -791,21 +866,52 @@ impl Stats {
     pub fn get_me_writer_restored_fallback_total(&self) -> u64 {
         self.me_writer_restored_fallback_total.load(Ordering::Relaxed)
     }
+    pub fn get_me_no_writer_failfast_total(&self) -> u64 {
+        self.me_no_writer_failfast_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_async_recovery_trigger_total(&self) -> u64 {
+        self.me_async_recovery_trigger_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_inline_recovery_total(&self) -> u64 {
+        self.me_inline_recovery_total.load(Ordering::Relaxed)
+    }
+    pub fn get_ip_reservation_rollback_tcp_limit_total(&self) -> u64 {
+        self.ip_reservation_rollback_tcp_limit_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_ip_reservation_rollback_quota_limit_total(&self) -> u64 {
+        self.ip_reservation_rollback_quota_limit_total
+            .load(Ordering::Relaxed)
+    }
     
     pub fn increment_user_connects(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .connects.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.connects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .connects
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_curr_connects(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .curr_connects.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.curr_connects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .curr_connects
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn decrement_user_curr_connects(&self, user: &str) {
@@ -839,32 +945,60 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .octets_from_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn add_user_octets_to(&self, user: &str, bytes: u64) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .octets_to_client.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .octets_to_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_from(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .msgs_from_client.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .msgs_from_client
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_to(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .msgs_to_client.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .msgs_to_client
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn get_user_total_octets(&self, user: &str) -> u64 {

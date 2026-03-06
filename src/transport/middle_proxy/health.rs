@@ -102,7 +102,7 @@ async fn check_family(
 
     let mut dc_endpoints = HashMap::<i32, Vec<SocketAddr>>::new();
     for (dc, addrs) in map {
-        let entry = dc_endpoints.entry(dc.abs()).or_default();
+        let entry = dc_endpoints.entry(dc).or_default();
         for (ip, port) in addrs {
             entry.push(SocketAddr::new(ip, port));
         }
@@ -295,15 +295,27 @@ async fn check_family(
             let wait = Duration::from_millis(next_ms)
                 + Duration::from_millis(rand::rng().random_range(0..=jitter.max(1)));
             next_attempt.insert(key, now + wait);
-            warn!(
-                dc = %dc,
-                ?family,
-                alive = now_alive,
-                required,
-                endpoint_count = endpoints.len(),
-                backoff_ms = next_ms,
-                "DC writer floor is below required level, scheduled reconnect"
-            );
+            if pool.is_runtime_ready() {
+                warn!(
+                    dc = %dc,
+                    ?family,
+                    alive = now_alive,
+                    required,
+                    endpoint_count = endpoints.len(),
+                    backoff_ms = next_ms,
+                    "DC writer floor is below required level, scheduled reconnect"
+                );
+            } else {
+                info!(
+                    dc = %dc,
+                    ?family,
+                    alive = now_alive,
+                    required,
+                    endpoint_count = endpoints.len(),
+                    backoff_ms = next_ms,
+                    "DC writer floor is below required level during startup, scheduled reconnect"
+                );
+            }
         }
         if let Some(v) = inflight.get_mut(&key) {
             *v = v.saturating_sub(1);

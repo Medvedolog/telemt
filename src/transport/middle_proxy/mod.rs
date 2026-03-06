@@ -10,6 +10,7 @@ mod pool_init;
 mod pool_nat;
 mod pool_refill;
 mod pool_reinit;
+mod pool_runtime_api;
 mod pool_writer;
 mod ping;
 mod reader;
@@ -30,7 +31,11 @@ pub use pool::MePool;
 pub use pool_nat::{stun_probe, detect_public_ip};
 pub use registry::ConnRegistry;
 pub use secret::fetch_proxy_secret;
-pub use config_updater::{fetch_proxy_config, me_config_updater};
+#[allow(unused_imports)]
+pub use config_updater::{
+    ProxyConfigData, fetch_proxy_config, fetch_proxy_config_with_raw, load_proxy_config_cache,
+    me_config_updater, save_proxy_config_cache,
+};
 pub use rotation::{MeReinitTrigger, me_reinit_scheduler, me_rotation_task};
 pub use wire::proto_flags_for_tag;
 

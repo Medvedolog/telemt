@@ -203,6 +203,22 @@ impl ProxyConfig {
 
         sanitize_ad_tag(&mut config.general.ad_tag);
 
+        if let Some(path) = &config.general.proxy_config_v4_cache_path
+            && path.trim().is_empty()
+        {
+            return Err(ProxyError::Config(
+                "general.proxy_config_v4_cache_path cannot be empty when provided".to_string(),
+            ));
+        }
+
+        if let Some(path) = &config.general.proxy_config_v6_cache_path
+            && path.trim().is_empty()
+        {
+            return Err(ProxyError::Config(
+                "general.proxy_config_v6_cache_path cannot be empty when provided".to_string(),
+            ));
+        }
+
         if let Some(update_every) = config.general.update_every {
             if update_every == 0 {
                 return Err(ProxyError::Config(
@@ -237,9 +253,21 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_init_retry_attempts > 1_000_000 {
+            return Err(ProxyError::Config(
+                "general.me_init_retry_attempts must be within [0, 1000000]".to_string(),
+            ));
+        }
+
         if config.general.upstream_connect_retry_attempts == 0 {
             return Err(ProxyError::Config(
                 "general.upstream_connect_retry_attempts must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.upstream_connect_budget_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.upstream_connect_budget_ms must be > 0".to_string(),
             ));
         }
 
@@ -254,6 +282,12 @@ impl ProxyConfig {
         {
             return Err(ProxyError::Config(
                 "general.rpc_proxy_req_every must be 0 or within [10, 300]".to_string(),
+            ));
+        }
+
+        if config.access.user_max_unique_ips_window_secs == 0 {
+            return Err(ProxyError::Config(
+                "access.user_max_unique_ips_window_secs must be > 0".to_string(),
             ));
         }
 
@@ -398,6 +432,24 @@ impl ProxyConfig {
             ));
         }
 
+        if !(10..=5000).contains(&config.general.me_route_no_writer_wait_ms) {
+            return Err(ProxyError::Config(
+                "general.me_route_no_writer_wait_ms must be within [10, 5000]".to_string(),
+            ));
+        }
+
+        if config.general.me_route_inline_recovery_attempts == 0 {
+            return Err(ProxyError::Config(
+                "general.me_route_inline_recovery_attempts must be > 0".to_string(),
+            ));
+        }
+
+        if !(10..=30000).contains(&config.general.me_route_inline_recovery_wait_ms) {
+            return Err(ProxyError::Config(
+                "general.me_route_inline_recovery_wait_ms must be within [10, 30000]".to_string(),
+            ));
+        }
+
         if config.server.api.request_body_limit_bytes == 0 {
             return Err(ProxyError::Config(
                 "server.api.request_body_limit_bytes must be > 0".to_string(),
@@ -410,9 +462,33 @@ impl ProxyConfig {
             ));
         }
 
+        if config.server.api.runtime_edge_cache_ttl_ms > 60_000 {
+            return Err(ProxyError::Config(
+                "server.api.runtime_edge_cache_ttl_ms must be within [0, 60000]".to_string(),
+            ));
+        }
+
+        if !(1..=1000).contains(&config.server.api.runtime_edge_top_n) {
+            return Err(ProxyError::Config(
+                "server.api.runtime_edge_top_n must be within [1, 1000]".to_string(),
+            ));
+        }
+
+        if !(16..=4096).contains(&config.server.api.runtime_edge_events_capacity) {
+            return Err(ProxyError::Config(
+                "server.api.runtime_edge_events_capacity must be within [16, 4096]".to_string(),
+            ));
+        }
+
         if config.server.api.listen.parse::<SocketAddr>().is_err() {
             return Err(ProxyError::Config(
                 "server.api.listen must be in IP:PORT format".to_string(),
+            ));
+        }
+
+        if config.server.proxy_protocol_header_timeout_ms == 0 {
+            return Err(ProxyError::Config(
+                "server.proxy_protocol_header_timeout_ms must be > 0".to_string(),
             ));
         }
 
@@ -497,10 +573,11 @@ impl ProxyConfig {
             warn!("prefer_ipv6 is deprecated, use [network].prefer = 6");
         }
 
-        // Auto-enable NAT probe when Middle Proxy is requested.
-        if config.general.use_middle_proxy && !config.general.middle_proxy_nat_probe {
-            config.general.middle_proxy_nat_probe = true;
-            warn!("Auto-enabled middle_proxy_nat_probe for middle proxy mode");
+        if config.general.use_middle_proxy && !config.general.me_secret_atomic_snapshot {
+            config.general.me_secret_atomic_snapshot = true;
+            warn!(
+                "Auto-enabled me_secret_atomic_snapshot for middle proxy mode to keep KDF key_selector/secret coherent"
+            );
         }
 
         validate_network_cfg(&mut config.network)?;
@@ -654,6 +731,22 @@ mod tests {
             default_me_reconnect_fast_retry_count()
         );
         assert_eq!(
+            cfg.general.me_init_retry_attempts,
+            default_me_init_retry_attempts()
+        );
+        assert_eq!(
+            cfg.general.me2dc_fallback,
+            default_me2dc_fallback()
+        );
+        assert_eq!(
+            cfg.general.proxy_config_v4_cache_path,
+            default_proxy_config_v4_cache_path()
+        );
+        assert_eq!(
+            cfg.general.proxy_config_v6_cache_path,
+            default_proxy_config_v6_cache_path()
+        );
+        assert_eq!(
             cfg.general.me_single_endpoint_shadow_writers,
             default_me_single_endpoint_shadow_writers()
         );
@@ -727,7 +820,31 @@ mod tests {
             cfg.server.api.minimal_runtime_cache_ttl_ms,
             default_api_minimal_runtime_cache_ttl_ms()
         );
+        assert_eq!(
+            cfg.server.api.runtime_edge_enabled,
+            default_api_runtime_edge_enabled()
+        );
+        assert_eq!(
+            cfg.server.api.runtime_edge_cache_ttl_ms,
+            default_api_runtime_edge_cache_ttl_ms()
+        );
+        assert_eq!(
+            cfg.server.api.runtime_edge_top_n,
+            default_api_runtime_edge_top_n()
+        );
+        assert_eq!(
+            cfg.server.api.runtime_edge_events_capacity,
+            default_api_runtime_edge_events_capacity()
+        );
         assert_eq!(cfg.access.users, default_access_users());
+        assert_eq!(
+            cfg.access.user_max_unique_ips_mode,
+            UserMaxUniqueIpsMode::default()
+        );
+        assert_eq!(
+            cfg.access.user_max_unique_ips_window_secs,
+            default_user_max_unique_ips_window_secs()
+        );
     }
 
     #[test]
@@ -749,6 +866,19 @@ mod tests {
         assert_eq!(
             general.me_reconnect_fast_retry_count,
             default_me_reconnect_fast_retry_count()
+        );
+        assert_eq!(
+            general.me_init_retry_attempts,
+            default_me_init_retry_attempts()
+        );
+        assert_eq!(general.me2dc_fallback, default_me2dc_fallback());
+        assert_eq!(
+            general.proxy_config_v4_cache_path,
+            default_proxy_config_v4_cache_path()
+        );
+        assert_eq!(
+            general.proxy_config_v6_cache_path,
+            default_proxy_config_v6_cache_path()
         );
         assert_eq!(
             general.me_single_endpoint_shadow_writers,
@@ -821,6 +951,22 @@ mod tests {
         assert_eq!(
             server.api.minimal_runtime_cache_ttl_ms,
             default_api_minimal_runtime_cache_ttl_ms()
+        );
+        assert_eq!(
+            server.api.runtime_edge_enabled,
+            default_api_runtime_edge_enabled()
+        );
+        assert_eq!(
+            server.api.runtime_edge_cache_ttl_ms,
+            default_api_runtime_edge_cache_ttl_ms()
+        );
+        assert_eq!(
+            server.api.runtime_edge_top_n,
+            default_api_runtime_edge_top_n()
+        );
+        assert_eq!(
+            server.api.runtime_edge_events_capacity,
+            default_api_runtime_edge_events_capacity()
         );
 
         let access = AccessConfig::default();
@@ -1174,6 +1320,85 @@ mod tests {
     }
 
     #[test]
+    fn me_route_no_writer_wait_ms_out_of_range_is_rejected() {
+        let toml = r#"
+            [general]
+            me_route_no_writer_wait_ms = 5
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_route_no_writer_wait_ms_out_of_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_route_no_writer_wait_ms must be within [10, 5000]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_route_no_writer_mode_is_parsed() {
+        let toml = r#"
+            [general]
+            me_route_no_writer_mode = "inline_recovery_legacy"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_route_no_writer_mode_parse_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.general.me_route_no_writer_mode,
+            crate::config::MeRouteNoWriterMode::InlineRecoveryLegacy
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proxy_config_cache_paths_empty_are_rejected() {
+        let toml = r#"
+            [general]
+            proxy_config_v4_cache_path = "   "
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_proxy_config_v4_cache_path_empty_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.proxy_config_v4_cache_path cannot be empty"));
+        let _ = std::fs::remove_file(path);
+
+        let toml_v6 = r#"
+            [general]
+            proxy_config_v6_cache_path = ""
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let path_v6 = dir.join("telemt_proxy_config_v6_cache_path_empty_test.toml");
+        std::fs::write(&path_v6, toml_v6).unwrap();
+        let err_v6 = ProxyConfig::load(&path_v6).unwrap_err().to_string();
+        assert!(err_v6.contains("general.proxy_config_v6_cache_path cannot be empty"));
+        let _ = std::fs::remove_file(path_v6);
+    }
+
+    #[test]
     fn me_hardswap_warmup_defaults_are_set() {
         let toml = r#"
             [censorship]
@@ -1387,6 +1612,72 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("server.api.minimal_runtime_cache_ttl_ms must be within [0, 60000]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_runtime_edge_cache_ttl_out_of_range_is_rejected() {
+        let toml = r#"
+            [server.api]
+            enabled = true
+            listen = "127.0.0.1:9091"
+            runtime_edge_cache_ttl_ms = 70000
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_api_runtime_edge_cache_ttl_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("server.api.runtime_edge_cache_ttl_ms must be within [0, 60000]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_runtime_edge_top_n_out_of_range_is_rejected() {
+        let toml = r#"
+            [server.api]
+            enabled = true
+            listen = "127.0.0.1:9091"
+            runtime_edge_top_n = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_api_runtime_edge_top_n_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("server.api.runtime_edge_top_n must be within [1, 1000]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_runtime_edge_events_capacity_out_of_range_is_rejected() {
+        let toml = r#"
+            [server.api]
+            enabled = true
+            listen = "127.0.0.1:9091"
+            runtime_edge_events_capacity = 8
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_api_runtime_edge_events_capacity_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("server.api.runtime_edge_events_capacity must be within [16, 4096]"));
         let _ = std::fs::remove_file(path);
     }
 

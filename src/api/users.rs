@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 
 use hyper::StatusCode;
@@ -112,6 +111,9 @@ pub(super) async fn create_user(
             max_unique_ips: updated_limit,
             current_connections: 0,
             active_unique_ips: 0,
+            active_unique_ips_list: Vec::new(),
+            recent_unique_ips: 0,
+            recent_unique_ips_list: Vec::new(),
             total_octets: 0,
             links: build_user_links(
                 &cfg,
@@ -287,6 +289,7 @@ pub(super) async fn delete_user(
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
     let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
     drop(_guard);
+    shared.ip_tracker.remove_user_limit(user).await;
     shared.ip_tracker.clear_user_ips(user).await;
 
     Ok((user.to_string(), revision))
@@ -299,18 +302,21 @@ pub(super) async fn users_from_config(
     startup_detected_ip_v4: Option<IpAddr>,
     startup_detected_ip_v6: Option<IpAddr>,
 ) -> Vec<UserInfo> {
-    let ip_counts = ip_tracker
-        .get_stats()
-        .await
-        .into_iter()
-        .map(|(user, count, _)| (user, count))
-        .collect::<HashMap<_, _>>();
-
     let mut names = cfg.access.users.keys().cloned().collect::<Vec<_>>();
     names.sort();
+    let active_ip_lists = ip_tracker.get_active_ips_for_users(&names).await;
+    let recent_ip_lists = ip_tracker.get_recent_ips_for_users(&names).await;
 
     let mut users = Vec::with_capacity(names.len());
     for username in names {
+        let active_ip_list = active_ip_lists
+            .get(&username)
+            .cloned()
+            .unwrap_or_else(Vec::new);
+        let recent_ip_list = recent_ip_lists
+            .get(&username)
+            .cloned()
+            .unwrap_or_else(Vec::new);
         let links = cfg
             .access
             .users
@@ -339,7 +345,10 @@ pub(super) async fn users_from_config(
             data_quota_bytes: cfg.access.user_data_quota.get(&username).copied(),
             max_unique_ips: cfg.access.user_max_unique_ips.get(&username).copied(),
             current_connections: stats.get_user_curr_connects(&username),
-            active_unique_ips: ip_counts.get(&username).copied().unwrap_or(0),
+            active_unique_ips: active_ip_list.len(),
+            active_unique_ips_list: active_ip_list,
+            recent_unique_ips: recent_ip_list.len(),
+            recent_unique_ips_list: recent_ip_list,
             total_octets: stats.get_user_total_octets(&username),
             links,
             username,

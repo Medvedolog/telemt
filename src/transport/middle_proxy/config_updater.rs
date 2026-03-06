@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +41,87 @@ pub struct ProxyConfigData {
     pub default_dc: Option<i32>,
     pub http_status: u16,
     pub proxy_for_lines: u32,
+}
+
+pub fn parse_proxy_config_text(text: &str, http_status: u16) -> ProxyConfigData {
+    let mut map: HashMap<i32, Vec<(IpAddr, u16)>> = HashMap::new();
+    let mut proxy_for_lines: u32 = 0;
+    for line in text.lines() {
+        if let Some((dc, ip, port)) = parse_proxy_line(line) {
+            map.entry(dc).or_default().push((ip, port));
+            proxy_for_lines = proxy_for_lines.saturating_add(1);
+        }
+    }
+
+    let default_dc = text.lines().find_map(|l| {
+        let t = l.trim();
+        if let Some(rest) = t.strip_prefix("default") {
+            return rest.trim().trim_end_matches(';').parse::<i32>().ok();
+        }
+        None
+    });
+
+    ProxyConfigData {
+        map,
+        default_dc,
+        http_status,
+        proxy_for_lines,
+    }
+}
+
+pub async fn load_proxy_config_cache(path: &str) -> Result<ProxyConfigData> {
+    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+        crate::error::ProxyError::Proxy(format!("read proxy-config cache '{path}' failed: {e}"))
+    })?;
+    Ok(parse_proxy_config_text(&text, 200))
+}
+
+pub async fn save_proxy_config_cache(path: &str, raw_text: &str) -> Result<()> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            crate::error::ProxyError::Proxy(format!(
+                "create proxy-config cache dir '{}' failed: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    tokio::fs::write(path, raw_text).await.map_err(|e| {
+        crate::error::ProxyError::Proxy(format!("write proxy-config cache '{path}' failed: {e}"))
+    })?;
+    Ok(())
+}
+
+pub async fn fetch_proxy_config_with_raw(url: &str) -> Result<(ProxyConfigData, String)> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| crate::error::ProxyError::Proxy(format!("fetch_proxy_config GET failed: {e}")))?
+        ;
+    let http_status = resp.status().as_u16();
+
+    if let Some(date) = resp.headers().get(reqwest::header::DATE)
+        && let Ok(date_str) = date.to_str()
+        && let Ok(server_time) = httpdate::parse_http_date(date_str)
+        && let Ok(skew) = SystemTime::now().duration_since(server_time).or_else(|e| {
+            server_time.duration_since(SystemTime::now()).map_err(|_| e)
+        })
+    {
+        let skew_secs = skew.as_secs();
+        if skew_secs > 60 {
+            warn!(skew_secs, "Time skew >60s detected from fetch_proxy_config Date header");
+        } else if skew_secs > 30 {
+            warn!(skew_secs, "Time skew >30s detected from fetch_proxy_config Date header");
+        }
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| crate::error::ProxyError::Proxy(format!("fetch_proxy_config read failed: {e}")))?;
+    let parsed = parse_proxy_config_text(&text, http_status);
+    Ok((parsed, text))
 }
 
 #[derive(Debug, Default)]
@@ -170,61 +252,9 @@ fn parse_proxy_line(line: &str) -> Option<(i32, IpAddr, u16)> {
 }
 
 pub async fn fetch_proxy_config(url: &str) -> Result<ProxyConfigData> {
-    let resp = reqwest::get(url)
+    fetch_proxy_config_with_raw(url)
         .await
-        .map_err(|e| crate::error::ProxyError::Proxy(format!("fetch_proxy_config GET failed: {e}")))?
-        ;
-    let http_status = resp.status().as_u16();
-
-    if let Some(date) = resp.headers().get(reqwest::header::DATE)
-        && let Ok(date_str) = date.to_str()
-        && let Ok(server_time) = httpdate::parse_http_date(date_str)
-        && let Ok(skew) = SystemTime::now().duration_since(server_time).or_else(|e| {
-            server_time.duration_since(SystemTime::now()).map_err(|_| e)
-        })
-    {
-        let skew_secs = skew.as_secs();
-        if skew_secs > 60 {
-            warn!(skew_secs, "Time skew >60s detected from fetch_proxy_config Date header");
-        } else if skew_secs > 30 {
-            warn!(skew_secs, "Time skew >30s detected from fetch_proxy_config Date header");
-        }
-    }
-
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| crate::error::ProxyError::Proxy(format!("fetch_proxy_config read failed: {e}")))?;
-
-    let mut map: HashMap<i32, Vec<(IpAddr, u16)>> = HashMap::new();
-    let mut proxy_for_lines: u32 = 0;
-    for line in text.lines() {
-        if let Some((dc, ip, port)) = parse_proxy_line(line) {
-            map.entry(dc).or_default().push((ip, port));
-            proxy_for_lines = proxy_for_lines.saturating_add(1);
-        }
-    }
-
-    let default_dc = text
-        .lines()
-        .find_map(|l| {
-            let t = l.trim();
-            if let Some(rest) = t.strip_prefix("default") {
-                return rest
-                    .trim()
-                    .trim_end_matches(';')
-                    .parse::<i32>()
-                    .ok();
-            }
-            None
-        });
-
-    Ok(ProxyConfigData {
-        map,
-        default_dc,
-        http_status,
-        proxy_for_lines,
-    })
+        .map(|(parsed, _raw)| parsed)
 }
 
 fn snapshot_passes_guards(

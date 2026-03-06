@@ -2,16 +2,14 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::AUTHORIZATION;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
@@ -23,20 +21,47 @@ use crate::transport::middle_proxy::MePool;
 use crate::transport::UpstreamManager;
 
 mod config_store;
+mod events;
+mod http_utils;
 mod model;
+mod runtime_edge;
+mod runtime_min;
 mod runtime_stats;
+mod runtime_watch;
+mod runtime_zero;
 mod users;
 
 use config_store::{current_revision, parse_if_match};
+use http_utils::{error_response, read_json, read_optional_json, success_response};
+use events::ApiEventStore;
 use model::{
-    ApiFailure, CreateUserRequest, ErrorBody, ErrorResponse, HealthData, PatchUserRequest,
-    RotateSecretRequest, SuccessResponse, SummaryData,
+    ApiFailure, CreateUserRequest, HealthData, PatchUserRequest, RotateSecretRequest, SummaryData,
+};
+use runtime_edge::{
+    EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
+    build_runtime_events_recent_data,
+};
+use runtime_min::{
+    build_runtime_me_pool_state_data, build_runtime_me_quality_data, build_runtime_nat_stun_data,
+    build_runtime_upstream_quality_data, build_security_whitelist_data,
 };
 use runtime_stats::{
     MinimalCacheEntry, build_dcs_data, build_me_writers_data, build_minimal_all_data,
     build_upstreams_data, build_zero_all_data,
 };
+use runtime_zero::{
+    build_limits_effective_data, build_runtime_gates_data, build_security_posture_data,
+    build_system_info_data,
+};
+use runtime_watch::spawn_runtime_watchers;
 use users::{create_user, delete_user, patch_user, rotate_secret, users_from_config};
+
+pub(super) struct ApiRuntimeState {
+    pub(super) process_started_at_epoch_secs: u64,
+    pub(super) config_reload_count: AtomicU64,
+    pub(super) last_config_reload_epoch_secs: AtomicU64,
+    pub(super) admission_open: AtomicBool,
+}
 
 #[derive(Clone)]
 pub(super) struct ApiShared {
@@ -49,7 +74,11 @@ pub(super) struct ApiShared {
     pub(super) startup_detected_ip_v6: Option<IpAddr>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
+    pub(super) runtime_edge_connections_cache: Arc<Mutex<Option<EdgeConnectionsCacheEntry>>>,
+    pub(super) runtime_edge_recompute_lock: Arc<Mutex<()>>,
+    pub(super) runtime_events: Arc<ApiEventStore>,
     pub(super) request_id: Arc<AtomicU64>,
+    pub(super) runtime_state: Arc<ApiRuntimeState>,
 }
 
 impl ApiShared {
@@ -65,9 +94,11 @@ pub async fn serve(
     me_pool: Option<Arc<MePool>>,
     upstream_manager: Arc<UpstreamManager>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
+    admission_rx: watch::Receiver<bool>,
     config_path: PathBuf,
     startup_detected_ip_v4: Option<IpAddr>,
     startup_detected_ip_v6: Option<IpAddr>,
+    process_started_at_epoch_secs: u64,
 ) {
     let listener = match TcpListener::bind(listen).await {
         Ok(listener) => listener,
@@ -83,6 +114,13 @@ pub async fn serve(
 
     info!("API endpoint: http://{}/v1/*", listen);
 
+    let runtime_state = Arc::new(ApiRuntimeState {
+        process_started_at_epoch_secs,
+        config_reload_count: AtomicU64::new(0),
+        last_config_reload_epoch_secs: AtomicU64::new(0),
+        admission_open: AtomicBool::new(*admission_rx.borrow()),
+    });
+
     let shared = Arc::new(ApiShared {
         stats,
         ip_tracker,
@@ -93,8 +131,21 @@ pub async fn serve(
         startup_detected_ip_v6,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
+        runtime_edge_connections_cache: Arc::new(Mutex::new(None)),
+        runtime_edge_recompute_lock: Arc::new(Mutex::new(())),
+        runtime_events: Arc::new(ApiEventStore::new(
+            config_rx.borrow().server.api.runtime_edge_events_capacity,
+        )),
         request_id: Arc::new(AtomicU64::new(1)),
+        runtime_state: runtime_state.clone(),
     });
+
+    spawn_runtime_watchers(
+        config_rx.clone(),
+        admission_rx.clone(),
+        runtime_state.clone(),
+        shared.runtime_events.clone(),
+    );
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -177,6 +228,7 @@ async fn handle(
 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     let body_limit = api_cfg.request_body_limit_bytes;
 
     let result: Result<Response<Full<Bytes>>, ApiFailure> = async {
@@ -187,6 +239,31 @@ async fn handle(
                     status: "ok",
                     read_only: api_cfg.read_only,
                 };
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/system/info") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_system_info_data(shared.as_ref(), cfg.as_ref(), &revision);
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/gates") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_gates_data(shared.as_ref(), cfg.as_ref());
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/limits/effective") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_limits_effective_data(cfg.as_ref());
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/security/posture") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_security_posture_data(cfg.as_ref());
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/security/whitelist") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_security_whitelist_data(cfg.as_ref());
                 Ok(success_response(StatusCode::OK, data, revision))
             }
             ("GET", "/v1/stats/summary") => {
@@ -225,6 +302,40 @@ async fn handle(
                 let data = build_dcs_data(shared.as_ref(), api_cfg).await;
                 Ok(success_response(StatusCode::OK, data, revision))
             }
+            ("GET", "/v1/runtime/me_pool_state") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_me_pool_state_data(shared.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/me_quality") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_me_quality_data(shared.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/upstream_quality") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_upstream_quality_data(shared.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/nat_stun") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_nat_stun_data(shared.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/connections/summary") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_connections_summary_data(shared.as_ref(), cfg.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/events/recent") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_events_recent_data(
+                    shared.as_ref(),
+                    cfg.as_ref(),
+                    query.as_deref(),
+                );
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
             ("GET", "/v1/stats/users") | ("GET", "/v1/users") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let users = users_from_config(
@@ -250,7 +361,17 @@ async fn handle(
                 }
                 let expected_revision = parse_if_match(req.headers());
                 let body = read_json::<CreateUserRequest>(req.into_body(), body_limit).await?;
-                let (data, revision) = create_user(body, expected_revision, &shared).await?;
+                let result = create_user(body, expected_revision, &shared).await;
+                let (data, revision) = match result {
+                    Ok(ok) => ok,
+                    Err(error) => {
+                        shared.runtime_events.record("api.user.create.failed", error.code);
+                        return Err(error);
+                    }
+                };
+                shared
+                    .runtime_events
+                    .record("api.user.create.ok", format!("username={}", data.user.username));
                 Ok(success_response(StatusCode::CREATED, data, revision))
             }
             _ => {
@@ -290,8 +411,20 @@ async fn handle(
                         }
                         let expected_revision = parse_if_match(req.headers());
                         let body = read_json::<PatchUserRequest>(req.into_body(), body_limit).await?;
-                        let (data, revision) =
-                            patch_user(user, body, expected_revision, &shared).await?;
+                        let result = patch_user(user, body, expected_revision, &shared).await;
+                        let (data, revision) = match result {
+                            Ok(ok) => ok,
+                            Err(error) => {
+                                shared.runtime_events.record(
+                                    "api.user.patch.failed",
+                                    format!("username={} code={}", user, error.code),
+                                );
+                                return Err(error);
+                            }
+                        };
+                        shared
+                            .runtime_events
+                            .record("api.user.patch.ok", format!("username={}", data.username));
                         return Ok(success_response(StatusCode::OK, data, revision));
                     }
                     if method == Method::DELETE {
@@ -306,8 +439,21 @@ async fn handle(
                             ));
                         }
                         let expected_revision = parse_if_match(req.headers());
-                        let (deleted_user, revision) =
-                            delete_user(user, expected_revision, &shared).await?;
+                        let result = delete_user(user, expected_revision, &shared).await;
+                        let (deleted_user, revision) = match result {
+                            Ok(ok) => ok,
+                            Err(error) => {
+                                shared.runtime_events.record(
+                                    "api.user.delete.failed",
+                                    format!("username={} code={}", user, error.code),
+                                );
+                                return Err(error);
+                            }
+                        };
+                        shared.runtime_events.record(
+                            "api.user.delete.ok",
+                            format!("username={}", deleted_user),
+                        );
                         return Ok(success_response(StatusCode::OK, deleted_user, revision));
                     }
                     if method == Method::POST
@@ -329,9 +475,27 @@ async fn handle(
                         let body =
                             read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
                                 .await?;
-                        let (data, revision) =
-                            rotate_secret(base_user, body.unwrap_or_default(), expected_revision, &shared)
-                                .await?;
+                        let result = rotate_secret(
+                            base_user,
+                            body.unwrap_or_default(),
+                            expected_revision,
+                            &shared,
+                        )
+                        .await;
+                        let (data, revision) = match result {
+                            Ok(ok) => ok,
+                            Err(error) => {
+                                shared.runtime_events.record(
+                                    "api.user.rotate_secret.failed",
+                                    format!("username={} code={}", base_user, error.code),
+                                );
+                                return Err(error);
+                            }
+                        };
+                        shared.runtime_events.record(
+                            "api.user.rotate_secret.ok",
+                            format!("username={}", base_user),
+                        );
                         return Ok(success_response(StatusCode::OK, data, revision));
                     }
                     if method == Method::POST {
@@ -362,82 +526,4 @@ async fn handle(
         Ok(resp) => Ok(resp),
         Err(error) => Ok(error_response(request_id, error)),
     }
-}
-
-fn success_response<T: Serialize>(
-    status: StatusCode,
-    data: T,
-    revision: String,
-) -> Response<Full<Bytes>> {
-    let payload = SuccessResponse {
-        ok: true,
-        data,
-        revision,
-    };
-    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap()
-}
-
-fn error_response(request_id: u64, failure: ApiFailure) -> Response<Full<Bytes>> {
-    let payload = ErrorResponse {
-        ok: false,
-        error: ErrorBody {
-            code: failure.code,
-            message: failure.message,
-        },
-        request_id,
-    };
-    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
-        format!(
-            "{{\"ok\":false,\"error\":{{\"code\":\"internal_error\",\"message\":\"serialization failed\"}},\"request_id\":{}}}",
-            request_id
-        )
-        .into_bytes()
-    });
-    Response::builder()
-        .status(failure.status)
-        .header("content-type", "application/json; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap()
-}
-
-async fn read_json<T: DeserializeOwned>(body: Incoming, limit: usize) -> Result<T, ApiFailure> {
-    let bytes = read_body_with_limit(body, limit).await?;
-    serde_json::from_slice(&bytes).map_err(|_| ApiFailure::bad_request("Invalid JSON body"))
-}
-
-async fn read_optional_json<T: DeserializeOwned>(
-    body: Incoming,
-    limit: usize,
-) -> Result<Option<T>, ApiFailure> {
-    let bytes = read_body_with_limit(body, limit).await?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| ApiFailure::bad_request("Invalid JSON body"))
-}
-
-async fn read_body_with_limit(body: Incoming, limit: usize) -> Result<Vec<u8>, ApiFailure> {
-    let mut collected = Vec::new();
-    let mut body = body;
-    while let Some(frame_result) = body.frame().await {
-        let frame = frame_result.map_err(|_| ApiFailure::bad_request("Invalid request body"))?;
-        if let Some(chunk) = frame.data_ref() {
-            if collected.len().saturating_add(chunk.len()) > limit {
-                return Err(ApiFailure::new(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "payload_too_large",
-                    format!("Body exceeds {} bytes", limit),
-                ));
-            }
-            collected.extend_from_slice(chunk);
-        }
-    }
-    Ok(collected)
 }

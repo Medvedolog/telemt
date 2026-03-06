@@ -12,8 +12,10 @@ const DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS: u8 = 2;
 const DEFAULT_ME_ADAPTIVE_FLOOR_IDLE_SECS: u64 = 90;
 const DEFAULT_ME_ADAPTIVE_FLOOR_MIN_WRITERS_SINGLE_ENDPOINT: u8 = 1;
 const DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS: u64 = 180;
+const DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS: u64 = 30;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 2;
 const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
+const DEFAULT_UPSTREAM_CONNECT_BUDGET_MS: u64 = 3000;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
 const DEFAULT_ACCESS_USER: &str = "default";
 const DEFAULT_ACCESS_SECRET: &str = "00000000000000000000000000000000";
@@ -112,6 +114,15 @@ pub(crate) fn default_api_minimal_runtime_cache_ttl_ms() -> u64 {
     1000
 }
 
+pub(crate) fn default_api_runtime_edge_enabled() -> bool { false }
+pub(crate) fn default_api_runtime_edge_cache_ttl_ms() -> u64 { 1000 }
+pub(crate) fn default_api_runtime_edge_top_n() -> usize { 10 }
+pub(crate) fn default_api_runtime_edge_events_capacity() -> usize { 256 }
+
+pub(crate) fn default_proxy_protocol_header_timeout_ms() -> u64 {
+    500
+}
+
 pub(crate) fn default_prefer_4() -> u8 {
     4
 }
@@ -128,12 +139,24 @@ pub(crate) fn default_unknown_dc_log_path() -> Option<String> {
     Some("unknown-dc.txt".to_string())
 }
 
+pub(crate) fn default_unknown_dc_file_log_enabled() -> bool {
+    false
+}
+
 pub(crate) fn default_pool_size() -> usize {
     8
 }
 
 pub(crate) fn default_proxy_secret_path() -> Option<String> {
     Some("proxy-secret".to_string())
+}
+
+pub(crate) fn default_proxy_config_v4_cache_path() -> Option<String> {
+    Some("cache/proxy-config-v4.txt".to_string())
+}
+
+pub(crate) fn default_proxy_config_v6_cache_path() -> Option<String> {
+    Some("cache/proxy-config-v6.txt".to_string())
 }
 
 pub(crate) fn default_middle_proxy_nat_stun() -> Option<String> {
@@ -150,6 +173,14 @@ pub(crate) fn default_stun_nat_probe_concurrency() -> usize {
 
 pub(crate) fn default_middle_proxy_warm_standby() -> usize {
     DEFAULT_MIDDLE_PROXY_WARM_STANDBY
+}
+
+pub(crate) fn default_me_init_retry_attempts() -> u32 {
+    0
+}
+
+pub(crate) fn default_me2dc_fallback() -> bool {
+    true
 }
 
 pub(crate) fn default_keepalive_interval() -> u64 {
@@ -232,6 +263,10 @@ pub(crate) fn default_upstream_unhealthy_fail_threshold() -> u32 {
     DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD
 }
 
+pub(crate) fn default_upstream_connect_budget_ms() -> u64 {
+    DEFAULT_UPSTREAM_CONNECT_BUDGET_MS
+}
+
 pub(crate) fn default_upstream_connect_failfast_hard_errors() -> bool {
     false
 }
@@ -262,6 +297,18 @@ pub(crate) fn default_me_route_backpressure_high_timeout_ms() -> u64 {
 
 pub(crate) fn default_me_route_backpressure_high_watermark_pct() -> u8 {
     80
+}
+
+pub(crate) fn default_me_route_no_writer_wait_ms() -> u64 {
+    250
+}
+
+pub(crate) fn default_me_route_inline_recovery_attempts() -> u32 {
+    3
+}
+
+pub(crate) fn default_me_route_inline_recovery_wait_ms() -> u64 {
+    3000
 }
 
 pub(crate) fn default_beobachten_minutes() -> u64 {
@@ -462,6 +509,10 @@ pub(crate) fn default_access_users() -> HashMap<String, String> {
         DEFAULT_ACCESS_USER.to_string(),
         DEFAULT_ACCESS_SECRET.to_string(),
     )])
+}
+
+pub(crate) fn default_user_max_unique_ips_window_secs() -> u64 {
+    DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS
 }
 
 // Custom deserializer helpers

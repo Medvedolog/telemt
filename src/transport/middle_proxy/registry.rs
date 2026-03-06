@@ -208,6 +208,23 @@ impl ConnRegistry {
         }
     }
 
+    pub async fn route_nowait(&self, id: u64, resp: MeResponse) -> RouteResult {
+        let tx = {
+            let inner = self.inner.read().await;
+            inner.map.get(&id).cloned()
+        };
+
+        let Some(tx) = tx else {
+            return RouteResult::NoConn;
+        };
+
+        match tx.try_send(resp) {
+            Ok(()) => RouteResult::Routed,
+            Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
+            Err(TrySendError::Full(_)) => RouteResult::QueueFullBase,
+        }
+    }
+
     pub async fn bind_writer(
         &self,
         conn_id: u64,
@@ -256,13 +273,12 @@ impl ConnRegistry {
             bound_clients_by_writer.insert(*writer_id, conn_ids.len());
         }
         for conn_meta in inner.meta.values() {
-            let dc_u16 = conn_meta.target_dc.unsigned_abs();
-            if dc_u16 == 0 {
+            if conn_meta.target_dc == 0 {
                 continue;
             }
-            if let Ok(dc) = i16::try_from(dc_u16) {
-                *active_sessions_by_target_dc.entry(dc).or_insert(0) += 1;
-            }
+            *active_sessions_by_target_dc
+                .entry(conn_meta.target_dc)
+                .or_insert(0) += 1;
         }
 
         WriterActivitySnapshot {
@@ -276,6 +292,11 @@ impl ConnRegistry {
         let writer_id = inner.writer_for_conn.get(&conn_id).cloned()?;
         let writer = inner.writers.get(&writer_id).cloned()?;
         Some(ConnWriter { writer_id, tx: writer })
+    }
+
+    pub async fn active_conn_ids(&self) -> Vec<u64> {
+        let inner = self.inner.read().await;
+        inner.writer_for_conn.keys().copied().collect()
     }
 
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
@@ -380,7 +401,8 @@ mod tests {
         let snapshot = registry.writer_activity_snapshot().await;
         assert_eq!(snapshot.bound_clients_by_writer.get(&10), Some(&2));
         assert_eq!(snapshot.bound_clients_by_writer.get(&20), Some(&1));
-        assert_eq!(snapshot.active_sessions_by_target_dc.get(&2), Some(&2));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&2), Some(&1));
+        assert_eq!(snapshot.active_sessions_by_target_dc.get(&-2), Some(&1));
         assert_eq!(snapshot.active_sessions_by_target_dc.get(&4), Some(&1));
     }
 }

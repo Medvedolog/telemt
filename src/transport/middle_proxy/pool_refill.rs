@@ -108,19 +108,10 @@ impl MePool {
         } else {
             IpFamily::V6
         };
-        let map = self.proxy_map_for_family(family).await;
-        for (dc, endpoints) in map {
-            if endpoints
-                .into_iter()
-                .any(|(ip, port)| SocketAddr::new(ip, port) == addr)
-            {
-                return Some(RefillDcKey {
-                    dc: dc.abs(),
-                    family,
-                });
-            }
-        }
-        None
+        Some(RefillDcKey {
+            dc: self.resolve_dc_for_endpoint(addr).await,
+            family,
+        })
     }
 
     async fn resolve_refill_dc_keys_for_endpoints(
@@ -177,47 +168,23 @@ impl MePool {
     }
 
     async fn endpoints_for_same_dc(&self, addr: SocketAddr) -> Vec<SocketAddr> {
-        let mut target_dc = HashSet::<i32>::new();
         let mut endpoints = HashSet::<SocketAddr>::new();
+        let target_dc = self.resolve_dc_for_endpoint(addr).await;
 
         if self.decision.ipv4_me {
             let map = self.proxy_map_v4.read().await.clone();
-            for (dc, addrs) in &map {
-                if addrs
-                    .iter()
-                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-                {
-                    target_dc.insert(dc.abs());
-                }
-            }
-            for dc in &target_dc {
-                for key in [*dc, -*dc] {
-                    if let Some(addrs) = map.get(&key) {
-                        for (ip, port) in addrs {
-                            endpoints.insert(SocketAddr::new(*ip, *port));
-                        }
-                    }
+            if let Some(addrs) = map.get(&target_dc) {
+                for (ip, port) in addrs {
+                    endpoints.insert(SocketAddr::new(*ip, *port));
                 }
             }
         }
 
         if self.decision.ipv6_me {
             let map = self.proxy_map_v6.read().await.clone();
-            for (dc, addrs) in &map {
-                if addrs
-                    .iter()
-                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-                {
-                    target_dc.insert(dc.abs());
-                }
-            }
-            for dc in &target_dc {
-                for key in [*dc, -*dc] {
-                    if let Some(addrs) = map.get(&key) {
-                        for (ip, port) in addrs {
-                            endpoints.insert(SocketAddr::new(*ip, *port));
-                        }
-                    }
+            if let Some(addrs) = map.get(&target_dc) {
+                for (ip, port) in addrs {
+                    endpoints.insert(SocketAddr::new(*ip, *port));
                 }
             }
         }

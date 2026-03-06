@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
@@ -210,7 +210,7 @@ where
     let proto_tag = success.proto_tag;
     let pool_generation = me_pool.current_generation();
 
-    info!(
+    debug!(
         user = %user,
         peer = %peer,
         dc = success.dc_idx,
@@ -237,6 +237,7 @@ where
 
     stats.increment_user_connects(&user);
     stats.increment_user_curr_connects(&user);
+    stats.increment_current_connections_me();
 
     // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
     let user_tag: Option<Vec<u8>> = config
@@ -466,6 +467,7 @@ where
         "ME relay cleanup"
     );
     me_pool.registry().unregister(conn_id).await;
+    stats.decrement_current_connections_me();
     stats.decrement_user_curr_connects(&user);
     result
 }

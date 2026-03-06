@@ -84,38 +84,7 @@ impl MePool {
     }
 
     async fn resolve_dc_idx_for_endpoint(&self, addr: SocketAddr) -> Option<i16> {
-        if addr.is_ipv4() {
-            let map = self.proxy_map_v4.read().await;
-            for (dc, addrs) in map.iter() {
-                if addrs
-                    .iter()
-                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-                {
-                    let abs_dc = dc.abs();
-                    if abs_dc > 0
-                        && let Ok(dc_idx) = i16::try_from(abs_dc)
-                    {
-                        return Some(dc_idx);
-                    }
-                }
-            }
-        } else {
-            let map = self.proxy_map_v6.read().await;
-            for (dc, addrs) in map.iter() {
-                if addrs
-                    .iter()
-                    .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-                {
-                    let abs_dc = dc.abs();
-                    if abs_dc > 0
-                        && let Ok(dc_idx) = i16::try_from(abs_dc)
-                    {
-                        return Some(dc_idx);
-                    }
-                }
-            }
-        }
-        None
+        i16::try_from(self.resolve_dc_for_endpoint(addr).await).ok()
     }
 
     fn direct_bind_ip_for_stun(
@@ -387,9 +356,11 @@ impl MePool {
             socks_bound_addr.map(|value| value.ip()),
             client_port_source,
         );
-        let mut kdf_fingerprint_guard = self.kdf_material_fingerprint.lock().await;
-        if let Some((prev_fingerprint, prev_client_port)) =
+        let previous_kdf_fingerprint = {
+            let kdf_fingerprint_guard = self.kdf_material_fingerprint.read().await;
             kdf_fingerprint_guard.get(&peer_addr_nat).copied()
+        };
+        if let Some((prev_fingerprint, prev_client_port)) = previous_kdf_fingerprint
         {
             if prev_fingerprint != kdf_fingerprint {
                 self.stats.increment_me_kdf_drift_total();
@@ -416,6 +387,9 @@ impl MePool {
                 );
             }
         }
+        // Keep fingerprint updates eventually consistent for diagnostics while avoiding
+        // serializing all concurrent handshakes on a single async mutex.
+        let mut kdf_fingerprint_guard = self.kdf_material_fingerprint.write().await;
         kdf_fingerprint_guard.insert(peer_addr_nat, (kdf_fingerprint, client_port_for_kdf));
         drop(kdf_fingerprint_guard);
 

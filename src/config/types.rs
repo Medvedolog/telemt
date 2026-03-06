@@ -183,6 +183,48 @@ impl MeFloorMode {
     }
 }
 
+/// Middle-End route behavior when no writer is immediately available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeRouteNoWriterMode {
+    AsyncRecoveryFailfast,
+    InlineRecoveryLegacy,
+    #[default]
+    HybridAsyncPersistent,
+}
+
+impl MeRouteNoWriterMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            MeRouteNoWriterMode::AsyncRecoveryFailfast => 0,
+            MeRouteNoWriterMode::InlineRecoveryLegacy => 1,
+            MeRouteNoWriterMode::HybridAsyncPersistent => 2,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => MeRouteNoWriterMode::AsyncRecoveryFailfast,
+            1 => MeRouteNoWriterMode::InlineRecoveryLegacy,
+            2 => MeRouteNoWriterMode::HybridAsyncPersistent,
+            _ => MeRouteNoWriterMode::HybridAsyncPersistent,
+        }
+    }
+}
+
+/// Per-user unique source IP limit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMaxUniqueIpsMode {
+    /// Count only currently active source IPs.
+    #[default]
+    ActiveWindow,
+    /// Count source IPs seen within the recent time window.
+    TimeWindow,
+    /// Enforce both active and recent-window limits at the same time.
+    Combined,
+}
+
 /// Telemetry controls for hot-path counters and ME diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryConfig {
@@ -305,6 +347,14 @@ pub struct GeneralConfig {
     #[serde(default = "default_proxy_secret_path")]
     pub proxy_secret_path: Option<String>,
 
+    /// Optional path to cache raw getProxyConfig (IPv4) snapshot for startup fallback.
+    #[serde(default = "default_proxy_config_v4_cache_path")]
+    pub proxy_config_v4_cache_path: Option<String>,
+
+    /// Optional path to cache raw getProxyConfigV6 snapshot for startup fallback.
+    #[serde(default = "default_proxy_config_v6_cache_path")]
+    pub proxy_config_v6_cache_path: Option<String>,
+
     /// Global ad_tag (32 hex chars from @MTProxybot). Fallback when user has no per-user tag in access.user_ad_tags.
     #[serde(default)]
     pub ad_tag: Option<String>,
@@ -339,6 +389,15 @@ pub struct GeneralConfig {
     /// Number of warm standby ME connections kept pre-initialized.
     #[serde(default = "default_middle_proxy_warm_standby")]
     pub middle_proxy_warm_standby: usize,
+
+    /// Startup retries for Middle-End pool initialization before ME→Direct fallback.
+    /// 0 means unlimited retries.
+    #[serde(default = "default_me_init_retry_attempts")]
+    pub me_init_retry_attempts: u32,
+
+    /// Allow fallback from Middle-End mode to direct DC when ME startup cannot be initialized.
+    #[serde(default = "default_me2dc_fallback")]
+    pub me2dc_fallback: bool,
 
     /// Enable ME keepalive padding frames.
     #[serde(default = "default_true")]
@@ -473,6 +532,10 @@ pub struct GeneralConfig {
     #[serde(default = "default_upstream_connect_retry_backoff_ms")]
     pub upstream_connect_retry_backoff_ms: u64,
 
+    /// Total wall-clock budget in milliseconds for one upstream connect request across retries.
+    #[serde(default = "default_upstream_connect_budget_ms")]
+    pub upstream_connect_budget_ms: u64,
+
     /// Consecutive failed requests before upstream is marked unhealthy.
     #[serde(default = "default_upstream_unhealthy_fail_threshold")]
     pub upstream_unhealthy_fail_threshold: u32,
@@ -488,6 +551,10 @@ pub struct GeneralConfig {
     /// Log unknown (non-standard) DC requests to a file (default: unknown-dc.txt). Set to null to disable.
     #[serde(default = "default_unknown_dc_log_path")]
     pub unknown_dc_log_path: Option<String>,
+
+    /// Enable unknown-DC file logging.
+    #[serde(default = "default_unknown_dc_file_log_enabled")]
+    pub unknown_dc_file_log_enabled: bool,
 
     #[serde(default)]
     pub log_level: LogLevel,
@@ -515,6 +582,22 @@ pub struct GeneralConfig {
     /// Queue occupancy percent threshold for high backpressure timeout.
     #[serde(default = "default_me_route_backpressure_high_watermark_pct")]
     pub me_route_backpressure_high_watermark_pct: u8,
+
+    /// ME route behavior when no writer is immediately available.
+    #[serde(default)]
+    pub me_route_no_writer_mode: MeRouteNoWriterMode,
+
+    /// Maximum wait time in milliseconds for async-recovery failfast mode.
+    #[serde(default = "default_me_route_no_writer_wait_ms")]
+    pub me_route_no_writer_wait_ms: u64,
+
+    /// Number of inline recovery attempts in legacy mode.
+    #[serde(default = "default_me_route_inline_recovery_attempts")]
+    pub me_route_inline_recovery_attempts: u32,
+
+    /// Maximum wait time in milliseconds for inline recovery in legacy mode.
+    #[serde(default = "default_me_route_inline_recovery_wait_ms")]
+    pub me_route_inline_recovery_wait_ms: u64,
 
     /// [general.links] — proxy link generation overrides.
     #[serde(default)]
@@ -660,6 +743,8 @@ impl Default for GeneralConfig {
             use_middle_proxy: default_true(),
             ad_tag: None,
             proxy_secret_path: default_proxy_secret_path(),
+            proxy_config_v4_cache_path: default_proxy_config_v4_cache_path(),
+            proxy_config_v6_cache_path: default_proxy_config_v6_cache_path(),
             middle_proxy_nat_ip: None,
             middle_proxy_nat_probe: default_true(),
             middle_proxy_nat_stun: default_middle_proxy_nat_stun(),
@@ -667,6 +752,8 @@ impl Default for GeneralConfig {
             stun_nat_probe_concurrency: default_stun_nat_probe_concurrency(),
             middle_proxy_pool_size: default_pool_size(),
             middle_proxy_warm_standby: default_middle_proxy_warm_standby(),
+            me_init_retry_attempts: default_me_init_retry_attempts(),
+            me2dc_fallback: default_me2dc_fallback(),
             me_keepalive_enabled: default_true(),
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),
@@ -691,10 +778,12 @@ impl Default for GeneralConfig {
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
+            upstream_connect_budget_ms: default_upstream_connect_budget_ms(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),
             upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
             unknown_dc_log_path: default_unknown_dc_log_path(),
+            unknown_dc_file_log_enabled: default_unknown_dc_file_log_enabled(),
             log_level: LogLevel::Normal,
             disable_colors: false,
             telemetry: TelemetryConfig::default(),
@@ -702,6 +791,10 @@ impl Default for GeneralConfig {
             me_route_backpressure_base_timeout_ms: default_me_route_backpressure_base_timeout_ms(),
             me_route_backpressure_high_timeout_ms: default_me_route_backpressure_high_timeout_ms(),
             me_route_backpressure_high_watermark_pct: default_me_route_backpressure_high_watermark_pct(),
+            me_route_no_writer_mode: MeRouteNoWriterMode::default(),
+            me_route_no_writer_wait_ms: default_me_route_no_writer_wait_ms(),
+            me_route_inline_recovery_attempts: default_me_route_inline_recovery_attempts(),
+            me_route_inline_recovery_wait_ms: default_me_route_inline_recovery_wait_ms(),
             links: LinksConfig::default(),
             crypto_pending_buffer: default_crypto_pending_buffer(),
             max_client_frame: default_max_client_frame(),
@@ -825,6 +918,22 @@ pub struct ApiConfig {
     #[serde(default = "default_api_minimal_runtime_cache_ttl_ms")]
     pub minimal_runtime_cache_ttl_ms: u64,
 
+    /// Enables runtime edge endpoints with optional cached aggregation.
+    #[serde(default = "default_api_runtime_edge_enabled")]
+    pub runtime_edge_enabled: bool,
+
+    /// Cache TTL for runtime edge aggregation payloads in milliseconds.
+    #[serde(default = "default_api_runtime_edge_cache_ttl_ms")]
+    pub runtime_edge_cache_ttl_ms: u64,
+
+    /// Top-N limit for edge connection leaderboard payloads.
+    #[serde(default = "default_api_runtime_edge_top_n")]
+    pub runtime_edge_top_n: usize,
+
+    /// Ring-buffer capacity for runtime edge control-plane events.
+    #[serde(default = "default_api_runtime_edge_events_capacity")]
+    pub runtime_edge_events_capacity: usize,
+
     /// Read-only mode: mutating endpoints are rejected.
     #[serde(default)]
     pub read_only: bool,
@@ -840,6 +949,10 @@ impl Default for ApiConfig {
             request_body_limit_bytes: default_api_request_body_limit_bytes(),
             minimal_runtime_enabled: default_api_minimal_runtime_enabled(),
             minimal_runtime_cache_ttl_ms: default_api_minimal_runtime_cache_ttl_ms(),
+            runtime_edge_enabled: default_api_runtime_edge_enabled(),
+            runtime_edge_cache_ttl_ms: default_api_runtime_edge_cache_ttl_ms(),
+            runtime_edge_top_n: default_api_runtime_edge_top_n(),
+            runtime_edge_events_capacity: default_api_runtime_edge_events_capacity(),
             read_only: false,
         }
     }
@@ -874,6 +987,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
+    /// Timeout in milliseconds for reading and parsing PROXY protocol headers.
+    #[serde(default = "default_proxy_protocol_header_timeout_ms")]
+    pub proxy_protocol_header_timeout_ms: u64,
+
     #[serde(default)]
     pub metrics_port: Option<u16>,
 
@@ -897,6 +1014,7 @@ impl Default for ServerConfig {
             listen_unix_sock_perm: None,
             listen_tcp: None,
             proxy_protocol: false,
+            proxy_protocol_header_timeout_ms: default_proxy_protocol_header_timeout_ms(),
             metrics_port: None,
             metrics_whitelist: default_metrics_whitelist(),
             api: ApiConfig::default(),
@@ -1045,6 +1163,12 @@ pub struct AccessConfig {
     #[serde(default)]
     pub user_max_unique_ips: HashMap<String, usize>,
 
+    #[serde(default)]
+    pub user_max_unique_ips_mode: UserMaxUniqueIpsMode,
+
+    #[serde(default = "default_user_max_unique_ips_window_secs")]
+    pub user_max_unique_ips_window_secs: u64,
+
     #[serde(default = "default_replay_check_len")]
     pub replay_check_len: usize,
 
@@ -1064,6 +1188,8 @@ impl Default for AccessConfig {
             user_expirations: HashMap::new(),
             user_data_quota: HashMap::new(),
             user_max_unique_ips: HashMap::new(),
+            user_max_unique_ips_mode: UserMaxUniqueIpsMode::default(),
+            user_max_unique_ips_window_secs: default_user_max_unique_ips_window_secs(),
             replay_check_len: default_replay_check_len(),
             replay_window_secs: default_replay_window_secs(),
             ignore_time_skew: false,

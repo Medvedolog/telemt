@@ -1199,6 +1199,48 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
             0
         }
     );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_no_writer_failfast_total ME route failfast errors due to missing writer in bounded wait window"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_no_writer_failfast_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_no_writer_failfast_total {}",
+        if me_allows_normal {
+            stats.get_me_no_writer_failfast_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_async_recovery_trigger_total Async ME recovery trigger attempts from route path"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_async_recovery_trigger_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_async_recovery_trigger_total {}",
+        if me_allows_normal {
+            stats.get_me_async_recovery_trigger_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_inline_recovery_total Legacy inline ME recovery attempts from route path"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_inline_recovery_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_inline_recovery_total {}",
+        if me_allows_normal {
+            stats.get_me_inline_recovery_total()
+        } else {
+            0
+        }
+    );
 
     let unresolved_writer_losses = if me_allows_normal {
         stats
@@ -1239,6 +1281,29 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
     let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client counter");
     let _ = writeln!(
         out,
+        "# HELP telemt_ip_reservation_rollback_total IP reservation rollbacks caused by later limit checks"
+    );
+    let _ = writeln!(out, "# TYPE telemt_ip_reservation_rollback_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_ip_reservation_rollback_total{{reason=\"tcp_limit\"}} {}",
+        if core_enabled {
+            stats.get_ip_reservation_rollback_tcp_limit_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_ip_reservation_rollback_total{{reason=\"quota_limit\"}} {}",
+        if core_enabled {
+            stats.get_ip_reservation_rollback_quota_limit_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
         "# HELP telemt_telemetry_user_series_suppressed User-labeled metric series suppression flag"
     );
     let _ = writeln!(out, "# TYPE telemt_telemetry_user_series_suppressed gauge");
@@ -1267,11 +1332,21 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
             .collect();
 
         let mut unique_users = BTreeSet::new();
+        unique_users.extend(config.access.users.keys().cloned());
         unique_users.extend(config.access.user_max_unique_ips.keys().cloned());
         unique_users.extend(ip_counts.keys().cloned());
+        let unique_users_vec: Vec<String> = unique_users.iter().cloned().collect();
+        let recent_counts = ip_tracker
+            .get_recent_counts_for_users(&unique_users_vec)
+            .await;
 
         let _ = writeln!(out, "# HELP telemt_user_unique_ips_current Per-user current number of unique active IPs");
         let _ = writeln!(out, "# TYPE telemt_user_unique_ips_current gauge");
+        let _ = writeln!(
+            out,
+            "# HELP telemt_user_unique_ips_recent_window Per-user unique IPs seen in configured observation window"
+        );
+        let _ = writeln!(out, "# TYPE telemt_user_unique_ips_recent_window gauge");
         let _ = writeln!(out, "# HELP telemt_user_unique_ips_limit Per-user configured unique IP limit (0 means unlimited)");
         let _ = writeln!(out, "# TYPE telemt_user_unique_ips_limit gauge");
         let _ = writeln!(out, "# HELP telemt_user_unique_ips_utilization Per-user unique IP usage ratio (0 for unlimited)");
@@ -1286,6 +1361,12 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
                 0.0
             };
             let _ = writeln!(out, "telemt_user_unique_ips_current{{user=\"{}\"}} {}", user, current);
+            let _ = writeln!(
+                out,
+                "telemt_user_unique_ips_recent_window{{user=\"{}\"}} {}",
+                user,
+                recent_counts.get(&user).copied().unwrap_or(0)
+            );
             let _ = writeln!(out, "telemt_user_unique_ips_limit{{user=\"{}\"}} {}", user, limit);
             let _ = writeln!(
                 out,
@@ -1378,6 +1459,7 @@ mod tests {
         assert!(output.contains("telemt_user_msgs_from_client{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_msgs_to_client{user=\"alice\"} 2"));
         assert!(output.contains("telemt_user_unique_ips_current{user=\"alice\"} 1"));
+        assert!(output.contains("telemt_user_unique_ips_recent_window{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 4"));
         assert!(output.contains("telemt_user_unique_ips_utilization{user=\"alice\"} 0.250000"));
     }
@@ -1391,7 +1473,8 @@ mod tests {
         assert!(output.contains("telemt_connections_total 0"));
         assert!(output.contains("telemt_connections_bad_total 0"));
         assert!(output.contains("telemt_handshake_timeouts_total 0"));
-        assert!(!output.contains("user="));
+        assert!(output.contains("telemt_user_unique_ips_current{user="));
+        assert!(output.contains("telemt_user_unique_ips_recent_window{user="));
     }
 
     #[tokio::test]
@@ -1412,6 +1495,7 @@ mod tests {
             "# TYPE telemt_me_writer_removed_unexpected_minus_restored_total gauge"
         ));
         assert!(output.contains("# TYPE telemt_user_unique_ips_current gauge"));
+        assert!(output.contains("# TYPE telemt_user_unique_ips_recent_window gauge"));
         assert!(output.contains("# TYPE telemt_user_unique_ips_limit gauge"));
         assert!(output.contains("# TYPE telemt_user_unique_ips_utilization gauge"));
     }

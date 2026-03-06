@@ -128,7 +128,7 @@ impl MePool {
         if self.decision.ipv4_me {
             let map_v4 = self.proxy_map_v4.read().await.clone();
             for (dc, addrs) in map_v4 {
-                let entry = out.entry(dc.abs()).or_default();
+                let entry = out.entry(dc).or_default();
                 for (ip, port) in addrs {
                     entry.insert(SocketAddr::new(ip, port));
                 }
@@ -138,7 +138,7 @@ impl MePool {
         if self.decision.ipv6_me {
             let map_v6 = self.proxy_map_v6.read().await.clone();
             for (dc, addrs) in map_v6 {
-                let entry = out.entry(dc.abs()).or_default();
+                let entry = out.entry(dc).or_default();
                 for (ip, port) in addrs {
                     entry.insert(SocketAddr::new(ip, port));
                 }

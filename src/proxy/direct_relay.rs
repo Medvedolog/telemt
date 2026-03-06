@@ -34,7 +34,7 @@ where
     let user = &success.user;
     let dc_addr = get_dc_addr_static(success.dc_idx, &config)?;
 
-    info!(
+    debug!(
         user = %user,
         peer = %success.peer,
         dc = success.dc_idx,
@@ -57,6 +57,7 @@ where
 
     stats.increment_user_connects(user);
     stats.increment_user_curr_connects(user);
+    stats.increment_current_connections_direct();
 
     let relay_result = relay_bidirectional(
         client_reader,
@@ -69,6 +70,7 @@ where
     )
     .await;
 
+    stats.decrement_current_connections_direct();
     stats.decrement_user_curr_connects(user);
 
     match &relay_result {
@@ -118,10 +120,16 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
     // Unknown DC requested by client without override: log and fall back.
     if !config.dc_overrides.contains_key(&dc_key) {
         warn!(dc_idx = dc_idx, "Requested non-standard DC with no override; falling back to default cluster");
-        if let Some(path) = &config.general.unknown_dc_log_path
-            && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+        if config.general.unknown_dc_file_log_enabled
+            && let Some(path) = &config.general.unknown_dc_log_path
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            let _ = writeln!(file, "dc_idx={dc_idx}");
+            let path = path.clone();
+            handle.spawn_blocking(move || {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "dc_idx={dc_idx}");
+                }
+            });
         }
     }
 

@@ -9,20 +9,17 @@
 //! | `general` | `log_level`                    | Filter updated via `log_level_tx`              |
 //! | `access`  | `user_ad_tags`                 | Passed on next connection                      |
 //! | `general` | `ad_tag`                       | Passed on next connection (fallback per-user)  |
-//! | `general` | `middle_proxy_pool_size`       | Passed on next connection                      |
-//! | `general` | `me_keepalive_*`               | Passed on next connection                      |
 //! | `general` | `desync_all_full`              | Applied immediately                            |
 //! | `general` | `update_every`                 | Applied to ME updater immediately              |
-//! | `general` | `hardswap`                     | Applied on next ME map update                  |
-//! | `general` | `me_pool_drain_ttl_secs`       | Applied on next ME map update                  |
-//! | `general` | `me_pool_min_fresh_ratio`      | Applied on next ME map update                  |
-//! | `general` | `me_reinit_drain_timeout_secs` | Applied on next ME map update                  |
+//! | `general` | `me_reinit_*`                  | Applied to ME reinit scheduler immediately     |
+//! | `general` | `hardswap` / `me_*_reinit`     | Applied on next ME map update                  |
 //! | `general` | `telemetry` / `me_*_policy`    | Applied immediately                            |
 //! | `network` | `dns_overrides`                | Applied immediately                            |
 //! | `access`  | All user/quota fields          | Effective immediately                          |
 //!
 //! Fields that require re-binding sockets (`server.port`, `censorship.*`,
 //! `network.*`, `use_middle_proxy`) are **not** applied; a warning is emitted.
+//! Non-hot changes are never mixed into the runtime config snapshot.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -32,7 +29,7 @@ use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::config::{LogLevel, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel};
+use crate::config::{LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel};
 use super::load::ProxyConfig;
 
 // ── Hot fields ────────────────────────────────────────────────────────────────
@@ -43,17 +40,37 @@ pub struct HotFields {
     pub log_level:               LogLevel,
     pub ad_tag:                  Option<String>,
     pub dns_overrides:           Vec<String>,
-    pub middle_proxy_pool_size:  usize,
     pub desync_all_full:         bool,
     pub update_every_secs:       u64,
+    pub me_reinit_every_secs:    u64,
+    pub me_reinit_singleflight:  bool,
+    pub me_reinit_coalesce_window_ms: u64,
     pub hardswap:                bool,
     pub me_pool_drain_ttl_secs:  u64,
     pub me_pool_min_fresh_ratio: f32,
     pub me_reinit_drain_timeout_secs: u64,
-    pub me_keepalive_enabled:    bool,
-    pub me_keepalive_interval_secs: u64,
-    pub me_keepalive_jitter_secs:   u64,
-    pub me_keepalive_payload_random: bool,
+    pub me_hardswap_warmup_delay_min_ms: u64,
+    pub me_hardswap_warmup_delay_max_ms: u64,
+    pub me_hardswap_warmup_extra_passes: u8,
+    pub me_hardswap_warmup_pass_backoff_base_ms: u64,
+    pub me_bind_stale_mode: MeBindStaleMode,
+    pub me_bind_stale_ttl_secs: u64,
+    pub me_secret_atomic_snapshot: bool,
+    pub me_deterministic_writer_sort: bool,
+    pub me_single_endpoint_shadow_writers: u8,
+    pub me_single_endpoint_outage_mode_enabled: bool,
+    pub me_single_endpoint_outage_disable_quarantine: bool,
+    pub me_single_endpoint_outage_backoff_min_ms: u64,
+    pub me_single_endpoint_outage_backoff_max_ms: u64,
+    pub me_single_endpoint_shadow_rotate_every_secs: u64,
+    pub me_config_stable_snapshots: u8,
+    pub me_config_apply_cooldown_secs: u64,
+    pub me_snapshot_require_http_2xx: bool,
+    pub me_snapshot_reject_empty_map: bool,
+    pub me_snapshot_min_proxy_for_lines: u32,
+    pub proxy_secret_stable_snapshots: u8,
+    pub proxy_secret_rotate_runtime: bool,
+    pub proxy_secret_len_max: usize,
     pub telemetry_core_enabled: bool,
     pub telemetry_user_enabled: bool,
     pub telemetry_me_level: MeTelemetryLevel,
@@ -65,7 +82,14 @@ pub struct HotFields {
     pub me_route_backpressure_base_timeout_ms: u64,
     pub me_route_backpressure_high_timeout_ms: u64,
     pub me_route_backpressure_high_watermark_pct: u8,
-    pub access:                  crate::config::AccessConfig,
+    pub users:                   std::collections::HashMap<String, String>,
+    pub user_ad_tags:            std::collections::HashMap<String, String>,
+    pub user_max_tcp_conns:      std::collections::HashMap<String, usize>,
+    pub user_expirations:        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    pub user_data_quota:         std::collections::HashMap<String, u64>,
+    pub user_max_unique_ips:     std::collections::HashMap<String, usize>,
+    pub user_max_unique_ips_mode: crate::config::UserMaxUniqueIpsMode,
+    pub user_max_unique_ips_window_secs: u64,
 }
 
 impl HotFields {
@@ -74,17 +98,49 @@ impl HotFields {
             log_level:               cfg.general.log_level.clone(),
             ad_tag:                  cfg.general.ad_tag.clone(),
             dns_overrides:           cfg.network.dns_overrides.clone(),
-            middle_proxy_pool_size:  cfg.general.middle_proxy_pool_size,
             desync_all_full:         cfg.general.desync_all_full,
             update_every_secs:       cfg.general.effective_update_every_secs(),
+            me_reinit_every_secs:    cfg.general.me_reinit_every_secs,
+            me_reinit_singleflight:  cfg.general.me_reinit_singleflight,
+            me_reinit_coalesce_window_ms: cfg.general.me_reinit_coalesce_window_ms,
             hardswap:                cfg.general.hardswap,
             me_pool_drain_ttl_secs:  cfg.general.me_pool_drain_ttl_secs,
             me_pool_min_fresh_ratio: cfg.general.me_pool_min_fresh_ratio,
             me_reinit_drain_timeout_secs: cfg.general.me_reinit_drain_timeout_secs,
-            me_keepalive_enabled:    cfg.general.me_keepalive_enabled,
-            me_keepalive_interval_secs: cfg.general.me_keepalive_interval_secs,
-            me_keepalive_jitter_secs:   cfg.general.me_keepalive_jitter_secs,
-            me_keepalive_payload_random: cfg.general.me_keepalive_payload_random,
+            me_hardswap_warmup_delay_min_ms: cfg.general.me_hardswap_warmup_delay_min_ms,
+            me_hardswap_warmup_delay_max_ms: cfg.general.me_hardswap_warmup_delay_max_ms,
+            me_hardswap_warmup_extra_passes: cfg.general.me_hardswap_warmup_extra_passes,
+            me_hardswap_warmup_pass_backoff_base_ms: cfg
+                .general
+                .me_hardswap_warmup_pass_backoff_base_ms,
+            me_bind_stale_mode: cfg.general.me_bind_stale_mode,
+            me_bind_stale_ttl_secs: cfg.general.me_bind_stale_ttl_secs,
+            me_secret_atomic_snapshot: cfg.general.me_secret_atomic_snapshot,
+            me_deterministic_writer_sort: cfg.general.me_deterministic_writer_sort,
+            me_single_endpoint_shadow_writers: cfg.general.me_single_endpoint_shadow_writers,
+            me_single_endpoint_outage_mode_enabled: cfg
+                .general
+                .me_single_endpoint_outage_mode_enabled,
+            me_single_endpoint_outage_disable_quarantine: cfg
+                .general
+                .me_single_endpoint_outage_disable_quarantine,
+            me_single_endpoint_outage_backoff_min_ms: cfg
+                .general
+                .me_single_endpoint_outage_backoff_min_ms,
+            me_single_endpoint_outage_backoff_max_ms: cfg
+                .general
+                .me_single_endpoint_outage_backoff_max_ms,
+            me_single_endpoint_shadow_rotate_every_secs: cfg
+                .general
+                .me_single_endpoint_shadow_rotate_every_secs,
+            me_config_stable_snapshots: cfg.general.me_config_stable_snapshots,
+            me_config_apply_cooldown_secs: cfg.general.me_config_apply_cooldown_secs,
+            me_snapshot_require_http_2xx: cfg.general.me_snapshot_require_http_2xx,
+            me_snapshot_reject_empty_map: cfg.general.me_snapshot_reject_empty_map,
+            me_snapshot_min_proxy_for_lines: cfg.general.me_snapshot_min_proxy_for_lines,
+            proxy_secret_stable_snapshots: cfg.general.proxy_secret_stable_snapshots,
+            proxy_secret_rotate_runtime: cfg.general.proxy_secret_rotate_runtime,
+            proxy_secret_len_max: cfg.general.proxy_secret_len_max,
             telemetry_core_enabled: cfg.general.telemetry.core_enabled,
             telemetry_user_enabled: cfg.general.telemetry.user_enabled,
             telemetry_me_level: cfg.general.telemetry.me_level,
@@ -100,16 +156,149 @@ impl HotFields {
             me_route_backpressure_base_timeout_ms: cfg.general.me_route_backpressure_base_timeout_ms,
             me_route_backpressure_high_timeout_ms: cfg.general.me_route_backpressure_high_timeout_ms,
             me_route_backpressure_high_watermark_pct: cfg.general.me_route_backpressure_high_watermark_pct,
-            access:                  cfg.access.clone(),
+            users:                   cfg.access.users.clone(),
+            user_ad_tags:            cfg.access.user_ad_tags.clone(),
+            user_max_tcp_conns:      cfg.access.user_max_tcp_conns.clone(),
+            user_expirations:        cfg.access.user_expirations.clone(),
+            user_data_quota:         cfg.access.user_data_quota.clone(),
+            user_max_unique_ips:     cfg.access.user_max_unique_ips.clone(),
+            user_max_unique_ips_mode: cfg.access.user_max_unique_ips_mode,
+            user_max_unique_ips_window_secs: cfg.access.user_max_unique_ips_window_secs,
         }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, item) in pairs.iter_mut() {
+                canonicalize_json(item);
+            }
+            for (key, item) in pairs {
+                map.insert(key, item);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn config_equal(lhs: &ProxyConfig, rhs: &ProxyConfig) -> bool {
+    let mut left = match serde_json::to_value(lhs) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let mut right = match serde_json::to_value(rhs) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    canonicalize_json(&mut left);
+    canonicalize_json(&mut right);
+    left == right
+}
+
+fn listeners_equal(
+    lhs: &[crate::config::ListenerConfig],
+    rhs: &[crate::config::ListenerConfig],
+) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+        a.ip == b.ip
+            && a.announce == b.announce
+            && a.announce_ip == b.announce_ip
+            && a.proxy_protocol == b.proxy_protocol
+            && a.reuse_allow == b.reuse_allow
+    })
+}
+
+fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
+    let mut cfg = old.clone();
+
+    cfg.general.log_level = new.general.log_level.clone();
+    cfg.general.ad_tag = new.general.ad_tag.clone();
+    cfg.network.dns_overrides = new.network.dns_overrides.clone();
+    cfg.general.desync_all_full = new.general.desync_all_full;
+    cfg.general.update_every = new.general.update_every;
+    cfg.general.proxy_secret_auto_reload_secs = new.general.proxy_secret_auto_reload_secs;
+    cfg.general.proxy_config_auto_reload_secs = new.general.proxy_config_auto_reload_secs;
+    cfg.general.me_reinit_every_secs = new.general.me_reinit_every_secs;
+    cfg.general.me_reinit_singleflight = new.general.me_reinit_singleflight;
+    cfg.general.me_reinit_coalesce_window_ms = new.general.me_reinit_coalesce_window_ms;
+    cfg.general.hardswap = new.general.hardswap;
+    cfg.general.me_pool_drain_ttl_secs = new.general.me_pool_drain_ttl_secs;
+    cfg.general.me_pool_min_fresh_ratio = new.general.me_pool_min_fresh_ratio;
+    cfg.general.me_reinit_drain_timeout_secs = new.general.me_reinit_drain_timeout_secs;
+    cfg.general.me_hardswap_warmup_delay_min_ms = new.general.me_hardswap_warmup_delay_min_ms;
+    cfg.general.me_hardswap_warmup_delay_max_ms = new.general.me_hardswap_warmup_delay_max_ms;
+    cfg.general.me_hardswap_warmup_extra_passes = new.general.me_hardswap_warmup_extra_passes;
+    cfg.general.me_hardswap_warmup_pass_backoff_base_ms =
+        new.general.me_hardswap_warmup_pass_backoff_base_ms;
+    cfg.general.me_bind_stale_mode = new.general.me_bind_stale_mode;
+    cfg.general.me_bind_stale_ttl_secs = new.general.me_bind_stale_ttl_secs;
+    cfg.general.me_secret_atomic_snapshot = new.general.me_secret_atomic_snapshot;
+    cfg.general.me_deterministic_writer_sort = new.general.me_deterministic_writer_sort;
+    cfg.general.me_single_endpoint_shadow_writers = new.general.me_single_endpoint_shadow_writers;
+    cfg.general.me_single_endpoint_outage_mode_enabled =
+        new.general.me_single_endpoint_outage_mode_enabled;
+    cfg.general.me_single_endpoint_outage_disable_quarantine =
+        new.general.me_single_endpoint_outage_disable_quarantine;
+    cfg.general.me_single_endpoint_outage_backoff_min_ms =
+        new.general.me_single_endpoint_outage_backoff_min_ms;
+    cfg.general.me_single_endpoint_outage_backoff_max_ms =
+        new.general.me_single_endpoint_outage_backoff_max_ms;
+    cfg.general.me_single_endpoint_shadow_rotate_every_secs =
+        new.general.me_single_endpoint_shadow_rotate_every_secs;
+    cfg.general.me_config_stable_snapshots = new.general.me_config_stable_snapshots;
+    cfg.general.me_config_apply_cooldown_secs = new.general.me_config_apply_cooldown_secs;
+    cfg.general.me_snapshot_require_http_2xx = new.general.me_snapshot_require_http_2xx;
+    cfg.general.me_snapshot_reject_empty_map = new.general.me_snapshot_reject_empty_map;
+    cfg.general.me_snapshot_min_proxy_for_lines = new.general.me_snapshot_min_proxy_for_lines;
+    cfg.general.proxy_secret_stable_snapshots = new.general.proxy_secret_stable_snapshots;
+    cfg.general.proxy_secret_rotate_runtime = new.general.proxy_secret_rotate_runtime;
+    cfg.general.proxy_secret_len_max = new.general.proxy_secret_len_max;
+    cfg.general.telemetry = new.general.telemetry.clone();
+    cfg.general.me_socks_kdf_policy = new.general.me_socks_kdf_policy;
+    cfg.general.me_floor_mode = new.general.me_floor_mode;
+    cfg.general.me_adaptive_floor_idle_secs = new.general.me_adaptive_floor_idle_secs;
+    cfg.general.me_adaptive_floor_min_writers_single_endpoint =
+        new.general.me_adaptive_floor_min_writers_single_endpoint;
+    cfg.general.me_adaptive_floor_recover_grace_secs =
+        new.general.me_adaptive_floor_recover_grace_secs;
+    cfg.general.me_route_backpressure_base_timeout_ms =
+        new.general.me_route_backpressure_base_timeout_ms;
+    cfg.general.me_route_backpressure_high_timeout_ms =
+        new.general.me_route_backpressure_high_timeout_ms;
+    cfg.general.me_route_backpressure_high_watermark_pct =
+        new.general.me_route_backpressure_high_watermark_pct;
+
+    cfg.access.users = new.access.users.clone();
+    cfg.access.user_ad_tags = new.access.user_ad_tags.clone();
+    cfg.access.user_max_tcp_conns = new.access.user_max_tcp_conns.clone();
+    cfg.access.user_expirations = new.access.user_expirations.clone();
+    cfg.access.user_data_quota = new.access.user_data_quota.clone();
+    cfg.access.user_max_unique_ips = new.access.user_max_unique_ips.clone();
+    cfg.access.user_max_unique_ips_mode = new.access.user_max_unique_ips_mode;
+    cfg.access.user_max_unique_ips_window_secs = new.access.user_max_unique_ips_window_secs;
+
+    cfg
+}
+
 /// Warn if any non-hot fields changed (require restart).
-fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
+fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: bool) {
+    let mut warned = false;
     if old.server.port != new.server.port {
+        warned = true;
         warn!(
             "config reload: server.port changed ({} → {}); restart required",
             old.server.port, new.server.port
@@ -123,24 +312,118 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
         || old.server.api.minimal_runtime_enabled != new.server.api.minimal_runtime_enabled
         || old.server.api.minimal_runtime_cache_ttl_ms
             != new.server.api.minimal_runtime_cache_ttl_ms
+        || old.server.api.runtime_edge_enabled != new.server.api.runtime_edge_enabled
+        || old.server.api.runtime_edge_cache_ttl_ms
+            != new.server.api.runtime_edge_cache_ttl_ms
+        || old.server.api.runtime_edge_top_n != new.server.api.runtime_edge_top_n
+        || old.server.api.runtime_edge_events_capacity
+            != new.server.api.runtime_edge_events_capacity
         || old.server.api.read_only != new.server.api.read_only
     {
+        warned = true;
         warn!("config reload: server.api changed; restart required");
     }
+    if old.server.proxy_protocol != new.server.proxy_protocol
+        || !listeners_equal(&old.server.listeners, &new.server.listeners)
+        || old.server.listen_addr_ipv4 != new.server.listen_addr_ipv4
+        || old.server.listen_addr_ipv6 != new.server.listen_addr_ipv6
+        || old.server.listen_tcp != new.server.listen_tcp
+        || old.server.listen_unix_sock != new.server.listen_unix_sock
+        || old.server.listen_unix_sock_perm != new.server.listen_unix_sock_perm
+    {
+        warned = true;
+        warn!("config reload: server listener settings changed; restart required");
+    }
+    if old.censorship.tls_domain != new.censorship.tls_domain
+        || old.censorship.tls_domains != new.censorship.tls_domains
+        || old.censorship.mask != new.censorship.mask
+        || old.censorship.mask_host != new.censorship.mask_host
+        || old.censorship.mask_port != new.censorship.mask_port
+        || old.censorship.mask_unix_sock != new.censorship.mask_unix_sock
+        || old.censorship.fake_cert_len != new.censorship.fake_cert_len
+        || old.censorship.tls_emulation != new.censorship.tls_emulation
+        || old.censorship.tls_front_dir != new.censorship.tls_front_dir
+        || old.censorship.server_hello_delay_min_ms != new.censorship.server_hello_delay_min_ms
+        || old.censorship.server_hello_delay_max_ms != new.censorship.server_hello_delay_max_ms
+        || old.censorship.tls_new_session_tickets != new.censorship.tls_new_session_tickets
+        || old.censorship.tls_full_cert_ttl_secs != new.censorship.tls_full_cert_ttl_secs
+        || old.censorship.alpn_enforce != new.censorship.alpn_enforce
+        || old.censorship.mask_proxy_protocol != new.censorship.mask_proxy_protocol
+    {
+        warned = true;
+        warn!("config reload: censorship settings changed; restart required");
+    }
     if old.censorship.tls_domain != new.censorship.tls_domain {
+        warned = true;
         warn!(
             "config reload: censorship.tls_domain changed ('{}' → '{}'); restart required",
             old.censorship.tls_domain, new.censorship.tls_domain
         );
     }
     if old.network.ipv4 != new.network.ipv4 || old.network.ipv6 != new.network.ipv6 {
+        warned = true;
         warn!("config reload: network.ipv4/ipv6 changed; restart required");
     }
+    if old.network.prefer != new.network.prefer
+        || old.network.multipath != new.network.multipath
+        || old.network.stun_use != new.network.stun_use
+        || old.network.stun_servers != new.network.stun_servers
+        || old.network.stun_tcp_fallback != new.network.stun_tcp_fallback
+        || old.network.http_ip_detect_urls != new.network.http_ip_detect_urls
+        || old.network.cache_public_ip_path != new.network.cache_public_ip_path
+    {
+        warned = true;
+        warn!("config reload: non-hot network settings changed; restart required");
+    }
     if old.general.use_middle_proxy != new.general.use_middle_proxy {
+        warned = true;
         warn!("config reload: use_middle_proxy changed; restart required");
     }
     if old.general.stun_nat_probe_concurrency != new.general.stun_nat_probe_concurrency {
+        warned = true;
         warn!("config reload: general.stun_nat_probe_concurrency changed; restart required");
+    }
+    if old.general.middle_proxy_pool_size != new.general.middle_proxy_pool_size {
+        warned = true;
+        warn!("config reload: general.middle_proxy_pool_size changed; restart required");
+    }
+    if old.general.me_route_no_writer_mode != new.general.me_route_no_writer_mode
+        || old.general.me_route_no_writer_wait_ms != new.general.me_route_no_writer_wait_ms
+        || old.general.me_route_inline_recovery_attempts
+            != new.general.me_route_inline_recovery_attempts
+        || old.general.me_route_inline_recovery_wait_ms
+            != new.general.me_route_inline_recovery_wait_ms
+    {
+        warned = true;
+        warn!("config reload: general.me_route_no_writer_* changed; restart required");
+    }
+    if old.general.unknown_dc_log_path != new.general.unknown_dc_log_path
+        || old.general.unknown_dc_file_log_enabled != new.general.unknown_dc_file_log_enabled
+    {
+        warned = true;
+        warn!("config reload: general.unknown_dc_* changed; restart required");
+    }
+    if old.general.me_init_retry_attempts != new.general.me_init_retry_attempts {
+        warned = true;
+        warn!("config reload: general.me_init_retry_attempts changed; restart required");
+    }
+    if old.general.me2dc_fallback != new.general.me2dc_fallback {
+        warned = true;
+        warn!("config reload: general.me2dc_fallback changed; restart required");
+    }
+    if old.general.proxy_config_v4_cache_path != new.general.proxy_config_v4_cache_path
+        || old.general.proxy_config_v6_cache_path != new.general.proxy_config_v6_cache_path
+    {
+        warned = true;
+        warn!("config reload: general.proxy_config_*_cache_path changed; restart required");
+    }
+    if old.general.me_keepalive_enabled != new.general.me_keepalive_enabled
+        || old.general.me_keepalive_interval_secs != new.general.me_keepalive_interval_secs
+        || old.general.me_keepalive_jitter_secs != new.general.me_keepalive_jitter_secs
+        || old.general.me_keepalive_payload_random != new.general.me_keepalive_payload_random
+    {
+        warned = true;
+        warn!("config reload: general.me_keepalive_* changed; restart required");
     }
     if old.general.upstream_connect_retry_attempts != new.general.upstream_connect_retry_attempts
         || old.general.upstream_connect_retry_backoff_ms
@@ -151,7 +434,11 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
             != new.general.upstream_connect_failfast_hard_errors
         || old.general.rpc_proxy_req_every != new.general.rpc_proxy_req_every
     {
+        warned = true;
         warn!("config reload: general.upstream_* changed; restart required");
+    }
+    if non_hot_changed && !warned {
+        warn!("config reload: one or more non-hot fields changed; restart required");
     }
 }
 
@@ -235,10 +522,10 @@ fn log_changes(
         log_tx.send(new_hot.log_level.clone()).ok();
     }
 
-    if old_hot.access.user_ad_tags != new_hot.access.user_ad_tags {
+    if old_hot.user_ad_tags != new_hot.user_ad_tags {
         info!(
             "config reload: user_ad_tags updated ({} entries)",
-            new_hot.access.user_ad_tags.len(),
+            new_hot.user_ad_tags.len(),
         );
     }
 
@@ -253,13 +540,6 @@ fn log_changes(
         );
     }
 
-    if old_hot.middle_proxy_pool_size != new_hot.middle_proxy_pool_size {
-        info!(
-            "config reload: middle_proxy_pool_size: {} → {}",
-            old_hot.middle_proxy_pool_size, new_hot.middle_proxy_pool_size,
-        );
-    }
-
     if old_hot.desync_all_full != new_hot.desync_all_full {
         info!(
             "config reload: desync_all_full: {} → {}",
@@ -271,6 +551,17 @@ fn log_changes(
         info!(
             "config reload: update_every(effective): {}s → {}s",
             old_hot.update_every_secs, new_hot.update_every_secs,
+        );
+    }
+    if old_hot.me_reinit_every_secs != new_hot.me_reinit_every_secs
+        || old_hot.me_reinit_singleflight != new_hot.me_reinit_singleflight
+        || old_hot.me_reinit_coalesce_window_ms != new_hot.me_reinit_coalesce_window_ms
+    {
+        info!(
+            "config reload: me_reinit: interval={}s singleflight={} coalesce={}ms",
+            new_hot.me_reinit_every_secs,
+            new_hot.me_reinit_singleflight,
+            new_hot.me_reinit_coalesce_window_ms
         );
     }
 
@@ -301,18 +592,84 @@ fn log_changes(
             old_hot.me_reinit_drain_timeout_secs, new_hot.me_reinit_drain_timeout_secs,
         );
     }
-
-    if old_hot.me_keepalive_enabled        != new_hot.me_keepalive_enabled
-    || old_hot.me_keepalive_interval_secs  != new_hot.me_keepalive_interval_secs
-    || old_hot.me_keepalive_jitter_secs    != new_hot.me_keepalive_jitter_secs
-    || old_hot.me_keepalive_payload_random != new_hot.me_keepalive_payload_random
+    if old_hot.me_hardswap_warmup_delay_min_ms != new_hot.me_hardswap_warmup_delay_min_ms
+        || old_hot.me_hardswap_warmup_delay_max_ms != new_hot.me_hardswap_warmup_delay_max_ms
+        || old_hot.me_hardswap_warmup_extra_passes != new_hot.me_hardswap_warmup_extra_passes
+        || old_hot.me_hardswap_warmup_pass_backoff_base_ms
+            != new_hot.me_hardswap_warmup_pass_backoff_base_ms
     {
         info!(
-            "config reload: me_keepalive: enabled={} interval={}s jitter={}s random_payload={}",
-            new_hot.me_keepalive_enabled,
-            new_hot.me_keepalive_interval_secs,
-            new_hot.me_keepalive_jitter_secs,
-            new_hot.me_keepalive_payload_random,
+            "config reload: me_hardswap_warmup: min={}ms max={}ms extra_passes={} pass_backoff={}ms",
+            new_hot.me_hardswap_warmup_delay_min_ms,
+            new_hot.me_hardswap_warmup_delay_max_ms,
+            new_hot.me_hardswap_warmup_extra_passes,
+            new_hot.me_hardswap_warmup_pass_backoff_base_ms
+        );
+    }
+    if old_hot.me_bind_stale_mode != new_hot.me_bind_stale_mode
+        || old_hot.me_bind_stale_ttl_secs != new_hot.me_bind_stale_ttl_secs
+    {
+        info!(
+            "config reload: me_bind_stale: mode={:?} ttl={}s",
+            new_hot.me_bind_stale_mode,
+            new_hot.me_bind_stale_ttl_secs
+        );
+    }
+    if old_hot.me_secret_atomic_snapshot != new_hot.me_secret_atomic_snapshot
+        || old_hot.me_deterministic_writer_sort != new_hot.me_deterministic_writer_sort
+    {
+        info!(
+            "config reload: me_runtime_flags: secret_atomic_snapshot={} deterministic_sort={}",
+            new_hot.me_secret_atomic_snapshot,
+            new_hot.me_deterministic_writer_sort
+        );
+    }
+    if old_hot.me_single_endpoint_shadow_writers != new_hot.me_single_endpoint_shadow_writers
+        || old_hot.me_single_endpoint_outage_mode_enabled
+            != new_hot.me_single_endpoint_outage_mode_enabled
+        || old_hot.me_single_endpoint_outage_disable_quarantine
+            != new_hot.me_single_endpoint_outage_disable_quarantine
+        || old_hot.me_single_endpoint_outage_backoff_min_ms
+            != new_hot.me_single_endpoint_outage_backoff_min_ms
+        || old_hot.me_single_endpoint_outage_backoff_max_ms
+            != new_hot.me_single_endpoint_outage_backoff_max_ms
+        || old_hot.me_single_endpoint_shadow_rotate_every_secs
+            != new_hot.me_single_endpoint_shadow_rotate_every_secs
+    {
+        info!(
+            "config reload: me_single_endpoint: shadow={} outage_enabled={} disable_quarantine={} backoff=[{}..{}]ms rotate={}s",
+            new_hot.me_single_endpoint_shadow_writers,
+            new_hot.me_single_endpoint_outage_mode_enabled,
+            new_hot.me_single_endpoint_outage_disable_quarantine,
+            new_hot.me_single_endpoint_outage_backoff_min_ms,
+            new_hot.me_single_endpoint_outage_backoff_max_ms,
+            new_hot.me_single_endpoint_shadow_rotate_every_secs
+        );
+    }
+    if old_hot.me_config_stable_snapshots != new_hot.me_config_stable_snapshots
+        || old_hot.me_config_apply_cooldown_secs != new_hot.me_config_apply_cooldown_secs
+        || old_hot.me_snapshot_require_http_2xx != new_hot.me_snapshot_require_http_2xx
+        || old_hot.me_snapshot_reject_empty_map != new_hot.me_snapshot_reject_empty_map
+        || old_hot.me_snapshot_min_proxy_for_lines != new_hot.me_snapshot_min_proxy_for_lines
+    {
+        info!(
+            "config reload: me_snapshot_guard: stable={} cooldown={}s require_2xx={} reject_empty={} min_proxy_for={}",
+            new_hot.me_config_stable_snapshots,
+            new_hot.me_config_apply_cooldown_secs,
+            new_hot.me_snapshot_require_http_2xx,
+            new_hot.me_snapshot_reject_empty_map,
+            new_hot.me_snapshot_min_proxy_for_lines
+        );
+    }
+    if old_hot.proxy_secret_stable_snapshots != new_hot.proxy_secret_stable_snapshots
+        || old_hot.proxy_secret_rotate_runtime != new_hot.proxy_secret_rotate_runtime
+        || old_hot.proxy_secret_len_max != new_hot.proxy_secret_len_max
+    {
+        info!(
+            "config reload: proxy_secret_runtime: stable={} rotate={} len_max={}",
+            new_hot.proxy_secret_stable_snapshots,
+            new_hot.proxy_secret_rotate_runtime,
+            new_hot.proxy_secret_len_max
         );
     }
 
@@ -367,21 +724,21 @@ fn log_changes(
         );
     }
 
-    if old_hot.access.users != new_hot.access.users {
-        let mut added: Vec<&String> = new_hot.access.users.keys()
-            .filter(|u| !old_hot.access.users.contains_key(*u))
+    if old_hot.users != new_hot.users {
+        let mut added: Vec<&String> = new_hot.users.keys()
+            .filter(|u| !old_hot.users.contains_key(*u))
             .collect();
         added.sort();
 
-        let mut removed: Vec<&String> = old_hot.access.users.keys()
-            .filter(|u| !new_hot.access.users.contains_key(*u))
+        let mut removed: Vec<&String> = old_hot.users.keys()
+            .filter(|u| !new_hot.users.contains_key(*u))
             .collect();
         removed.sort();
 
-        let mut changed: Vec<&String> = new_hot.access.users.keys()
+        let mut changed: Vec<&String> = new_hot.users.keys()
             .filter(|u| {
-                old_hot.access.users.get(*u)
-                    .map(|s| s != &new_hot.access.users[*u])
+                old_hot.users.get(*u)
+                    .map(|s| s != &new_hot.users[*u])
                     .unwrap_or(false)
             })
             .collect();
@@ -395,7 +752,7 @@ fn log_changes(
             let host = resolve_link_host(new_cfg, detected_ip_v4, detected_ip_v6);
             let port = new_cfg.general.links.public_port.unwrap_or(new_cfg.server.port);
             for user in &added {
-                if let Some(secret) = new_hot.access.users.get(*user) {
+                if let Some(secret) = new_hot.users.get(*user) {
                     print_user_links(user, secret, &host, port, new_cfg);
                 }
             }
@@ -414,28 +771,38 @@ fn log_changes(
         }
     }
 
-    if old_hot.access.user_max_tcp_conns != new_hot.access.user_max_tcp_conns {
+    if old_hot.user_max_tcp_conns != new_hot.user_max_tcp_conns {
         info!(
             "config reload: user_max_tcp_conns updated ({} entries)",
-            new_hot.access.user_max_tcp_conns.len()
+            new_hot.user_max_tcp_conns.len()
         );
     }
-    if old_hot.access.user_expirations != new_hot.access.user_expirations {
+    if old_hot.user_expirations != new_hot.user_expirations {
         info!(
             "config reload: user_expirations updated ({} entries)",
-            new_hot.access.user_expirations.len()
+            new_hot.user_expirations.len()
         );
     }
-    if old_hot.access.user_data_quota != new_hot.access.user_data_quota {
+    if old_hot.user_data_quota != new_hot.user_data_quota {
         info!(
             "config reload: user_data_quota updated ({} entries)",
-            new_hot.access.user_data_quota.len()
+            new_hot.user_data_quota.len()
         );
     }
-    if old_hot.access.user_max_unique_ips != new_hot.access.user_max_unique_ips {
+    if old_hot.user_max_unique_ips != new_hot.user_max_unique_ips {
         info!(
             "config reload: user_max_unique_ips updated ({} entries)",
-            new_hot.access.user_max_unique_ips.len()
+            new_hot.user_max_unique_ips.len()
+        );
+    }
+    if old_hot.user_max_unique_ips_mode != new_hot.user_max_unique_ips_mode
+        || old_hot.user_max_unique_ips_window_secs
+            != new_hot.user_max_unique_ips_window_secs
+    {
+        info!(
+            "config reload: user_max_unique_ips policy mode={:?} window={}s",
+            new_hot.user_max_unique_ips_mode,
+            new_hot.user_max_unique_ips_window_secs
         );
     }
 }
@@ -462,15 +829,22 @@ fn reload_config(
     }
 
     let old_cfg = config_tx.borrow().clone();
+    let applied_cfg = overlay_hot_fields(&old_cfg, &new_cfg);
     let old_hot = HotFields::from_config(&old_cfg);
-    let new_hot = HotFields::from_config(&new_cfg);
+    let applied_hot = HotFields::from_config(&applied_cfg);
+    let non_hot_changed = !config_equal(&applied_cfg, &new_cfg);
+    let hot_changed = old_hot != applied_hot;
 
-    if old_hot == new_hot {
+    if non_hot_changed {
+        warn_non_hot_changes(&old_cfg, &new_cfg, non_hot_changed);
+    }
+
+    if !hot_changed {
         return;
     }
 
-    if old_hot.dns_overrides != new_hot.dns_overrides
-        && let Err(e) = crate::network::dns_overrides::install_entries(&new_hot.dns_overrides)
+    if old_hot.dns_overrides != applied_hot.dns_overrides
+        && let Err(e) = crate::network::dns_overrides::install_entries(&applied_hot.dns_overrides)
     {
         error!(
             "config reload: invalid network.dns_overrides: {}; keeping old config",
@@ -479,9 +853,15 @@ fn reload_config(
         return;
     }
 
-    warn_non_hot_changes(&old_cfg, &new_cfg);
-    log_changes(&old_hot, &new_hot, &new_cfg, log_tx, detected_ip_v4, detected_ip_v6);
-    config_tx.send(Arc::new(new_cfg)).ok();
+    log_changes(
+        &old_hot,
+        &applied_hot,
+        &applied_cfg,
+        log_tx,
+        detected_ip_v4,
+        detected_ip_v6,
+    );
+    config_tx.send(Arc::new(applied_cfg)).ok();
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -606,4 +986,81 @@ pub fn spawn_config_watcher(
     });
 
     (config_rx, log_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> ProxyConfig {
+        ProxyConfig::default()
+    }
+
+    #[test]
+    fn overlay_applies_hot_and_preserves_non_hot() {
+        let old = sample_config();
+        let mut new = old.clone();
+        new.general.hardswap = !old.general.hardswap;
+        new.server.port = old.server.port.saturating_add(1);
+
+        let applied = overlay_hot_fields(&old, &new);
+        assert_eq!(applied.general.hardswap, new.general.hardswap);
+        assert_eq!(applied.server.port, old.server.port);
+    }
+
+    #[test]
+    fn non_hot_only_change_does_not_change_hot_snapshot() {
+        let old = sample_config();
+        let mut new = old.clone();
+        new.server.port = old.server.port.saturating_add(1);
+
+        let applied = overlay_hot_fields(&old, &new);
+        assert_eq!(HotFields::from_config(&old), HotFields::from_config(&applied));
+        assert_eq!(applied.server.port, old.server.port);
+    }
+
+    #[test]
+    fn bind_stale_mode_is_hot() {
+        let old = sample_config();
+        let mut new = old.clone();
+        new.general.me_bind_stale_mode = match old.general.me_bind_stale_mode {
+            MeBindStaleMode::Never => MeBindStaleMode::Ttl,
+            MeBindStaleMode::Ttl => MeBindStaleMode::Always,
+            MeBindStaleMode::Always => MeBindStaleMode::Never,
+        };
+
+        let applied = overlay_hot_fields(&old, &new);
+        assert_eq!(
+            applied.general.me_bind_stale_mode,
+            new.general.me_bind_stale_mode
+        );
+        assert_ne!(HotFields::from_config(&old), HotFields::from_config(&applied));
+    }
+
+    #[test]
+    fn keepalive_is_not_hot() {
+        let old = sample_config();
+        let mut new = old.clone();
+        new.general.me_keepalive_interval_secs = old.general.me_keepalive_interval_secs + 5;
+
+        let applied = overlay_hot_fields(&old, &new);
+        assert_eq!(
+            applied.general.me_keepalive_interval_secs,
+            old.general.me_keepalive_interval_secs
+        );
+        assert_eq!(HotFields::from_config(&old), HotFields::from_config(&applied));
+    }
+
+    #[test]
+    fn mixed_hot_and_non_hot_change_applies_only_hot_subset() {
+        let old = sample_config();
+        let mut new = old.clone();
+        new.general.hardswap = !old.general.hardswap;
+        new.general.use_middle_proxy = !old.general.use_middle_proxy;
+
+        let applied = overlay_hot_fields(&old, &new);
+        assert_eq!(applied.general.hardswap, new.general.hardswap);
+        assert_eq!(applied.general.use_middle_proxy, old.general.use_middle_proxy);
+        assert!(!config_equal(&applied, &new));
+    }
 }

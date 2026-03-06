@@ -4,11 +4,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 #[cfg(unix)]
@@ -41,8 +41,9 @@ use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::transport::middle_proxy::{
-    MePool, fetch_proxy_config, run_me_ping, MePingFamily, MePingSample, MeReinitTrigger, format_sample_line,
-    format_me_route,
+    MePool, ProxyConfigData, fetch_proxy_config_with_raw, format_me_route, format_sample_line,
+    load_proxy_config_cache, run_me_ping, save_proxy_config_cache, MePingFamily, MePingSample,
+    MeReinitTrigger,
 };
 use crate::transport::{ListenOptions, UpstreamManager, create_listener, find_listener_processes};
 use crate::tls_front::TlsFrontCache;
@@ -172,8 +173,206 @@ async fn write_beobachten_snapshot(path: &str, payload: &str) -> std::io::Result
     tokio::fs::write(path, payload).await
 }
 
+fn unit_label(value: u64, singular: &'static str, plural: &'static str) -> &'static str {
+    if value == 1 { singular } else { plural }
+}
+
+fn format_uptime(total_secs: u64) -> String {
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+    const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+    const SECS_PER_MONTH: u64 = 30 * SECS_PER_DAY;
+    const SECS_PER_YEAR: u64 = 12 * SECS_PER_MONTH;
+
+    let mut remaining = total_secs;
+    let years = remaining / SECS_PER_YEAR;
+    remaining %= SECS_PER_YEAR;
+    let months = remaining / SECS_PER_MONTH;
+    remaining %= SECS_PER_MONTH;
+    let days = remaining / SECS_PER_DAY;
+    remaining %= SECS_PER_DAY;
+    let hours = remaining / SECS_PER_HOUR;
+    remaining %= SECS_PER_HOUR;
+    let minutes = remaining / SECS_PER_MINUTE;
+    let seconds = remaining % SECS_PER_MINUTE;
+
+    let mut parts = Vec::new();
+    if total_secs > SECS_PER_YEAR {
+        parts.push(format!(
+            "{} {}",
+            years,
+            unit_label(years, "year", "years")
+        ));
+    }
+    if total_secs > SECS_PER_MONTH {
+        parts.push(format!(
+            "{} {}",
+            months,
+            unit_label(months, "month", "months")
+        ));
+    }
+    if total_secs > SECS_PER_DAY {
+        parts.push(format!(
+            "{} {}",
+            days,
+            unit_label(days, "day", "days")
+        ));
+    }
+    if total_secs > SECS_PER_HOUR {
+        parts.push(format!(
+            "{} {}",
+            hours,
+            unit_label(hours, "hour", "hours")
+        ));
+    }
+    if total_secs > SECS_PER_MINUTE {
+        parts.push(format!(
+            "{} {}",
+            minutes,
+            unit_label(minutes, "minute", "minutes")
+        ));
+    }
+    parts.push(format!(
+        "{} {}",
+        seconds,
+        unit_label(seconds, "second", "seconds")
+    ));
+
+    format!("{} / {} seconds", parts.join(", "), total_secs)
+}
+
+async fn wait_until_admission_open(admission_rx: &mut watch::Receiver<bool>) -> bool {
+    loop {
+        if *admission_rx.borrow() {
+            return true;
+        }
+        if admission_rx.changed().await.is_err() {
+            return *admission_rx.borrow();
+        }
+    }
+}
+
+async fn load_startup_proxy_config_snapshot(
+    url: &str,
+    cache_path: Option<&str>,
+    me2dc_fallback: bool,
+    label: &'static str,
+) -> Option<ProxyConfigData> {
+    loop {
+        match fetch_proxy_config_with_raw(url).await {
+            Ok((cfg, raw)) => {
+                if !cfg.map.is_empty() {
+                    if let Some(path) = cache_path
+                        && let Err(e) = save_proxy_config_cache(path, &raw).await
+                    {
+                        warn!(error = %e, path, snapshot = label, "Failed to store startup proxy-config cache");
+                    }
+                    return Some(cfg);
+                }
+
+                warn!(snapshot = label, url, "Startup proxy-config is empty; trying disk cache");
+                if let Some(path) = cache_path {
+                    match load_proxy_config_cache(path).await {
+                        Ok(cached) if !cached.map.is_empty() => {
+                            info!(
+                                snapshot = label,
+                                path,
+                                proxy_for_lines = cached.proxy_for_lines,
+                                "Loaded startup proxy-config from disk cache"
+                            );
+                            return Some(cached);
+                        }
+                        Ok(_) => {
+                            warn!(
+                                snapshot = label,
+                                path,
+                                "Startup proxy-config cache is empty; ignoring cache file"
+                            );
+                        }
+                        Err(cache_err) => {
+                            debug!(
+                                snapshot = label,
+                                path,
+                                error = %cache_err,
+                                "Startup proxy-config cache unavailable"
+                            );
+                        }
+                    }
+                }
+
+                if me2dc_fallback {
+                    error!(
+                        snapshot = label,
+                        "Startup proxy-config unavailable and no saved config found; falling back to direct mode"
+                    );
+                    return None;
+                }
+
+                warn!(
+                    snapshot = label,
+                    retry_in_secs = 2,
+                    "Startup proxy-config unavailable and no saved config found; retrying because me2dc_fallback=false"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(fetch_err) => {
+                if let Some(path) = cache_path {
+                    match load_proxy_config_cache(path).await {
+                        Ok(cached) if !cached.map.is_empty() => {
+                            info!(
+                                snapshot = label,
+                                path,
+                                proxy_for_lines = cached.proxy_for_lines,
+                                "Loaded startup proxy-config from disk cache"
+                            );
+                            return Some(cached);
+                        }
+                        Ok(_) => {
+                            warn!(
+                                snapshot = label,
+                                path,
+                                "Startup proxy-config cache is empty; ignoring cache file"
+                            );
+                        }
+                        Err(cache_err) => {
+                            debug!(
+                                snapshot = label,
+                                path,
+                                error = %cache_err,
+                                "Startup proxy-config cache unavailable"
+                            );
+                        }
+                    }
+                }
+
+                if me2dc_fallback {
+                    error!(
+                        snapshot = label,
+                        error = %fetch_err,
+                        "Startup proxy-config unavailable and no cached data; falling back to direct mode"
+                    );
+                    return None;
+                }
+
+                warn!(
+                    snapshot = label,
+                    error = %fetch_err,
+                    retry_in_secs = 2,
+                    "Startup proxy-config unavailable; retrying because me2dc_fallback=false"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let process_started_at = Instant::now();
+    let process_started_at_epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (config_path, cli_silent, cli_log_level) = parse_cli();
 
     let mut config = match ProxyConfig::load(&config_path) {
@@ -269,6 +468,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.upstreams.clone(),
         config.general.upstream_connect_retry_attempts,
         config.general.upstream_connect_retry_backoff_ms,
+        config.general.upstream_connect_budget_ms,
         config.general.upstream_unhealthy_fail_threshold,
         config.general.upstream_connect_failfast_hard_errors,
         stats.clone(),
@@ -416,13 +616,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     log_probe_result(&probe, &decision);
 
     let prefer_ipv6 = decision.prefer_ipv6();
-    let mut use_middle_proxy = config.general.use_middle_proxy && (decision.ipv4_me || decision.ipv6_me);
+    let mut use_middle_proxy = config.general.use_middle_proxy;
     let beobachten = Arc::new(BeobachtenStore::new());
     let rng = Arc::new(SecureRandom::new());
 
     // IP Tracker initialization
     let ip_tracker = Arc::new(UserIpTracker::new());
     ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
+    ip_tracker
+        .set_limit_policy(
+            config.access.user_max_unique_ips_mode,
+            config.access.user_max_unique_ips_window_secs,
+        )
+        .await;
     
     if !config.access.user_max_unique_ips.is_empty() {
         info!("IP limits configured for {} users", config.access.user_max_unique_ips.len());
@@ -437,9 +643,18 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Connection concurrency limit
     let max_connections = Arc::new(Semaphore::new(10_000));
 
+    let me2dc_fallback = config.general.me2dc_fallback;
+    let me_init_retry_attempts = config.general.me_init_retry_attempts;
+    let me_init_warn_after_attempts: u32 = 3;
     if use_middle_proxy && !decision.ipv4_me && !decision.ipv6_me {
-        warn!("No usable IP family for Middle Proxy detected; falling back to direct DC");
-        use_middle_proxy = false;
+        if me2dc_fallback {
+            warn!("No usable IP family for Middle Proxy detected; falling back to direct DC");
+            use_middle_proxy = false;
+        } else {
+            warn!(
+                "No usable IP family for Middle Proxy detected; me2dc_fallback=false, ME init retries stay active"
+            );
+        }
     }
 
     // =====================================================================
@@ -469,13 +684,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // proxy-secret is from: https://core.telegram.org/getProxySecret
         // =============================================================
         let proxy_secret_path = config.general.proxy_secret_path.as_deref();
-        match crate::transport::middle_proxy::fetch_proxy_secret(
-            proxy_secret_path,
-            config.general.proxy_secret_len_max,
-        )
-        .await
-        {
-            Ok(proxy_secret) => {
+        let pool_size = config.general.middle_proxy_pool_size.max(1);
+        let proxy_secret = loop {
+            match crate::transport::middle_proxy::fetch_proxy_secret(
+                proxy_secret_path,
+                config.general.proxy_secret_len_max,
+            )
+            .await
+            {
+                Ok(proxy_secret) => break Some(proxy_secret),
+                Err(e) => {
+                    if me2dc_fallback {
+                        error!(
+                            error = %e,
+                            "ME startup failed: proxy-secret is unavailable and no saved secret found; falling back to direct mode"
+                        );
+                        break None;
+                    }
+
+                    warn!(
+                        error = %e,
+                        retry_in_secs = 2,
+                        "ME startup failed: proxy-secret is unavailable and no saved secret found; retrying because me2dc_fallback=false"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
+        match proxy_secret {
+            Some(proxy_secret) => {
                 info!(
                     secret_len = proxy_secret.len(),
                     key_sig = format_args!(
@@ -494,118 +731,153 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "Proxy-secret loaded"
                 );
 
-                // Load ME config (v4/v6) + default DC
-                let mut cfg_v4 = fetch_proxy_config(
+                let cfg_v4 = load_startup_proxy_config_snapshot(
                     "https://core.telegram.org/getProxyConfig",
+                    config.general.proxy_config_v4_cache_path.as_deref(),
+                    me2dc_fallback,
+                    "getProxyConfig",
                 )
-                .await
-                .unwrap_or_default();
-                let mut cfg_v6 = fetch_proxy_config(
+                .await;
+                let cfg_v6 = load_startup_proxy_config_snapshot(
                     "https://core.telegram.org/getProxyConfigV6",
+                    config.general.proxy_config_v6_cache_path.as_deref(),
+                    me2dc_fallback,
+                    "getProxyConfigV6",
                 )
-                .await
-                .unwrap_or_default();
+                .await;
 
-                if cfg_v4.map.is_empty() {
-                    cfg_v4.map = crate::protocol::constants::TG_MIDDLE_PROXIES_V4.clone();
-                }
-                if cfg_v6.map.is_empty() {
-                    cfg_v6.map = crate::protocol::constants::TG_MIDDLE_PROXIES_V6.clone();
-                }
+                if let (Some(cfg_v4), Some(cfg_v6)) = (cfg_v4, cfg_v6) {
+                    let pool = MePool::new(
+                        proxy_tag.clone(),
+                        proxy_secret,
+                        config.general.middle_proxy_nat_ip,
+                        me_nat_probe,
+                        None,
+                        config.network.stun_servers.clone(),
+                        config.general.stun_nat_probe_concurrency,
+                        probe.detected_ipv6,
+                        config.timeouts.me_one_retry,
+                        config.timeouts.me_one_timeout_ms,
+                        cfg_v4.map.clone(),
+                        cfg_v6.map.clone(),
+                        cfg_v4.default_dc.or(cfg_v6.default_dc),
+                        decision.clone(),
+                        Some(upstream_manager.clone()),
+                        rng.clone(),
+                        stats.clone(),
+                        config.general.me_keepalive_enabled,
+                        config.general.me_keepalive_interval_secs,
+                        config.general.me_keepalive_jitter_secs,
+                        config.general.me_keepalive_payload_random,
+                        config.general.rpc_proxy_req_every,
+                        config.general.me_warmup_stagger_enabled,
+                        config.general.me_warmup_step_delay_ms,
+                        config.general.me_warmup_step_jitter_ms,
+                        config.general.me_reconnect_max_concurrent_per_dc,
+                        config.general.me_reconnect_backoff_base_ms,
+                        config.general.me_reconnect_backoff_cap_ms,
+                        config.general.me_reconnect_fast_retry_count,
+                        config.general.me_single_endpoint_shadow_writers,
+                        config.general.me_single_endpoint_outage_mode_enabled,
+                        config.general.me_single_endpoint_outage_disable_quarantine,
+                        config.general.me_single_endpoint_outage_backoff_min_ms,
+                        config.general.me_single_endpoint_outage_backoff_max_ms,
+                        config.general.me_single_endpoint_shadow_rotate_every_secs,
+                        config.general.me_floor_mode,
+                        config.general.me_adaptive_floor_idle_secs,
+                        config.general.me_adaptive_floor_min_writers_single_endpoint,
+                        config.general.me_adaptive_floor_recover_grace_secs,
+                        config.general.hardswap,
+                        config.general.me_pool_drain_ttl_secs,
+                        config.general.effective_me_pool_force_close_secs(),
+                        config.general.me_pool_min_fresh_ratio,
+                        config.general.me_hardswap_warmup_delay_min_ms,
+                        config.general.me_hardswap_warmup_delay_max_ms,
+                        config.general.me_hardswap_warmup_extra_passes,
+                        config.general.me_hardswap_warmup_pass_backoff_base_ms,
+                        config.general.me_bind_stale_mode,
+                        config.general.me_bind_stale_ttl_secs,
+                        config.general.me_secret_atomic_snapshot,
+                        config.general.me_deterministic_writer_sort,
+                        config.general.me_socks_kdf_policy,
+                        config.general.me_route_backpressure_base_timeout_ms,
+                        config.general.me_route_backpressure_high_timeout_ms,
+                        config.general.me_route_backpressure_high_watermark_pct,
+                        config.general.me_route_no_writer_mode,
+                        config.general.me_route_no_writer_wait_ms,
+                        config.general.me_route_inline_recovery_attempts,
+                        config.general.me_route_inline_recovery_wait_ms,
+                    );
 
-                let pool = MePool::new(
-                    proxy_tag,
-                    proxy_secret,
-                    config.general.middle_proxy_nat_ip,
-                    me_nat_probe,
-                    None,
-                    config.network.stun_servers.clone(),
-                    config.general.stun_nat_probe_concurrency,
-                    probe.detected_ipv6,
-                    config.timeouts.me_one_retry,
-                    config.timeouts.me_one_timeout_ms,
-                    cfg_v4.map.clone(),
-                    cfg_v6.map.clone(),
-                    cfg_v4.default_dc.or(cfg_v6.default_dc),
-                    decision.clone(),
-                    Some(upstream_manager.clone()),
-                    rng.clone(),
-                    stats.clone(),
-                    config.general.me_keepalive_enabled,
-                    config.general.me_keepalive_interval_secs,
-                    config.general.me_keepalive_jitter_secs,
-                    config.general.me_keepalive_payload_random,
-                    config.general.rpc_proxy_req_every,
-                    config.general.me_warmup_stagger_enabled,
-                    config.general.me_warmup_step_delay_ms,
-                    config.general.me_warmup_step_jitter_ms,
-                    config.general.me_reconnect_max_concurrent_per_dc,
-                    config.general.me_reconnect_backoff_base_ms,
-                    config.general.me_reconnect_backoff_cap_ms,
-                    config.general.me_reconnect_fast_retry_count,
-                    config.general.me_single_endpoint_shadow_writers,
-                    config.general.me_single_endpoint_outage_mode_enabled,
-                    config.general.me_single_endpoint_outage_disable_quarantine,
-                    config.general.me_single_endpoint_outage_backoff_min_ms,
-                    config.general.me_single_endpoint_outage_backoff_max_ms,
-                    config.general.me_single_endpoint_shadow_rotate_every_secs,
-                    config.general.me_floor_mode,
-                    config.general.me_adaptive_floor_idle_secs,
-                    config.general.me_adaptive_floor_min_writers_single_endpoint,
-                    config.general.me_adaptive_floor_recover_grace_secs,
-                    config.general.hardswap,
-                    config.general.me_pool_drain_ttl_secs,
-                    config.general.effective_me_pool_force_close_secs(),
-                    config.general.me_pool_min_fresh_ratio,
-                    config.general.me_hardswap_warmup_delay_min_ms,
-                    config.general.me_hardswap_warmup_delay_max_ms,
-                    config.general.me_hardswap_warmup_extra_passes,
-                    config.general.me_hardswap_warmup_pass_backoff_base_ms,
-                    config.general.me_bind_stale_mode,
-                    config.general.me_bind_stale_ttl_secs,
-                    config.general.me_secret_atomic_snapshot,
-                    config.general.me_deterministic_writer_sort,
-                    config.general.me_socks_kdf_policy,
-                    config.general.me_route_backpressure_base_timeout_ms,
-                    config.general.me_route_backpressure_high_timeout_ms,
-                    config.general.me_route_backpressure_high_watermark_pct,
-                );
+                    let mut init_attempt: u32 = 0;
+                    loop {
+                        init_attempt = init_attempt.saturating_add(1);
+                        match pool.init(pool_size, &rng).await {
+                            Ok(()) => {
+                                info!(
+                                    attempt = init_attempt,
+                                    "Middle-End pool initialized successfully"
+                                );
 
-                let pool_size = config.general.middle_proxy_pool_size.max(1);
-                loop {
-                    match pool.init(pool_size, &rng).await {
-                        Ok(()) => {
-                            info!("Middle-End pool initialized successfully");
+                                // Phase 4: Start health monitor
+                                let pool_clone = pool.clone();
+                                let rng_clone = rng.clone();
+                                let min_conns = pool_size;
+                                tokio::spawn(async move {
+                                    crate::transport::middle_proxy::me_health_monitor(
+                                        pool_clone, rng_clone, min_conns,
+                                    )
+                                    .await;
+                                });
 
-                            // Phase 4: Start health monitor
-                            let pool_clone = pool.clone();
-                            let rng_clone = rng.clone();
-                            let min_conns = pool_size;
-                            tokio::spawn(async move {
-                                crate::transport::middle_proxy::me_health_monitor(
-                                    pool_clone, rng_clone, min_conns,
-                                )
-                                .await;
-                            });
+                                break Some(pool);
+                            }
+                            Err(e) => {
+                                let retries_limited = me2dc_fallback && me_init_retry_attempts > 0;
+                                if retries_limited && init_attempt >= me_init_retry_attempts {
+                                    error!(
+                                        error = %e,
+                                        attempt = init_attempt,
+                                        retry_limit = me_init_retry_attempts,
+                                        "ME pool init retries exhausted; falling back to direct mode"
+                                    );
+                                    break None;
+                                }
 
-                            break Some(pool);
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                retry_in_secs = 2,
-                                "ME pool is not ready yet; retrying startup initialization"
-                            );
-                            pool.reset_stun_state();
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                                let retry_limit = if !me2dc_fallback || me_init_retry_attempts == 0 {
+                                    String::from("unlimited")
+                                } else {
+                                    me_init_retry_attempts.to_string()
+                                };
+                                if init_attempt >= me_init_warn_after_attempts {
+                                    warn!(
+                                        error = %e,
+                                        attempt = init_attempt,
+                                        retry_limit = retry_limit,
+                                        me2dc_fallback = me2dc_fallback,
+                                        retry_in_secs = 2,
+                                        "ME pool is not ready yet; retrying startup initialization"
+                                    );
+                                } else {
+                                    info!(
+                                        error = %e,
+                                        attempt = init_attempt,
+                                        retry_limit = retry_limit,
+                                        me2dc_fallback = me2dc_fallback,
+                                        retry_in_secs = 2,
+                                        "ME pool startup warmup: retrying initialization"
+                                    );
+                                }
+                                pool.reset_stun_state();
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
                         }
                     }
+                } else {
+                    None
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Failed to fetch proxy-secret. Falling back to direct mode.");
-                None
-            }
+            None => None,
         }
     } else {
         None
@@ -670,22 +942,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut grouped: BTreeMap<i32, Vec<MePingSample>> = BTreeMap::new();
         for report in me_results {
             for s in report.samples {
-                let key = s.dc.abs();
-                grouped.entry(key).or_default().push(s);
+                grouped.entry(s.dc).or_default().push(s);
             }
         }
 
         let family_order = if prefer_ipv6 {
-            vec![(MePingFamily::V6, true), (MePingFamily::V6, false), (MePingFamily::V4, true), (MePingFamily::V4, false)]
+            vec![MePingFamily::V6, MePingFamily::V4]
         } else {
-            vec![(MePingFamily::V4, true), (MePingFamily::V4, false), (MePingFamily::V6, true), (MePingFamily::V6, false)]
+            vec![MePingFamily::V4, MePingFamily::V6]
         };
 
-        for (dc_abs, samples) in grouped {
-            for (family, is_pos) in &family_order {
+        for (dc, samples) in grouped {
+            for family in &family_order {
                 let fam_samples: Vec<&MePingSample> = samples
                     .iter()
-                    .filter(|s| matches!(s.family, f if &f == family) && (s.dc >= 0) == *is_pos)
+                    .filter(|s| matches!(s.family, f if &f == family))
                     .collect();
                 if fam_samples.is_empty() {
                     continue;
@@ -695,7 +966,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     MePingFamily::V4 => "IPv4",
                     MePingFamily::V6 => "IPv6",
                 };
-                info!("    DC{} [{}]", dc_abs, fam_label);
+                info!("    DC{} [{}]", dc, fam_label);
                 for sample in fam_samples {
                     let line = format_sample_line(sample);
                     info!("{}", line);
@@ -786,6 +1057,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 		}
 	}
 
+    let initialized_secs = process_started_at.elapsed().as_secs();
+    let second_suffix = if initialized_secs == 1 { "" } else { "s" };
+    info!("===================== Telegram Startup =====================");
+    info!(
+        "  DC/ME Initialized in {} second{}",
+        initialized_secs, second_suffix
+    );
+    info!("============================================================");
+
+    if let Some(ref pool) = me_pool {
+        pool.set_runtime_ready(true);
+    }
+
     // Background tasks
     let um_clone = upstream_manager.clone();
     let decision_clone = decision.clone();
@@ -843,6 +1127,51 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     cfg.general.me_route_backpressure_high_timeout_ms,
                     cfg.general.me_route_backpressure_high_watermark_pct,
                 );
+            }
+        }
+    });
+
+    let ip_tracker_policy = ip_tracker.clone();
+    let mut config_rx_ip_limits = config_rx.clone();
+    tokio::spawn(async move {
+        let mut prev_limits = config_rx_ip_limits
+            .borrow()
+            .access
+            .user_max_unique_ips
+            .clone();
+        let mut prev_mode = config_rx_ip_limits
+            .borrow()
+            .access
+            .user_max_unique_ips_mode;
+        let mut prev_window = config_rx_ip_limits
+            .borrow()
+            .access
+            .user_max_unique_ips_window_secs;
+
+        loop {
+            if config_rx_ip_limits.changed().await.is_err() {
+                break;
+            }
+            let cfg = config_rx_ip_limits.borrow_and_update().clone();
+
+            if prev_limits != cfg.access.user_max_unique_ips {
+                ip_tracker_policy
+                    .load_limits(&cfg.access.user_max_unique_ips)
+                    .await;
+                prev_limits = cfg.access.user_max_unique_ips.clone();
+            }
+
+            if prev_mode != cfg.access.user_max_unique_ips_mode
+                || prev_window != cfg.access.user_max_unique_ips_window_secs
+            {
+                ip_tracker_policy
+                    .set_limit_policy(
+                        cfg.access.user_max_unique_ips_mode,
+                        cfg.access.user_max_unique_ips_window_secs,
+                    )
+                    .await;
+                prev_mode = cfg.access.user_max_unique_ips_mode;
+                prev_window = cfg.access.user_max_unique_ips_window_secs;
             }
         }
     });
@@ -1011,6 +1340,60 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         print_proxy_links(&host, port, &config);
     }
 
+    let (admission_tx, admission_rx) = watch::channel(true);
+    if config.general.use_middle_proxy {
+        if let Some(pool) = me_pool.as_ref() {
+            let initial_open = pool.admission_ready_conditional_cast().await;
+            admission_tx.send_replace(initial_open);
+            if initial_open {
+                info!("Conditional-admission gate: open (ME pool ready)");
+            } else {
+                warn!("Conditional-admission gate: closed (ME pool is not ready)");
+            }
+
+            let pool_for_gate = pool.clone();
+            let admission_tx_gate = admission_tx.clone();
+            tokio::spawn(async move {
+                let mut gate_open = initial_open;
+                let mut open_streak = if initial_open { 1u32 } else { 0u32 };
+                let mut close_streak = if initial_open { 0u32 } else { 1u32 };
+                loop {
+                    let ready = pool_for_gate.admission_ready_conditional_cast().await;
+                    if ready {
+                        open_streak = open_streak.saturating_add(1);
+                        close_streak = 0;
+                        if !gate_open && open_streak >= 2 {
+                            gate_open = true;
+                            admission_tx_gate.send_replace(true);
+                            info!(
+                                open_streak,
+                                "Conditional-admission gate opened (ME pool recovered)"
+                            );
+                        }
+                    } else {
+                        close_streak = close_streak.saturating_add(1);
+                        open_streak = 0;
+                        if gate_open && close_streak >= 2 {
+                            gate_open = false;
+                            admission_tx_gate.send_replace(false);
+                            warn!(
+                                close_streak,
+                                "Conditional-admission gate closed (ME pool has uncovered DC groups)"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+        } else {
+            admission_tx.send_replace(false);
+            warn!("Conditional-admission gate: closed (ME pool is unavailable)");
+        }
+    } else {
+        admission_tx.send_replace(true);
+    }
+    let _admission_tx_hold = admission_tx;
+
     // Unix socket setup (before listeners check so unix-only config works)
     let mut has_unix_listener = false;
     #[cfg(unix)]
@@ -1044,6 +1427,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         has_unix_listener = true;
 
         let mut config_rx_unix: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
+        let mut admission_rx_unix = admission_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
@@ -1059,6 +1443,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let unix_conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
 
             loop {
+                if !wait_until_admission_open(&mut admission_rx_unix).await {
+                    warn!("Conditional-admission gate channel closed for unix listener");
+                    break;
+                }
                 match unix_listener.accept().await {
                     Ok((stream, _)) => {
                         let permit = match max_connections_unix.clone().acquire_owned().await {
@@ -1171,6 +1559,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let me_pool_api = me_pool.clone();
             let upstream_manager_api = upstream_manager.clone();
             let config_rx_api = config_rx.clone();
+            let admission_rx_api = admission_rx.clone();
             let config_path_api = std::path::PathBuf::from(&config_path);
             let startup_detected_ip_v4 = detected_ip_v4;
             let startup_detected_ip_v6 = detected_ip_v6;
@@ -1182,9 +1571,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     me_pool_api,
                     upstream_manager_api,
                     config_rx_api,
+                    admission_rx_api,
                     config_path_api,
                     startup_detected_ip_v4,
                     startup_detected_ip_v6,
+                    process_started_at_epoch_secs,
                 )
                 .await;
             });
@@ -1193,6 +1584,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     for (listener, listener_proxy_protocol) in listeners {
         let mut config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
+        let mut admission_rx_tcp = admission_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
@@ -1206,6 +1598,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             loop {
+                if !wait_until_admission_open(&mut admission_rx_tcp).await {
+                    warn!("Conditional-admission gate channel closed for tcp listener");
+                    break;
+                }
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         let permit = match max_connections_tcp.clone().acquire_owned().await {
@@ -1294,7 +1690,36 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     match signal::ctrl_c().await {
-        Ok(()) => info!("Shutting down..."),
+        Ok(()) => {
+            let shutdown_started_at = Instant::now();
+            info!("Shutting down...");
+            let uptime_secs = process_started_at.elapsed().as_secs();
+            info!("Uptime: {}", format_uptime(uptime_secs));
+            if let Some(pool) = &me_pool {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    pool.shutdown_send_close_conn_all(),
+                )
+                .await
+                {
+                    Ok(total) => {
+                        info!(
+                            close_conn_sent = total,
+                            "ME shutdown: RPC_CLOSE_CONN broadcast completed"
+                        );
+                    }
+                    Err(_) => {
+                        warn!("ME shutdown: RPC_CLOSE_CONN broadcast timed out");
+                    }
+                }
+            }
+            let shutdown_secs = shutdown_started_at.elapsed().as_secs();
+            info!(
+                "Shutdown completed successfully in {} {}.",
+                shutdown_secs,
+                unit_label(shutdown_secs, "second", "seconds")
+            );
+        }
         Err(e) => error!("Signal error: {}", e),
     }
 

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -100,47 +100,103 @@ pub(crate) struct MeApiRuntimeSnapshot {
 }
 
 impl MePool {
+    pub(crate) async fn admission_ready_conditional_cast(&self) -> bool {
+        let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
+        if self.decision.ipv4_me {
+            let map = self.proxy_map_v4.read().await.clone();
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
+        }
+        if self.decision.ipv6_me {
+            let map = self.proxy_map_v6.read().await.clone();
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
+        }
+
+        if endpoints_by_dc.is_empty() {
+            return false;
+        }
+
+        let writers = self.writers.read().await.clone();
+        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        for writer in writers {
+            if writer.draining.load(Ordering::Relaxed) {
+                continue;
+            }
+            *live_writers_by_endpoint.entry(writer.addr).or_insert(0) += 1;
+        }
+
+        for endpoints in endpoints_by_dc.values() {
+            let alive: usize = endpoints
+                .iter()
+                .map(|endpoint| live_writers_by_endpoint.get(endpoint).copied().unwrap_or(0))
+                .sum();
+            if alive == 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn admission_ready_full_floor(&self) -> bool {
+        let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
+        if self.decision.ipv4_me {
+            let map = self.proxy_map_v4.read().await.clone();
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
+        }
+        if self.decision.ipv6_me {
+            let map = self.proxy_map_v6.read().await.clone();
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
+        }
+
+        if endpoints_by_dc.is_empty() {
+            return false;
+        }
+
+        let writers = self.writers.read().await.clone();
+        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        for writer in writers {
+            if writer.draining.load(Ordering::Relaxed) {
+                continue;
+            }
+            *live_writers_by_endpoint.entry(writer.addr).or_insert(0) += 1;
+        }
+
+        for endpoints in endpoints_by_dc.values() {
+            let endpoint_count = endpoints.len();
+            if endpoint_count == 0 {
+                return false;
+            }
+            let required = self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
+            let alive: usize = endpoints
+                .iter()
+                .map(|endpoint| live_writers_by_endpoint.get(endpoint).copied().unwrap_or(0))
+                .sum();
+            if alive < required {
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub(crate) async fn api_status_snapshot(&self) -> MeApiStatusSnapshot {
         let now_epoch_secs = Self::now_epoch_secs();
 
         let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
         if self.decision.ipv4_me {
             let map = self.proxy_map_v4.read().await.clone();
-            for (dc, addrs) in map {
-                let abs_dc = dc.abs();
-                if abs_dc == 0 {
-                    continue;
-                }
-                let Ok(dc_idx) = i16::try_from(abs_dc) else {
-                    continue;
-                };
-                let entry = endpoints_by_dc.entry(dc_idx).or_default();
-                for (ip, port) in addrs {
-                    entry.insert(SocketAddr::new(ip, port));
-                }
-            }
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
         }
         if self.decision.ipv6_me {
             let map = self.proxy_map_v6.read().await.clone();
-            for (dc, addrs) in map {
-                let abs_dc = dc.abs();
-                if abs_dc == 0 {
-                    continue;
-                }
-                let Ok(dc_idx) = i16::try_from(abs_dc) else {
-                    continue;
-                };
-                let entry = endpoints_by_dc.entry(dc_idx).or_default();
-                for (ip, port) in addrs {
-                    entry.insert(SocketAddr::new(ip, port));
-                }
-            }
+            extend_signed_endpoints(&mut endpoints_by_dc, map);
         }
 
-        let mut endpoint_to_dc = HashMap::<SocketAddr, i16>::new();
+        let mut endpoint_to_dc = HashMap::<SocketAddr, BTreeSet<i16>>::new();
         for (dc, endpoints) in &endpoints_by_dc {
             for endpoint in endpoints {
-                endpoint_to_dc.entry(*endpoint).or_insert(*dc);
+                endpoint_to_dc.entry(*endpoint).or_default().insert(*dc);
             }
         }
 
@@ -164,7 +220,13 @@ impl MePool {
 
         for writer in writers {
             let endpoint = writer.addr;
-            let dc = endpoint_to_dc.get(&endpoint).copied();
+            let dc = endpoint_to_dc.get(&endpoint).and_then(|dcs| {
+                if dcs.len() == 1 {
+                    dcs.iter().next().copied()
+                } else {
+                    None
+                }
+            });
             let draining = writer.draining.load(Ordering::Relaxed);
             let degraded = writer.degraded.load(Ordering::Relaxed);
             let bound_clients = activity
@@ -369,6 +431,24 @@ fn ratio_pct(part: usize, total: usize) -> f64 {
     }
     let pct = ((part as f64) / (total as f64)) * 100.0;
     pct.clamp(0.0, 100.0)
+}
+
+fn extend_signed_endpoints(
+    endpoints_by_dc: &mut BTreeMap<i16, BTreeSet<SocketAddr>>,
+    map: HashMap<i32, Vec<(IpAddr, u16)>>,
+) {
+    for (dc, addrs) in map {
+        if dc == 0 {
+            continue;
+        }
+        let Ok(dc_idx) = i16::try_from(dc) else {
+            continue;
+        };
+        let entry = endpoints_by_dc.entry(dc_idx).or_default();
+        for (ip, port) in addrs {
+            entry.insert(SocketAddr::new(ip, port));
+        }
+    }
 }
 
 fn floor_mode_label(mode: MeFloorMode) -> &'static str {

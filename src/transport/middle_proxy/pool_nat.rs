@@ -248,6 +248,43 @@ impl MePool {
             }
         }
 
+        let _singleflight_guard = if use_shared_cache {
+            Some(match family {
+                IpFamily::V4 => self.nat_reflection_singleflight_v4.lock().await,
+                IpFamily::V6 => self.nat_reflection_singleflight_v6.lock().await,
+            })
+        } else {
+            None
+        };
+
+        if use_shared_cache
+            && let Some(until) = *self.stun_backoff_until.read().await
+            && Instant::now() < until
+        {
+            if let Ok(cache) = self.nat_reflection_cache.try_lock() {
+                let slot = match family {
+                    IpFamily::V4 => cache.v4,
+                    IpFamily::V6 => cache.v6,
+                };
+                return slot.map(|(_, addr)| addr);
+            }
+            return None;
+        }
+
+        if use_shared_cache
+            && let Ok(mut cache) = self.nat_reflection_cache.try_lock()
+        {
+            let slot = match family {
+                IpFamily::V4 => &mut cache.v4,
+                IpFamily::V6 => &mut cache.v6,
+            };
+            if let Some((ts, addr)) = slot
+                && ts.elapsed() < STUN_CACHE_TTL
+            {
+                return Some(*addr);
+            }
+        }
+
         let attempt = if use_shared_cache {
             self.nat_probe_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         } else {

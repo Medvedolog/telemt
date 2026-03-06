@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
+use crate::config::{MeBindStaleMode, MeFloorMode, MeRouteNoWriterMode, MeSocksKdfPolicy};
 use crate::crypto::SecureRandom;
 use crate::network::IpFamily;
 use crate::network::probe::NetworkDecision;
@@ -119,6 +119,8 @@ pub struct MePool {
     pub(super) ping_tracker: Arc<Mutex<HashMap<i64, (std::time::Instant, u64)>>>,
     pub(super) rtt_stats: Arc<Mutex<HashMap<u64, (f64, f64)>>>,
     pub(super) nat_reflection_cache: Arc<Mutex<NatReflectionCache>>,
+    pub(super) nat_reflection_singleflight_v4: Arc<Mutex<()>>,
+    pub(super) nat_reflection_singleflight_v6: Arc<Mutex<()>>,
     pub(super) writer_available: Arc<Notify>,
     pub(super) refill_inflight: Arc<Mutex<HashSet<SocketAddr>>>,
     pub(super) refill_inflight_dc: Arc<Mutex<HashSet<RefillDcKey>>>,
@@ -132,7 +134,7 @@ pub struct MePool {
     pub(super) pending_hardswap_map_hash: AtomicU64,
     pub(super) hardswap: AtomicBool,
     pub(super) endpoint_quarantine: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
-    pub(super) kdf_material_fingerprint: Arc<Mutex<HashMap<SocketAddr, (u64, u16)>>>,
+    pub(super) kdf_material_fingerprint: Arc<RwLock<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
@@ -145,6 +147,11 @@ pub struct MePool {
     pub(super) secret_atomic_snapshot: AtomicBool,
     pub(super) me_deterministic_writer_sort: AtomicBool,
     pub(super) me_socks_kdf_policy: AtomicU8,
+    pub(super) me_route_no_writer_mode: AtomicU8,
+    pub(super) me_route_no_writer_wait: Duration,
+    pub(super) me_route_inline_recovery_attempts: u32,
+    pub(super) me_route_inline_recovery_wait: Duration,
+    pub(super) runtime_ready: AtomicBool,
     pool_size: usize,
 }
 
@@ -227,6 +234,10 @@ impl MePool {
         me_route_backpressure_base_timeout_ms: u64,
         me_route_backpressure_high_timeout_ms: u64,
         me_route_backpressure_high_watermark_pct: u8,
+        me_route_no_writer_mode: MeRouteNoWriterMode,
+        me_route_no_writer_wait_ms: u64,
+        me_route_inline_recovery_attempts: u32,
+        me_route_inline_recovery_wait_ms: u64,
     ) -> Arc<Self> {
         let registry = Arc::new(ConnRegistry::new());
         registry.update_route_backpressure_policy(
@@ -309,11 +320,13 @@ impl MePool {
             pool_size: 2,
             proxy_map_v4: Arc::new(RwLock::new(proxy_map_v4)),
             proxy_map_v6: Arc::new(RwLock::new(proxy_map_v6)),
-            default_dc: AtomicI32::new(default_dc.unwrap_or(0)),
+            default_dc: AtomicI32::new(default_dc.unwrap_or(2)),
             next_writer_id: AtomicU64::new(1),
             ping_tracker: Arc::new(Mutex::new(HashMap::new())),
             rtt_stats: Arc::new(Mutex::new(HashMap::new())),
             nat_reflection_cache: Arc::new(Mutex::new(NatReflectionCache::default())),
+            nat_reflection_singleflight_v4: Arc::new(Mutex::new(())),
+            nat_reflection_singleflight_v6: Arc::new(Mutex::new(())),
             writer_available: Arc::new(Notify::new()),
             refill_inflight: Arc::new(Mutex::new(HashSet::new())),
             refill_inflight_dc: Arc::new(Mutex::new(HashSet::new())),
@@ -326,7 +339,7 @@ impl MePool {
             pending_hardswap_map_hash: AtomicU64::new(0),
             hardswap: AtomicBool::new(hardswap),
             endpoint_quarantine: Arc::new(Mutex::new(HashMap::new())),
-            kdf_material_fingerprint: Arc::new(Mutex::new(HashMap::new())),
+            kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
             me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
             me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(
@@ -343,11 +356,24 @@ impl MePool {
             secret_atomic_snapshot: AtomicBool::new(me_secret_atomic_snapshot),
             me_deterministic_writer_sort: AtomicBool::new(me_deterministic_writer_sort),
             me_socks_kdf_policy: AtomicU8::new(me_socks_kdf_policy.as_u8()),
+            me_route_no_writer_mode: AtomicU8::new(me_route_no_writer_mode.as_u8()),
+            me_route_no_writer_wait: Duration::from_millis(me_route_no_writer_wait_ms),
+            me_route_inline_recovery_attempts,
+            me_route_inline_recovery_wait: Duration::from_millis(me_route_inline_recovery_wait_ms),
+            runtime_ready: AtomicBool::new(false),
         })
     }
 
     pub fn current_generation(&self) -> u64 {
         self.active_generation.load(Ordering::Relaxed)
+    }
+
+    pub fn set_runtime_ready(&self, ready: bool) {
+        self.runtime_ready.store(ready, Ordering::Relaxed);
+    }
+
+    pub fn is_runtime_ready(&self) -> bool {
+        self.runtime_ready.load(Ordering::Relaxed)
     }
 
     pub fn update_runtime_reinit_policy(
@@ -597,6 +623,58 @@ impl MePool {
             }
         }
         order
+    }
+
+    pub(super) fn default_dc_for_routing(&self) -> i32 {
+        let dc = self.default_dc.load(Ordering::Relaxed);
+        if dc == 0 { 2 } else { dc }
+    }
+
+    pub(super) fn dc_lookup_chain_for_target(&self, target_dc: i32) -> Vec<i32> {
+        let mut out = Vec::with_capacity(1);
+        if target_dc != 0 {
+            out.push(target_dc);
+        } else {
+            // Use default DC only when target DC is unknown and pinning is not established.
+            let fallback_dc = self.default_dc_for_routing();
+            out.push(fallback_dc);
+        }
+        out
+    }
+
+    pub(super) async fn resolve_dc_for_endpoint(&self, addr: SocketAddr) -> i32 {
+        let map_guard = if addr.is_ipv4() {
+            self.proxy_map_v4.read().await
+        } else {
+            self.proxy_map_v6.read().await
+        };
+
+        let mut matched_dc: Option<i32> = None;
+        let mut ambiguous = false;
+        for (dc, addrs) in map_guard.iter() {
+            if addrs
+                .iter()
+                .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
+            {
+                match matched_dc {
+                    None => matched_dc = Some(*dc),
+                    Some(prev_dc) if prev_dc == *dc => {}
+                    Some(_) => {
+                        ambiguous = true;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(map_guard);
+
+        if !ambiguous
+            && let Some(dc) = matched_dc
+        {
+            return dc;
+        }
+
+        self.default_dc_for_routing()
     }
 
     pub(super) async fn proxy_map_for_family(

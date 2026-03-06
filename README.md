@@ -2,7 +2,12 @@
 
 ***Löst Probleme, bevor andere überhaupt wissen, dass sie existieren*** / ***It solves problems before others even realize they exist***
 
-**Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as connection pooling, replay protection, detailed statistics, masking from "prying" eyes
+**Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as:
+- [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/model/MODEL.en.md)
+- [Full-covered API w/ management](https://github.com/telemt/telemt/blob/main/docs/API.md)
+- Anti-Replay on Sliding Window
+- Prometheus-format Metrics
+- TLS-Fronting and TCP-Splicing for masking from "prying" eyes
 
 [**Telemt Chat in Telegram**](https://t.me/telemtrs)
 
@@ -14,18 +19,18 @@
 
 ### 🇷🇺 RU
 
-#### Релиз 3.0.15 — 25 февраля
+#### Релиз 3.3.3 LTS - 6 марта
 
-25 февраля мы выпустили версию **3.0.15**
+6 марта мы выпустили Telemt **3.3.3**
 
-Мы предполагаем, что она станет завершающей версией поколения 3.0 и уже сейчас мы рассматриваем её как **LTS-кандидата** для версии **3.1.0**!
+Это первая версия telemt работающая в комплексных условиях и при этом предоставляющая API
 
-После нескольких дней детального анализа особенностей работы Middle-End мы спроектировали и реализовали продуманный режим **ротации ME Writer**. Данный режим позволяет поддерживать стабильно высокую производительность в long-run сценариях без возникновения ошибок, связанных с некорректной конфигурацией прокси
+В ней используется новый алгоритм - ME NoWait, который вместе с Adaptive Floor и моделью усовершенствованного доступа к KDF Fingerprint на RwLock позволяет достигать максимальную производительность, даже в условиях lossy-сети
 
 Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **статистики** и **UX**
 
 Релиз:  
-[3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
+[3.3.3](https://github.com/telemt/telemt/releases/tag/3.3.3)
 
 ---
 
@@ -42,18 +47,18 @@
 
 ### 🇬🇧 EN
 
-#### Release 3.0.15 — February 25
+#### Release 3.3.3 LTS - March 6
 
-On February 25, we released version **3.0.15**
+On March 6, we released Telemt **3.3.3**
 
-We expect this to become the final release of the 3.0 generation and at this point, we already see it as a strong **LTS candidate** for the upcoming **3.1.0** release!
+This is the first telemt's version designed to operate reliably in complex network conditions while also providing a runtime API!
 
-After several days of deep analysis of Middle-End behavior, we designed and implemented a well-engineered **ME Writer rotation mode**. This mode enables sustained high throughput in long-run scenarios while preventing proxy misconfiguration errors
+The release introduces a new algorithm — ME NoWait, which combined with Adaptive Floor and an improved KDF Fingerprint access model based on RwLock, it enables the system to achieve maximum performance even in lossy network environments
 
 We are looking forward to your feedback and improvement proposals — especially regarding **statistics** and **UX**
 
 Release:  
-[3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
+[3.3.3](https://github.com/telemt/telemt/releases/tag/3.3.3)
 
 ---
 
@@ -113,8 +118,8 @@ We welcome ideas, architectural feedback, and pull requests.
 
 ## Quick Start Guide
 
-### [Quick Start Guid RU](docs/QUICK_START_GUIDE.ru.md)  
-### [Quick Start Guid EN](docs/QUICK_START_GUIDE.en.md)
+### [Quick Start Guide RU](docs/QUICK_START_GUIDE.ru.md)  
+### [Quick Start Guide EN](docs/QUICK_START_GUIDE.en.md)
 
 
 ### Advanced
