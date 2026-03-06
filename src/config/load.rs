@@ -265,6 +265,12 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.upstream_connect_budget_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.upstream_connect_budget_ms must be > 0".to_string(),
+            ));
+        }
+
         if config.general.upstream_unhealthy_fail_threshold == 0 {
             return Err(ProxyError::Config(
                 "general.upstream_unhealthy_fail_threshold must be > 0".to_string(),
@@ -459,6 +465,12 @@ impl ProxyConfig {
         if config.server.api.listen.parse::<SocketAddr>().is_err() {
             return Err(ProxyError::Config(
                 "server.api.listen must be in IP:PORT format".to_string(),
+            ));
+        }
+
+        if config.server.proxy_protocol_header_timeout_ms == 0 {
+            return Err(ProxyError::Config(
+                "server.proxy_protocol_header_timeout_ms must be > 0".to_string(),
             ));
         }
 

@@ -532,6 +532,10 @@ pub struct GeneralConfig {
     #[serde(default = "default_upstream_connect_retry_backoff_ms")]
     pub upstream_connect_retry_backoff_ms: u64,
 
+    /// Total wall-clock budget in milliseconds for one upstream connect request across retries.
+    #[serde(default = "default_upstream_connect_budget_ms")]
+    pub upstream_connect_budget_ms: u64,
+
     /// Consecutive failed requests before upstream is marked unhealthy.
     #[serde(default = "default_upstream_unhealthy_fail_threshold")]
     pub upstream_unhealthy_fail_threshold: u32,
@@ -774,6 +778,7 @@ impl Default for GeneralConfig {
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
+            upstream_connect_budget_ms: default_upstream_connect_budget_ms(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),
             upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
@@ -962,6 +967,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
+    /// Timeout in milliseconds for reading and parsing PROXY protocol headers.
+    #[serde(default = "default_proxy_protocol_header_timeout_ms")]
+    pub proxy_protocol_header_timeout_ms: u64,
+
     #[serde(default)]
     pub metrics_port: Option<u16>,
 
@@ -985,6 +994,7 @@ impl Default for ServerConfig {
             listen_unix_sock_perm: None,
             listen_tcp: None,
             proxy_protocol: false,
+            proxy_protocol_header_timeout_ms: default_proxy_protocol_header_timeout_ms(),
             metrics_port: None,
             metrics_whitelist: default_metrics_whitelist(),
             api: ApiConfig::default(),

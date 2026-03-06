@@ -208,6 +208,23 @@ impl ConnRegistry {
         }
     }
 
+    pub async fn route_nowait(&self, id: u64, resp: MeResponse) -> RouteResult {
+        let tx = {
+            let inner = self.inner.read().await;
+            inner.map.get(&id).cloned()
+        };
+
+        let Some(tx) = tx else {
+            return RouteResult::NoConn;
+        };
+
+        match tx.try_send(resp) {
+            Ok(()) => RouteResult::Routed,
+            Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
+            Err(TrySendError::Full(_)) => RouteResult::QueueFullBase,
+        }
+    }
+
     pub async fn bind_writer(
         &self,
         conn_id: u64,

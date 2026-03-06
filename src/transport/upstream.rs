@@ -225,6 +225,7 @@ pub struct UpstreamManager {
     upstreams: Arc<RwLock<Vec<UpstreamState>>>,
     connect_retry_attempts: u32,
     connect_retry_backoff: Duration,
+    connect_budget: Duration,
     unhealthy_fail_threshold: u32,
     connect_failfast_hard_errors: bool,
     stats: Arc<Stats>,
@@ -235,6 +236,7 @@ impl UpstreamManager {
         configs: Vec<UpstreamConfig>,
         connect_retry_attempts: u32,
         connect_retry_backoff_ms: u64,
+        connect_budget_ms: u64,
         unhealthy_fail_threshold: u32,
         connect_failfast_hard_errors: bool,
         stats: Arc<Stats>,
@@ -248,6 +250,7 @@ impl UpstreamManager {
             upstreams: Arc::new(RwLock::new(states)),
             connect_retry_attempts: connect_retry_attempts.max(1),
             connect_retry_backoff: Duration::from_millis(connect_retry_backoff_ms),
+            connect_budget: Duration::from_millis(connect_budget_ms.max(1)),
             unhealthy_fail_threshold: unhealthy_fail_threshold.max(1),
             connect_failfast_hard_errors,
             stats,
@@ -593,11 +596,27 @@ impl UpstreamManager {
         let mut last_error: Option<ProxyError> = None;
         let mut attempts_used = 0u32;
         for attempt in 1..=self.connect_retry_attempts {
+            let elapsed = connect_started_at.elapsed();
+            if elapsed >= self.connect_budget {
+                last_error = Some(ProxyError::ConnectionTimeout {
+                    addr: target.to_string(),
+                });
+                break;
+            }
+            let remaining_budget = self.connect_budget.saturating_sub(elapsed);
+            let attempt_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS)
+                .min(remaining_budget);
+            if attempt_timeout.is_zero() {
+                last_error = Some(ProxyError::ConnectionTimeout {
+                    addr: target.to_string(),
+                });
+                break;
+            }
             attempts_used = attempt;
             self.stats.increment_upstream_connect_attempt_total();
             let start = Instant::now();
             match self
-                .connect_via_upstream(&upstream, target, bind_rr.clone())
+                .connect_via_upstream(&upstream, target, bind_rr.clone(), attempt_timeout)
                 .await
             {
                 Ok((stream, egress)) => {
@@ -707,6 +726,7 @@ impl UpstreamManager {
         config: &UpstreamConfig,
         target: SocketAddr,
         bind_rr: Option<Arc<AtomicUsize>>,
+        connect_timeout: Duration,
     ) -> Result<(TcpStream, UpstreamEgressInfo)> {
         match &config.upstream_type {
             UpstreamType::Direct { interface, bind_addresses } => {
@@ -735,7 +755,6 @@ impl UpstreamManager {
                 let std_stream: std::net::TcpStream = socket.into();
                 let stream = TcpStream::from_std(std_stream)?;
 
-                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
                 match tokio::time::timeout(connect_timeout, stream.writable()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return Err(ProxyError::Io(e)),
@@ -762,7 +781,6 @@ impl UpstreamManager {
                 ))
             },
             UpstreamType::Socks4 { address, interface, user_id } => {
-                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
                 // Try to parse as SocketAddr first (IP:port), otherwise treat as hostname:port
                 let mut stream = if let Ok(proxy_addr) = address.parse::<SocketAddr>() {
                     // IP:port format - use socket with optional interface binding
@@ -841,7 +859,6 @@ impl UpstreamManager {
                 ))
             },
             UpstreamType::Socks5 { address, interface, username, password } => {
-                let connect_timeout = Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS);
                 // Try to parse as SocketAddr first (IP:port), otherwise treat as hostname:port
                 let mut stream = if let Ok(proxy_addr) = address.parse::<SocketAddr>() {
                     // IP:port format - use socket with optional interface binding
@@ -1165,7 +1182,14 @@ impl UpstreamManager {
         target: SocketAddr,
     ) -> Result<f64> {
         let start = Instant::now();
-        let _ = self.connect_via_upstream(config, target, bind_rr).await?;
+        let _ = self
+            .connect_via_upstream(
+                config,
+                target,
+                bind_rr,
+                Duration::from_secs(DC_PING_TIMEOUT_SECS),
+            )
+            .await?;
         Ok(start.elapsed().as_secs_f64() * 1000.0)
     }
 
@@ -1337,7 +1361,12 @@ impl UpstreamManager {
                             let start = Instant::now();
                             let result = tokio::time::timeout(
                                 Duration::from_secs(HEALTH_CHECK_CONNECT_TIMEOUT_SECS),
-                                self.connect_via_upstream(&config, endpoint, Some(bind_rr.clone())),
+                                self.connect_via_upstream(
+                                    &config,
+                                    endpoint,
+                                    Some(bind_rr.clone()),
+                                    Duration::from_secs(HEALTH_CHECK_CONNECT_TIMEOUT_SECS),
+                                ),
                             )
                             .await;
 

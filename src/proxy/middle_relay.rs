@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
@@ -210,7 +210,7 @@ where
     let proto_tag = success.proto_tag;
     let pool_generation = me_pool.current_generation();
 
-    info!(
+    debug!(
         user = %user,
         peer = %peer,
         dc = success.dc_idx,

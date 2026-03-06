@@ -34,7 +34,7 @@ where
     let user = &success.user;
     let dc_addr = get_dc_addr_static(success.dc_idx, &config)?;
 
-    info!(
+    debug!(
         user = %user,
         peer = %success.peer,
         dc = success.dc_idx,

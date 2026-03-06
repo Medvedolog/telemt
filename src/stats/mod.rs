@@ -846,16 +846,30 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .connects.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.connects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .connects
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_curr_connects(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .curr_connects.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.curr_connects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .curr_connects
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn decrement_user_curr_connects(&self, user: &str) {
@@ -889,32 +903,60 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .octets_from_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn add_user_octets_to(&self, user: &str, bytes: u64) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .octets_to_client.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .octets_to_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_from(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .msgs_from_client.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .msgs_from_client
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_to(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.user_stats.entry(user.to_string()).or_default()
-            .msgs_to_client.fetch_add(1, Ordering::Relaxed);
+        if let Some(stats) = self.user_stats.get(user) {
+            stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.user_stats
+            .entry(user.to_string())
+            .or_default()
+            .msgs_to_client
+            .fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn get_user_total_octets(&self, user: &str) -> u64 {

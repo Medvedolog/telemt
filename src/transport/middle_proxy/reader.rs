@@ -124,7 +124,7 @@ pub(crate) async fn reader_loop(
                 let data = Bytes::copy_from_slice(&body[12..]);
                 trace!(cid, flags, len = data.len(), "RPC_PROXY_ANS");
 
-                let routed = reg.route(cid, MeResponse::Data { flags, data }).await;
+                let routed = reg.route_nowait(cid, MeResponse::Data { flags, data }).await;
                 if !matches!(routed, RouteResult::Routed) {
                     match routed {
                         RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
@@ -147,7 +147,7 @@ pub(crate) async fn reader_loop(
                 let cfm = u32::from_le_bytes(body[8..12].try_into().unwrap());
                 trace!(cid, cfm, "RPC_SIMPLE_ACK");
 
-                let routed = reg.route(cid, MeResponse::Ack(cfm)).await;
+                let routed = reg.route_nowait(cid, MeResponse::Ack(cfm)).await;
                 if !matches!(routed, RouteResult::Routed) {
                     match routed {
                         RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),

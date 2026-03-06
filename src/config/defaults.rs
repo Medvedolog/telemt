@@ -15,6 +15,7 @@ const DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS: u64 = 180;
 const DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS: u64 = 30;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 2;
 const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
+const DEFAULT_UPSTREAM_CONNECT_BUDGET_MS: u64 = 3000;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
 const DEFAULT_ACCESS_USER: &str = "default";
 const DEFAULT_ACCESS_SECRET: &str = "00000000000000000000000000000000";
@@ -111,6 +112,10 @@ pub(crate) fn default_api_minimal_runtime_enabled() -> bool {
 
 pub(crate) fn default_api_minimal_runtime_cache_ttl_ms() -> u64 {
     1000
+}
+
+pub(crate) fn default_proxy_protocol_header_timeout_ms() -> u64 {
+    500
 }
 
 pub(crate) fn default_prefer_4() -> u8 {
@@ -251,6 +256,10 @@ pub(crate) fn default_upstream_connect_retry_backoff_ms() -> u64 {
 
 pub(crate) fn default_upstream_unhealthy_fail_threshold() -> u32 {
     DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD
+}
+
+pub(crate) fn default_upstream_connect_budget_ms() -> u64 {
+    DEFAULT_UPSTREAM_CONNECT_BUDGET_MS
 }
 
 pub(crate) fn default_upstream_connect_failfast_hard_errors() -> bool {

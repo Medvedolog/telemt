@@ -97,8 +97,11 @@ where
         .unwrap_or_else(|_| "0.0.0.0:443".parse().unwrap());
 
     if proxy_protocol_enabled {
-        match parse_proxy_protocol(&mut stream, peer).await {
-            Ok(info) => {
+        let proxy_header_timeout = Duration::from_millis(
+            config.server.proxy_protocol_header_timeout_ms.max(1),
+        );
+        match timeout(proxy_header_timeout, parse_proxy_protocol(&mut stream, peer)).await {
+            Ok(Ok(info)) => {
                 debug!(
                     peer = %peer,
                     client = %info.src_addr,
@@ -110,11 +113,17 @@ where
                     local_addr = dst;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 stats.increment_connects_bad();
                 warn!(peer = %peer, error = %e, "Invalid PROXY protocol header");
                 record_beobachten_class(&beobachten, &config, peer.ip(), "other");
                 return Err(e);
+            }
+            Err(_) => {
+                stats.increment_connects_bad();
+                warn!(peer = %peer, timeout_ms = proxy_header_timeout.as_millis(), "PROXY protocol header timeout");
+                record_beobachten_class(&beobachten, &config, peer.ip(), "other");
+                return Err(ProxyError::InvalidProxyProtocol);
             }
         }
     }
@@ -161,7 +170,7 @@ where
 
             let (read_half, write_half) = tokio::io::split(stream);
 
-            let (mut tls_reader, tls_writer, _tls_user) = match handle_tls_handshake(
+            let (mut tls_reader, tls_writer, tls_user) = match handle_tls_handshake(
                 &handshake, read_half, write_half, real_peer,
                 &config, &replay_checker, &rng, tls_cache.clone(),
             ).await {
@@ -190,7 +199,7 @@ where
 
             let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake(
                 &mtproto_handshake, tls_reader, tls_writer, real_peer,
-                &config, &replay_checker, true,
+                &config, &replay_checker, true, Some(tls_user.as_str()),
             ).await {
                 HandshakeResult::Success(result) => result,
                 HandshakeResult::BadClient { reader: _, writer: _ } => {
@@ -234,7 +243,7 @@ where
 
             let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake(
                 &handshake, read_half, write_half, real_peer,
-                &config, &replay_checker, false,
+                &config, &replay_checker, false, None,
             ).await {
                 HandshakeResult::Success(result) => result,
                 HandshakeResult::BadClient { reader, writer } => {
@@ -415,8 +424,16 @@ impl RunningClientHandler {
         let mut local_addr = self.stream.local_addr().map_err(ProxyError::Io)?;
 
         if self.proxy_protocol_enabled {
-            match parse_proxy_protocol(&mut self.stream, self.peer).await {
-                Ok(info) => {
+            let proxy_header_timeout = Duration::from_millis(
+                self.config.server.proxy_protocol_header_timeout_ms.max(1),
+            );
+            match timeout(
+                proxy_header_timeout,
+                parse_proxy_protocol(&mut self.stream, self.peer),
+            )
+            .await
+            {
+                Ok(Ok(info)) => {
                     debug!(
                         peer = %self.peer,
                         client = %info.src_addr,
@@ -428,7 +445,7 @@ impl RunningClientHandler {
                         local_addr = dst;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.stats.increment_connects_bad();
                     warn!(peer = %self.peer, error = %e, "Invalid PROXY protocol header");
                     record_beobachten_class(
@@ -438,6 +455,21 @@ impl RunningClientHandler {
                         "other",
                     );
                     return Err(e);
+                }
+                Err(_) => {
+                    self.stats.increment_connects_bad();
+                    warn!(
+                        peer = %self.peer,
+                        timeout_ms = proxy_header_timeout.as_millis(),
+                        "PROXY protocol header timeout"
+                    );
+                    record_beobachten_class(
+                        &self.beobachten,
+                        &self.config,
+                        self.peer.ip(),
+                        "other",
+                    );
+                    return Err(ProxyError::InvalidProxyProtocol);
                 }
             }
         }
@@ -494,7 +526,7 @@ impl RunningClientHandler {
 
         let (read_half, write_half) = self.stream.into_split();
 
-        let (mut tls_reader, tls_writer, _tls_user) = match handle_tls_handshake(
+        let (mut tls_reader, tls_writer, tls_user) = match handle_tls_handshake(
             &handshake,
             read_half,
             write_half,
@@ -538,6 +570,7 @@ impl RunningClientHandler {
             &config,
             &replay_checker,
             true,
+            Some(tls_user.as_str()),
         )
         .await
         {
@@ -611,6 +644,7 @@ impl RunningClientHandler {
             &config,
             &replay_checker,
             false,
+            None,
         )
         .await
         {
