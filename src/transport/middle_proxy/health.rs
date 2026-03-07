@@ -13,7 +13,6 @@ use crate::network::IpFamily;
 
 use super::MePool;
 
-const HEALTH_INTERVAL_SECS: u64 = 1;
 const JITTER_FRAC_NUM: u64 = 2; // jitter up to 50% of backoff
 #[allow(dead_code)]
 const MAX_CONCURRENT_PER_DC_DEFAULT: usize = 1;
@@ -62,11 +61,18 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
     let mut idle_refresh_next_attempt: HashMap<(i32, IpFamily), Instant> = HashMap::new();
     let mut adaptive_idle_since: HashMap<(i32, IpFamily), Instant> = HashMap::new();
     let mut adaptive_recover_until: HashMap<(i32, IpFamily), Instant> = HashMap::new();
+    let mut floor_warn_next_allowed: HashMap<(i32, IpFamily), Instant> = HashMap::new();
+    let mut degraded_interval = true;
     loop {
-        tokio::time::sleep(Duration::from_secs(HEALTH_INTERVAL_SECS)).await;
+        let interval = if degraded_interval {
+            pool.health_interval_unhealthy()
+        } else {
+            pool.health_interval_healthy()
+        };
+        tokio::time::sleep(interval).await;
         pool.prune_closed_writers().await;
         reap_draining_writers(&pool).await;
-        check_family(
+        let v4_degraded = check_family(
             IpFamily::V4,
             &pool,
             &rng,
@@ -80,9 +86,10 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
             &mut idle_refresh_next_attempt,
             &mut adaptive_idle_since,
             &mut adaptive_recover_until,
+            &mut floor_warn_next_allowed,
         )
         .await;
-        check_family(
+        let v6_degraded = check_family(
             IpFamily::V6,
             &pool,
             &rng,
@@ -96,8 +103,10 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
             &mut idle_refresh_next_attempt,
             &mut adaptive_idle_since,
             &mut adaptive_recover_until,
+            &mut floor_warn_next_allowed,
         )
         .await;
+        degraded_interval = v4_degraded || v6_degraded;
     }
 }
 
@@ -137,14 +146,17 @@ async fn check_family(
     idle_refresh_next_attempt: &mut HashMap<(i32, IpFamily), Instant>,
     adaptive_idle_since: &mut HashMap<(i32, IpFamily), Instant>,
     adaptive_recover_until: &mut HashMap<(i32, IpFamily), Instant>,
-) {
+    floor_warn_next_allowed: &mut HashMap<(i32, IpFamily), Instant>,
+) -> bool {
     let enabled = match family {
         IpFamily::V4 => pool.decision.ipv4_me,
         IpFamily::V6 => pool.decision.ipv6_me,
     };
     if !enabled {
-        return;
+        return false;
     }
+
+    let mut family_degraded = false;
 
     let mut dc_endpoints = HashMap::<i32, Vec<SocketAddr>>::new();
     let map_guard = match family {
@@ -234,6 +246,7 @@ async fn check_family(
             .sum::<usize>();
 
         if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive == 0 {
+            family_degraded = true;
             if single_endpoint_outage.insert(key) {
                 pool.stats.increment_me_single_endpoint_outage_enter_total();
                 warn!(
@@ -310,6 +323,7 @@ async fn check_family(
             continue;
         }
         let missing = required - alive;
+        family_degraded = true;
 
         let now = Instant::now();
         if reconnect_budget == 0 {
@@ -438,15 +452,23 @@ async fn check_family(
                 + Duration::from_millis(rand::rng().random_range(0..=jitter.max(1)));
             next_attempt.insert(key, now + wait);
             if pool.is_runtime_ready() {
-                warn!(
-                    dc = %dc,
-                    ?family,
-                    alive = now_alive,
-                    required,
-                    endpoint_count = endpoints.len(),
-                    backoff_ms = next_ms,
-                    "DC writer floor is below required level, scheduled reconnect"
-                );
+                let warn_cooldown = pool.warn_rate_limit_duration();
+                if should_emit_rate_limited_warn(
+                    floor_warn_next_allowed,
+                    key,
+                    now,
+                    warn_cooldown,
+                ) {
+                    warn!(
+                        dc = %dc,
+                        ?family,
+                        alive = now_alive,
+                        required,
+                        endpoint_count = endpoints.len(),
+                        backoff_ms = next_ms,
+                        "DC writer floor is below required level, scheduled reconnect"
+                    );
+                }
             } else {
                 info!(
                     dc = %dc,
@@ -463,6 +485,8 @@ async fn check_family(
             *v = v.saturating_sub(1);
         }
     }
+
+    family_degraded
 }
 
 fn health_reconnect_budget(pool: &Arc<MePool>, dc_groups: usize) -> usize {
@@ -472,6 +496,23 @@ fn health_reconnect_budget(pool: &Arc<MePool>, dc_groups: usize) -> usize {
     by_cpu
         .saturating_add(by_dc)
         .clamp(HEALTH_RECONNECT_BUDGET_MIN, HEALTH_RECONNECT_BUDGET_MAX)
+}
+
+fn should_emit_rate_limited_warn(
+    next_allowed: &mut HashMap<(i32, IpFamily), Instant>,
+    key: (i32, IpFamily),
+    now: Instant,
+    cooldown: Duration,
+) -> bool {
+    let Some(ready_at) = next_allowed.get(&key).copied() else {
+        next_allowed.insert(key, now + cooldown);
+        return true;
+    };
+    if now >= ready_at {
+        next_allowed.insert(key, now + cooldown);
+        return true;
+    }
+    false
 }
 
 fn adaptive_floor_class_min(

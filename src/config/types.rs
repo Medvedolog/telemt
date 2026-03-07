@@ -420,6 +420,18 @@ pub struct GeneralConfig {
     #[serde(default = "default_rpc_proxy_req_every")]
     pub rpc_proxy_req_every: u64,
 
+    /// Capacity of per-ME writer command channel.
+    #[serde(default = "default_me_writer_cmd_channel_capacity")]
+    pub me_writer_cmd_channel_capacity: usize,
+
+    /// Capacity of per-connection ME response route channel.
+    #[serde(default = "default_me_route_channel_capacity")]
+    pub me_route_channel_capacity: usize,
+
+    /// Capacity of per-client command queue from client reader to ME sender task.
+    #[serde(default = "default_me_c2me_channel_capacity")]
+    pub me_c2me_channel_capacity: usize,
+
     /// Max pending ciphertext buffer per client writer (bytes).
     /// Controls FakeTLS backpressure vs throughput.
     #[serde(default = "default_crypto_pending_buffer")]
@@ -620,6 +632,22 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_route_backpressure_high_watermark_pct")]
     pub me_route_backpressure_high_watermark_pct: u8,
 
+    /// Health monitor interval in milliseconds while writer coverage is degraded.
+    #[serde(default = "default_me_health_interval_ms_unhealthy")]
+    pub me_health_interval_ms_unhealthy: u64,
+
+    /// Health monitor interval in milliseconds while writer coverage is stable.
+    #[serde(default = "default_me_health_interval_ms_healthy")]
+    pub me_health_interval_ms_healthy: u64,
+
+    /// Poll interval in milliseconds for conditional-admission state checks.
+    #[serde(default = "default_me_admission_poll_ms")]
+    pub me_admission_poll_ms: u64,
+
+    /// Cooldown for repetitive ME warning logs in milliseconds.
+    #[serde(default = "default_me_warn_rate_limit_ms")]
+    pub me_warn_rate_limit_ms: u64,
+
     /// ME route behavior when no writer is immediately available.
     #[serde(default)]
     pub me_route_no_writer_mode: MeRouteNoWriterMode,
@@ -796,6 +824,9 @@ impl Default for GeneralConfig {
             me_keepalive_jitter_secs: default_keepalive_jitter(),
             me_keepalive_payload_random: default_true(),
             rpc_proxy_req_every: default_rpc_proxy_req_every(),
+            me_writer_cmd_channel_capacity: default_me_writer_cmd_channel_capacity(),
+            me_route_channel_capacity: default_me_route_channel_capacity(),
+            me_c2me_channel_capacity: default_me_c2me_channel_capacity(),
             me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
@@ -837,6 +868,10 @@ impl Default for GeneralConfig {
             me_route_backpressure_base_timeout_ms: default_me_route_backpressure_base_timeout_ms(),
             me_route_backpressure_high_timeout_ms: default_me_route_backpressure_high_timeout_ms(),
             me_route_backpressure_high_watermark_pct: default_me_route_backpressure_high_watermark_pct(),
+            me_health_interval_ms_unhealthy: default_me_health_interval_ms_unhealthy(),
+            me_health_interval_ms_healthy: default_me_health_interval_ms_healthy(),
+            me_admission_poll_ms: default_me_admission_poll_ms(),
+            me_warn_rate_limit_ms: default_me_warn_rate_limit_ms(),
             me_route_no_writer_mode: MeRouteNoWriterMode::default(),
             me_route_no_writer_wait_ms: default_me_route_no_writer_wait_ms(),
             me_route_inline_recovery_attempts: default_me_route_inline_recovery_attempts(),

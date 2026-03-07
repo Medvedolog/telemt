@@ -1048,9 +1048,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         config.general.me_secret_atomic_snapshot,
                         config.general.me_deterministic_writer_sort,
                         config.general.me_socks_kdf_policy,
+                        config.general.me_writer_cmd_channel_capacity,
+                        config.general.me_route_channel_capacity,
                         config.general.me_route_backpressure_base_timeout_ms,
                         config.general.me_route_backpressure_high_timeout_ms,
                         config.general.me_route_backpressure_high_watermark_pct,
+                        config.general.me_health_interval_ms_unhealthy,
+                        config.general.me_health_interval_ms_healthy,
+                        config.general.me_warn_rate_limit_ms,
                         config.general.me_route_no_writer_mode,
                         config.general.me_route_no_writer_wait_ms,
                         config.general.me_route_inline_recovery_attempts,
@@ -1784,11 +1789,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
             let pool_for_gate = pool.clone();
             let admission_tx_gate = admission_tx.clone();
+            let mut config_rx_gate = config_rx.clone();
+            let mut admission_poll_ms = config.general.me_admission_poll_ms.max(1);
             tokio::spawn(async move {
                 let mut gate_open = initial_open;
                 let mut open_streak = if initial_open { 1u32 } else { 0u32 };
                 let mut close_streak = if initial_open { 0u32 } else { 1u32 };
                 loop {
+                    tokio::select! {
+                        changed = config_rx_gate.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let cfg = config_rx_gate.borrow_and_update().clone();
+                            admission_poll_ms = cfg.general.me_admission_poll_ms.max(1);
+                            continue;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(admission_poll_ms)) => {}
+                    }
                     let ready = pool_for_gate.admission_ready_conditional_cast().await;
                     if ready {
                         open_streak = open_streak.saturating_add(1);
@@ -1813,7 +1831,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             });
         } else {

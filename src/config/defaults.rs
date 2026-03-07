@@ -21,6 +21,13 @@ const DEFAULT_ME_ADAPTIVE_FLOOR_MAX_ACTIVE_WRITERS_PER_CORE: u16 = 64;
 const DEFAULT_ME_ADAPTIVE_FLOOR_MAX_WARM_WRITERS_PER_CORE: u16 = 64;
 const DEFAULT_ME_ADAPTIVE_FLOOR_MAX_ACTIVE_WRITERS_GLOBAL: u32 = 256;
 const DEFAULT_ME_ADAPTIVE_FLOOR_MAX_WARM_WRITERS_GLOBAL: u32 = 256;
+const DEFAULT_ME_WRITER_CMD_CHANNEL_CAPACITY: usize = 512;
+const DEFAULT_ME_ROUTE_CHANNEL_CAPACITY: usize = 512;
+const DEFAULT_ME_C2ME_CHANNEL_CAPACITY: usize = 128;
+const DEFAULT_ME_HEALTH_INTERVAL_MS_UNHEALTHY: u64 = 1000;
+const DEFAULT_ME_HEALTH_INTERVAL_MS_HEALTHY: u64 = 3000;
+const DEFAULT_ME_ADMISSION_POLL_MS: u64 = 1000;
+const DEFAULT_ME_WARN_RATE_LIMIT_MS: u64 = 5000;
 const DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS: u64 = 30;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 2;
 const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
@@ -294,6 +301,34 @@ pub(crate) fn default_me_adaptive_floor_max_active_writers_global() -> u32 {
 
 pub(crate) fn default_me_adaptive_floor_max_warm_writers_global() -> u32 {
     DEFAULT_ME_ADAPTIVE_FLOOR_MAX_WARM_WRITERS_GLOBAL
+}
+
+pub(crate) fn default_me_writer_cmd_channel_capacity() -> usize {
+    DEFAULT_ME_WRITER_CMD_CHANNEL_CAPACITY
+}
+
+pub(crate) fn default_me_route_channel_capacity() -> usize {
+    DEFAULT_ME_ROUTE_CHANNEL_CAPACITY
+}
+
+pub(crate) fn default_me_c2me_channel_capacity() -> usize {
+    DEFAULT_ME_C2ME_CHANNEL_CAPACITY
+}
+
+pub(crate) fn default_me_health_interval_ms_unhealthy() -> u64 {
+    DEFAULT_ME_HEALTH_INTERVAL_MS_UNHEALTHY
+}
+
+pub(crate) fn default_me_health_interval_ms_healthy() -> u64 {
+    DEFAULT_ME_HEALTH_INTERVAL_MS_HEALTHY
+}
+
+pub(crate) fn default_me_admission_poll_ms() -> u64 {
+    DEFAULT_ME_ADMISSION_POLL_MS
+}
+
+pub(crate) fn default_me_warn_rate_limit_ms() -> u64 {
+    DEFAULT_ME_WARN_RATE_LIMIT_MS
 }
 
 pub(crate) fn default_upstream_connect_retry_attempts() -> u32 {

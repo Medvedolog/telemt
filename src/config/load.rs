@@ -285,6 +285,48 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_writer_cmd_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_writer_cmd_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_route_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_route_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_c2me_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_c2me_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_health_interval_ms_unhealthy == 0 {
+            return Err(ProxyError::Config(
+                "general.me_health_interval_ms_unhealthy must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_health_interval_ms_healthy == 0 {
+            return Err(ProxyError::Config(
+                "general.me_health_interval_ms_healthy must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_admission_poll_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_admission_poll_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_warn_rate_limit_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_warn_rate_limit_ms must be > 0".to_string(),
+            ));
+        }
+
         if config.access.user_max_unique_ips_window_secs == 0 {
             return Err(ProxyError::Config(
                 "access.user_max_unique_ips_window_secs must be > 0".to_string(),

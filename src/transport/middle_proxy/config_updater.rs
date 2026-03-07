@@ -325,6 +325,9 @@ async fn run_update_cycle(
         cfg.general.me_adaptive_floor_max_warm_writers_per_core,
         cfg.general.me_adaptive_floor_max_active_writers_global,
         cfg.general.me_adaptive_floor_max_warm_writers_global,
+        cfg.general.me_health_interval_ms_unhealthy,
+        cfg.general.me_health_interval_ms_healthy,
+        cfg.general.me_warn_rate_limit_ms,
     );
 
     let required_cfg_snapshots = cfg.general.me_config_stable_snapshots.max(1);
@@ -546,6 +549,9 @@ pub async fn me_config_updater(
                     cfg.general.me_adaptive_floor_max_warm_writers_per_core,
                     cfg.general.me_adaptive_floor_max_active_writers_global,
                     cfg.general.me_adaptive_floor_max_warm_writers_global,
+                    cfg.general.me_health_interval_ms_unhealthy,
+                    cfg.general.me_health_interval_ms_healthy,
+                    cfg.general.me_warn_rate_limit_ms,
                 );
                 let new_secs = cfg.general.effective_update_every_secs().max(1);
                 if new_secs == update_every_secs {

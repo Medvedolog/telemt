@@ -103,6 +103,7 @@ pub struct MePool {
     pub(super) me_keepalive_jitter: Duration,
     pub(super) me_keepalive_payload_random: bool,
     pub(super) rpc_proxy_req_every_secs: AtomicU64,
+    pub(super) writer_cmd_channel_capacity: usize,
     pub(super) me_warmup_stagger_enabled: bool,
     pub(super) me_warmup_step_delay: Duration,
     pub(super) me_warmup_step_jitter: Duration,
@@ -181,8 +182,12 @@ pub struct MePool {
     pub(super) me_route_no_writer_wait: Duration,
     pub(super) me_route_inline_recovery_attempts: u32,
     pub(super) me_route_inline_recovery_wait: Duration,
+    pub(super) me_health_interval_ms_unhealthy: AtomicU64,
+    pub(super) me_health_interval_ms_healthy: AtomicU64,
+    pub(super) me_warn_rate_limit_ms: AtomicU64,
     pub(super) runtime_ready: AtomicBool,
     pool_size: usize,
+    pub(super) preferred_endpoints_by_dc: Arc<RwLock<HashMap<i32, Vec<SocketAddr>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -270,16 +275,25 @@ impl MePool {
         me_secret_atomic_snapshot: bool,
         me_deterministic_writer_sort: bool,
         me_socks_kdf_policy: MeSocksKdfPolicy,
+        me_writer_cmd_channel_capacity: usize,
+        me_route_channel_capacity: usize,
         me_route_backpressure_base_timeout_ms: u64,
         me_route_backpressure_high_timeout_ms: u64,
         me_route_backpressure_high_watermark_pct: u8,
+        me_health_interval_ms_unhealthy: u64,
+        me_health_interval_ms_healthy: u64,
+        me_warn_rate_limit_ms: u64,
         me_route_no_writer_mode: MeRouteNoWriterMode,
         me_route_no_writer_wait_ms: u64,
         me_route_inline_recovery_attempts: u32,
         me_route_inline_recovery_wait_ms: u64,
     ) -> Arc<Self> {
         let endpoint_dc_map = Self::build_endpoint_dc_map_from_maps(&proxy_map_v4, &proxy_map_v6);
-        let registry = Arc::new(ConnRegistry::new());
+        let preferred_endpoints_by_dc =
+            Self::build_preferred_endpoints_by_dc(&decision, &proxy_map_v4, &proxy_map_v6);
+        let registry = Arc::new(ConnRegistry::with_route_channel_capacity(
+            me_route_channel_capacity,
+        ));
         registry.update_route_backpressure_policy(
             me_route_backpressure_base_timeout_ms,
             me_route_backpressure_high_timeout_ms,
@@ -326,6 +340,7 @@ impl MePool {
             me_keepalive_jitter: Duration::from_secs(me_keepalive_jitter_secs),
             me_keepalive_payload_random,
             rpc_proxy_req_every_secs: AtomicU64::new(rpc_proxy_req_every_secs),
+            writer_cmd_channel_capacity: me_writer_cmd_channel_capacity.max(1),
             me_warmup_stagger_enabled,
             me_warmup_step_delay: Duration::from_millis(me_warmup_step_delay_ms),
             me_warmup_step_jitter: Duration::from_millis(me_warmup_step_jitter_ms),
@@ -440,7 +455,11 @@ impl MePool {
             me_route_no_writer_wait: Duration::from_millis(me_route_no_writer_wait_ms),
             me_route_inline_recovery_attempts,
             me_route_inline_recovery_wait: Duration::from_millis(me_route_inline_recovery_wait_ms),
+            me_health_interval_ms_unhealthy: AtomicU64::new(me_health_interval_ms_unhealthy.max(1)),
+            me_health_interval_ms_healthy: AtomicU64::new(me_health_interval_ms_healthy.max(1)),
+            me_warn_rate_limit_ms: AtomicU64::new(me_warn_rate_limit_ms.max(1)),
             runtime_ready: AtomicBool::new(false),
+            preferred_endpoints_by_dc: Arc::new(RwLock::new(preferred_endpoints_by_dc)),
         })
     }
 
@@ -489,6 +508,9 @@ impl MePool {
         adaptive_floor_max_warm_writers_per_core: u16,
         adaptive_floor_max_active_writers_global: u32,
         adaptive_floor_max_warm_writers_global: u32,
+        me_health_interval_ms_unhealthy: u64,
+        me_health_interval_ms_healthy: u64,
+        me_warn_rate_limit_ms: u64,
     ) {
         self.hardswap.store(hardswap, Ordering::Relaxed);
         self.me_pool_drain_ttl_secs
@@ -564,6 +586,12 @@ impl MePool {
             .store(adaptive_floor_max_active_writers_global, Ordering::Relaxed);
         self.me_adaptive_floor_max_warm_writers_global
             .store(adaptive_floor_max_warm_writers_global, Ordering::Relaxed);
+        self.me_health_interval_ms_unhealthy
+            .store(me_health_interval_ms_unhealthy.max(1), Ordering::Relaxed);
+        self.me_health_interval_ms_healthy
+            .store(me_health_interval_ms_healthy.max(1), Ordering::Relaxed);
+        self.me_warn_rate_limit_ms
+            .store(me_warn_rate_limit_ms.max(1), Ordering::Relaxed);
         if previous_floor_mode != floor_mode {
             self.stats.increment_me_floor_mode_switch_total();
             match (previous_floor_mode, floor_mode) {
@@ -1042,6 +1070,62 @@ impl MePool {
         }
     }
 
+    fn build_preferred_endpoints_by_dc(
+        decision: &NetworkDecision,
+        map_v4: &HashMap<i32, Vec<(IpAddr, u16)>>,
+        map_v6: &HashMap<i32, Vec<(IpAddr, u16)>>,
+    ) -> HashMap<i32, Vec<SocketAddr>> {
+        let mut out = HashMap::<i32, Vec<SocketAddr>>::new();
+        let mut dcs = HashSet::<i32>::new();
+        dcs.extend(map_v4.keys().copied());
+        dcs.extend(map_v6.keys().copied());
+
+        for dc in dcs {
+            let v4 = map_v4
+                .get(&dc)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|(ip, port)| SocketAddr::new(*ip, *port))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let v6 = map_v6
+                .get(&dc)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|(ip, port)| SocketAddr::new(*ip, *port))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let mut selected = if decision.effective_multipath {
+                let mut both = Vec::<SocketAddr>::with_capacity(v4.len().saturating_add(v6.len()));
+                if decision.prefer_ipv6() {
+                    both.extend(v6.iter().copied());
+                    both.extend(v4.iter().copied());
+                } else {
+                    both.extend(v4.iter().copied());
+                    both.extend(v6.iter().copied());
+                }
+                both
+            } else if decision.prefer_ipv6() {
+                if !v6.is_empty() { v6 } else { v4 }
+            } else if !v4.is_empty() {
+                v4
+            } else {
+                v6
+            };
+
+            selected.sort_unstable();
+            selected.dedup();
+            out.insert(dc, selected);
+        }
+
+        out
+    }
+
     fn build_endpoint_dc_map_from_maps(
         map_v4: &HashMap<i32, Vec<(IpAddr, u16)>>,
         map_v6: &HashMap<i32, Vec<(IpAddr, u16)>>,
@@ -1064,6 +1148,25 @@ impl MePool {
         let map_v4 = self.proxy_map_v4.read().await.clone();
         let map_v6 = self.proxy_map_v6.read().await.clone();
         let rebuilt = Self::build_endpoint_dc_map_from_maps(&map_v4, &map_v6);
+        let preferred = Self::build_preferred_endpoints_by_dc(&self.decision, &map_v4, &map_v6);
         *self.endpoint_dc_map.write().await = rebuilt;
+        *self.preferred_endpoints_by_dc.write().await = preferred;
+    }
+
+    pub(super) async fn preferred_endpoints_for_dc(&self, dc: i32) -> Vec<SocketAddr> {
+        let guard = self.preferred_endpoints_by_dc.read().await;
+        guard.get(&dc).cloned().unwrap_or_default()
+    }
+
+    pub(super) fn health_interval_unhealthy(&self) -> Duration {
+        Duration::from_millis(self.me_health_interval_ms_unhealthy.load(Ordering::Relaxed).max(1))
+    }
+
+    pub(super) fn health_interval_healthy(&self) -> Duration {
+        Duration::from_millis(self.me_health_interval_ms_healthy.load(Ordering::Relaxed).max(1))
+    }
+
+    pub(super) fn warn_rate_limit_duration(&self) -> Duration {
+        Duration::from_millis(self.me_warn_rate_limit_ms.load(Ordering::Relaxed).max(1))
     }
 }

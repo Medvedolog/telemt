@@ -480,31 +480,7 @@ impl MePool {
     }
 
     async fn endpoint_candidates_for_target_dc(&self, routed_dc: i32) -> Vec<SocketAddr> {
-        let mut preferred = Vec::<SocketAddr>::new();
-        let mut seen = HashSet::<SocketAddr>::new();
-
-        for family in self.family_order() {
-            let map_guard = match family {
-                IpFamily::V4 => self.proxy_map_v4.read().await,
-                IpFamily::V6 => self.proxy_map_v6.read().await,
-            };
-            let mut family_selected = Vec::<SocketAddr>::new();
-            if let Some(addrs) = map_guard.get(&routed_dc) {
-                for (ip, port) in addrs {
-                    family_selected.push(SocketAddr::new(*ip, *port));
-                }
-            }
-            for addr in family_selected {
-                if seen.insert(addr) {
-                    preferred.push(addr);
-                }
-            }
-            if !preferred.is_empty() && !self.decision.effective_multipath {
-                break;
-            }
-        }
-
-        preferred
+        self.preferred_endpoints_for_dc(routed_dc).await
     }
 
     async fn maybe_trigger_hybrid_recovery(
@@ -591,28 +567,7 @@ impl MePool {
         routed_dc: i32,
         include_warm: bool,
     ) -> Vec<usize> {
-        let mut preferred = HashSet::<SocketAddr>::new();
-
-        for family in self.family_order() {
-            let map_guard = match family {
-                IpFamily::V4 => self.proxy_map_v4.read().await,
-                IpFamily::V6 => self.proxy_map_v6.read().await,
-            };
-            let mut family_selected = Vec::<SocketAddr>::new();
-            if let Some(v) = map_guard.get(&routed_dc) {
-                family_selected.extend(v.iter().map(|(ip, port)| SocketAddr::new(*ip, *port)));
-            }
-            for endpoint in family_selected {
-                preferred.insert(endpoint);
-            }
-
-            drop(map_guard);
-
-            if !preferred.is_empty() && !self.decision.effective_multipath {
-                break;
-            }
-        }
-
+        let preferred = self.preferred_endpoints_for_dc(routed_dc).await;
         if preferred.is_empty() {
             return Vec::new();
         }
@@ -622,7 +577,7 @@ impl MePool {
             if !self.writer_eligible_for_selection(w, include_warm) {
                 continue;
             }
-            if w.writer_dc == routed_dc && preferred.contains(&w.addr) {
+            if w.writer_dc == routed_dc && preferred.iter().any(|endpoint| *endpoint == w.addr) {
                 out.push(idx);
             }
         }

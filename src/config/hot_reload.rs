@@ -91,6 +91,10 @@ pub struct HotFields {
     pub me_route_backpressure_base_timeout_ms: u64,
     pub me_route_backpressure_high_timeout_ms: u64,
     pub me_route_backpressure_high_watermark_pct: u8,
+    pub me_health_interval_ms_unhealthy: u64,
+    pub me_health_interval_ms_healthy: u64,
+    pub me_admission_poll_ms: u64,
+    pub me_warn_rate_limit_ms: u64,
     pub users:                   std::collections::HashMap<String, String>,
     pub user_ad_tags:            std::collections::HashMap<String, String>,
     pub user_max_tcp_conns:      std::collections::HashMap<String, usize>,
@@ -192,6 +196,10 @@ impl HotFields {
             me_route_backpressure_base_timeout_ms: cfg.general.me_route_backpressure_base_timeout_ms,
             me_route_backpressure_high_timeout_ms: cfg.general.me_route_backpressure_high_timeout_ms,
             me_route_backpressure_high_watermark_pct: cfg.general.me_route_backpressure_high_watermark_pct,
+            me_health_interval_ms_unhealthy: cfg.general.me_health_interval_ms_unhealthy,
+            me_health_interval_ms_healthy: cfg.general.me_health_interval_ms_healthy,
+            me_admission_poll_ms: cfg.general.me_admission_poll_ms,
+            me_warn_rate_limit_ms: cfg.general.me_warn_rate_limit_ms,
             users:                   cfg.access.users.clone(),
             user_ad_tags:            cfg.access.user_ad_tags.clone(),
             user_max_tcp_conns:      cfg.access.user_max_tcp_conns.clone(),
@@ -335,6 +343,10 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
         new.general.me_route_backpressure_high_timeout_ms;
     cfg.general.me_route_backpressure_high_watermark_pct =
         new.general.me_route_backpressure_high_watermark_pct;
+    cfg.general.me_health_interval_ms_unhealthy = new.general.me_health_interval_ms_unhealthy;
+    cfg.general.me_health_interval_ms_healthy = new.general.me_health_interval_ms_healthy;
+    cfg.general.me_admission_poll_ms = new.general.me_admission_poll_ms;
+    cfg.general.me_warn_rate_limit_ms = new.general.me_warn_rate_limit_ms;
 
     cfg.access.users = new.access.users.clone();
     cfg.access.user_ad_tags = new.access.user_ad_tags.clone();
@@ -796,12 +808,21 @@ fn log_changes(
             != new_hot.me_route_backpressure_high_timeout_ms
         || old_hot.me_route_backpressure_high_watermark_pct
             != new_hot.me_route_backpressure_high_watermark_pct
+        || old_hot.me_health_interval_ms_unhealthy
+            != new_hot.me_health_interval_ms_unhealthy
+        || old_hot.me_health_interval_ms_healthy != new_hot.me_health_interval_ms_healthy
+        || old_hot.me_admission_poll_ms != new_hot.me_admission_poll_ms
+        || old_hot.me_warn_rate_limit_ms != new_hot.me_warn_rate_limit_ms
     {
         info!(
-            "config reload: me_route_backpressure: base={}ms high={}ms watermark={}%",
+            "config reload: me_route_backpressure: base={}ms high={}ms watermark={}%; me_health_interval: unhealthy={}ms healthy={}ms; me_admission_poll={}ms; me_warn_rate_limit={}ms",
             new_hot.me_route_backpressure_base_timeout_ms,
             new_hot.me_route_backpressure_high_timeout_ms,
             new_hot.me_route_backpressure_high_watermark_pct,
+            new_hot.me_health_interval_ms_unhealthy,
+            new_hot.me_health_interval_ms_healthy,
+            new_hot.me_admission_poll_ms,
+            new_hot.me_warn_rate_limit_ms,
         );
     }
 

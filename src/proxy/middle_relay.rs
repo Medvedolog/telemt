@@ -27,7 +27,7 @@ enum C2MeCommand {
 
 const DESYNC_DEDUP_WINDOW: Duration = Duration::from_secs(60);
 const DESYNC_ERROR_CLASS: &str = "frame_too_large_crypto_desync";
-const C2ME_CHANNEL_CAPACITY: usize = 1024;
+const C2ME_CHANNEL_CAPACITY_FALLBACK: usize = 128;
 const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
 const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 static DESYNC_DEDUP: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
@@ -271,7 +271,11 @@ where
 
     let frame_limit = config.general.max_client_frame;
 
-    let (c2me_tx, mut c2me_rx) = mpsc::channel::<C2MeCommand>(C2ME_CHANNEL_CAPACITY);
+    let c2me_channel_capacity = config
+        .general
+        .me_c2me_channel_capacity
+        .max(C2ME_CHANNEL_CAPACITY_FALLBACK);
+    let (c2me_tx, mut c2me_rx) = mpsc::channel::<C2MeCommand>(c2me_channel_capacity);
     let me_pool_c2me = me_pool.clone();
     let effective_tag = effective_tag;
     let c2me_sender = tokio::spawn(async move {

@@ -132,7 +132,7 @@ impl MePool {
         let draining_started_at_epoch_secs = Arc::new(AtomicU64::new(0));
         let drain_deadline_epoch_secs = Arc::new(AtomicU64::new(0));
         let allow_drain_fallback = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = mpsc::channel::<WriterCommand>(4096);
+        let (tx, mut rx) = mpsc::channel::<WriterCommand>(self.writer_cmd_channel_capacity);
         let mut rpc_writer = RpcWriter {
             writer: hs.wr,
             key: hs.write_key,
