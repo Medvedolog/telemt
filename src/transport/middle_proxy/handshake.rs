@@ -135,10 +135,15 @@ impl MePool {
     pub(crate) async fn connect_tcp(
         &self,
         addr: SocketAddr,
+        dc_idx_override: Option<i16>,
     ) -> Result<(TcpStream, f64, Option<UpstreamEgressInfo>)> {
         let start = Instant::now();
         let (stream, upstream_egress) = if let Some(upstream) = &self.upstream {
-            let dc_idx = self.resolve_dc_idx_for_endpoint(addr).await;
+            let dc_idx = if let Some(dc_idx) = dc_idx_override {
+                Some(dc_idx)
+            } else {
+                self.resolve_dc_idx_for_endpoint(addr).await
+            };
             let (stream, egress) = upstream.connect_with_details(addr, dc_idx, None).await?;
             (stream, Some(egress))
         } else {

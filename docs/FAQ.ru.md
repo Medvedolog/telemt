@@ -1,4 +1,4 @@
-## Как настроить канал "спонсор прокси"
+## Как настроить канал "спонсор прокси" и статистику через бота @MTProxybot
 
 1. Зайти в бота @MTProxybot.
 2. Ввести команду `/newproxy`
@@ -70,3 +70,43 @@ metrics_whitelist = ["127.0.0.1/32", "::1/128", "0.0.0.0/0"]
 4. Метрики доступны по адресу SERVER_IP:9090/metrics. 
 > [!WARNING]
 > "0.0.0.0/0" в metrics_whitelist открывает доступ с любого IP. Замените на свой ip. Например "1.2.3.4"
+
+## Дополнительные параметры
+
+### Домен в ссылке вместо IP
+Чтобы указать домен в ссылках, добавьте в секцию `[general.links]` файла config.
+```toml
+[general.links]
+public_host = "proxy.example.com"
+```
+
+### Upstream Manager
+Чтобы указать апстрим, добавьте в секцию `[[upstreams]]` файла config.toml:
+#### Привязка к IP
+```toml
+[[upstreams]]
+type = "direct"
+weight = 1
+enabled = true
+interface = "192.168.1.100" # Change to your outgoing IP
+```
+#### SOCKS4/5 как Upstream
+- Без авторизации:
+```toml
+[[upstreams]]
+type = "socks5"            # Specify SOCKS4 or SOCKS5
+address = "1.2.3.4:1234"   # SOCKS-server Address
+weight = 1                 # Set Weight for Scenarios
+enabled = true
+```
+
+- С авторизацией:
+```toml
+[[upstreams]]
+type = "socks5"            # Specify SOCKS4 or SOCKS5
+address = "1.2.3.4:1234"   # SOCKS-server Address
+username = "user"          # Username for Auth on SOCKS-server
+password = "pass"          # Password for Auth on SOCKS-server
+weight = 1                 # Set Weight for Scenarios
+enabled = true
+```

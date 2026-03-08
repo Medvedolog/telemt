@@ -25,13 +25,24 @@ pub(crate) struct MeApiWriterStatusSnapshot {
 pub(crate) struct MeApiDcStatusSnapshot {
     pub dc: i16,
     pub endpoints: Vec<SocketAddr>,
+    pub endpoint_writers: Vec<MeApiDcEndpointWriterSnapshot>,
     pub available_endpoints: usize,
     pub available_pct: f64,
     pub required_writers: usize,
+    pub floor_min: usize,
+    pub floor_target: usize,
+    pub floor_max: usize,
+    pub floor_capped: bool,
     pub alive_writers: usize,
     pub coverage_pct: f64,
     pub rtt_ms: Option<f64>,
     pub load: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MeApiDcEndpointWriterSnapshot {
+    pub endpoint: SocketAddr,
+    pub active_writers: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +83,27 @@ pub(crate) struct MeApiRuntimeSnapshot {
     pub floor_mode: &'static str,
     pub adaptive_floor_idle_secs: u64,
     pub adaptive_floor_min_writers_single_endpoint: u8,
+    pub adaptive_floor_min_writers_multi_endpoint: u8,
     pub adaptive_floor_recover_grace_secs: u64,
+    pub adaptive_floor_writers_per_core_total: u16,
+    pub adaptive_floor_cpu_cores_override: u16,
+    pub adaptive_floor_max_extra_writers_single_per_core: u16,
+    pub adaptive_floor_max_extra_writers_multi_per_core: u16,
+    pub adaptive_floor_max_active_writers_per_core: u16,
+    pub adaptive_floor_max_warm_writers_per_core: u16,
+    pub adaptive_floor_max_active_writers_global: u32,
+    pub adaptive_floor_max_warm_writers_global: u32,
+    pub adaptive_floor_cpu_cores_detected: u32,
+    pub adaptive_floor_cpu_cores_effective: u32,
+    pub adaptive_floor_global_cap_raw: u64,
+    pub adaptive_floor_global_cap_effective: u64,
+    pub adaptive_floor_target_writers_total: u64,
+    pub adaptive_floor_active_cap_configured: u64,
+    pub adaptive_floor_active_cap_effective: u64,
+    pub adaptive_floor_warm_cap_configured: u64,
+    pub adaptive_floor_warm_cap_effective: u64,
+    pub adaptive_floor_active_writers_current: u64,
+    pub adaptive_floor_warm_writers_current: u64,
     pub me_keepalive_enabled: bool,
     pub me_keepalive_interval_secs: u64,
     pub me_keepalive_jitter_secs: u64,
@@ -94,6 +125,8 @@ pub(crate) struct MeApiRuntimeSnapshot {
     pub me_single_endpoint_outage_backoff_max_ms: u64,
     pub me_single_endpoint_shadow_rotate_every_secs: u64,
     pub me_deterministic_writer_sort: bool,
+    pub me_writer_pick_mode: &'static str,
+    pub me_writer_pick_sample_size: u8,
     pub me_socks_kdf_policy: &'static str,
     pub quarantined_endpoints: Vec<MeApiQuarantinedEndpointSnapshot>,
     pub network_path: Vec<MeApiDcPathSnapshot>,
@@ -116,19 +149,18 @@ impl MePool {
         }
 
         let writers = self.writers.read().await.clone();
-        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        let mut live_writers_by_dc = HashMap::<i16, usize>::new();
         for writer in writers {
             if writer.draining.load(Ordering::Relaxed) {
                 continue;
             }
-            *live_writers_by_endpoint.entry(writer.addr).or_insert(0) += 1;
+            if let Ok(dc) = i16::try_from(writer.writer_dc) {
+                *live_writers_by_dc.entry(dc).or_insert(0) += 1;
+            }
         }
 
-        for endpoints in endpoints_by_dc.values() {
-            let alive: usize = endpoints
-                .iter()
-                .map(|endpoint| live_writers_by_endpoint.get(endpoint).copied().unwrap_or(0))
-                .sum();
+        for dc in endpoints_by_dc.keys() {
+            let alive = live_writers_by_dc.get(dc).copied().unwrap_or(0);
             if alive == 0 {
                 return false;
             }
@@ -154,24 +186,23 @@ impl MePool {
         }
 
         let writers = self.writers.read().await.clone();
-        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        let mut live_writers_by_dc = HashMap::<i16, usize>::new();
         for writer in writers {
             if writer.draining.load(Ordering::Relaxed) {
                 continue;
             }
-            *live_writers_by_endpoint.entry(writer.addr).or_insert(0) += 1;
+            if let Ok(dc) = i16::try_from(writer.writer_dc) {
+                *live_writers_by_dc.entry(dc).or_insert(0) += 1;
+            }
         }
 
-        for endpoints in endpoints_by_dc.values() {
+        for (dc, endpoints) in endpoints_by_dc {
             let endpoint_count = endpoints.len();
             if endpoint_count == 0 {
                 return false;
             }
             let required = self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
-            let alive: usize = endpoints
-                .iter()
-                .map(|endpoint| live_writers_by_endpoint.get(endpoint).copied().unwrap_or(0))
-                .sum();
+            let alive = live_writers_by_dc.get(&dc).copied().unwrap_or(0);
             if alive < required {
                 return false;
             }
@@ -193,13 +224,6 @@ impl MePool {
             extend_signed_endpoints(&mut endpoints_by_dc, map);
         }
 
-        let mut endpoint_to_dc = HashMap::<SocketAddr, BTreeSet<i16>>::new();
-        for (dc, endpoints) in &endpoints_by_dc {
-            for endpoint in endpoints {
-                endpoint_to_dc.entry(*endpoint).or_default().insert(*dc);
-            }
-        }
-
         let configured_dc_groups = endpoints_by_dc.len();
         let configured_endpoints = endpoints_by_dc.values().map(BTreeSet::len).sum();
 
@@ -213,20 +237,14 @@ impl MePool {
         let rtt = self.rtt_stats.lock().await.clone();
         let writers = self.writers.read().await.clone();
 
-        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        let mut live_writers_by_dc_endpoint = HashMap::<(i16, SocketAddr), usize>::new();
         let mut live_writers_by_dc = HashMap::<i16, usize>::new();
         let mut dc_rtt_agg = HashMap::<i16, (f64, u64)>::new();
         let mut writer_rows = Vec::<MeApiWriterStatusSnapshot>::with_capacity(writers.len());
 
         for writer in writers {
             let endpoint = writer.addr;
-            let dc = endpoint_to_dc.get(&endpoint).and_then(|dcs| {
-                if dcs.len() == 1 {
-                    dcs.iter().next().copied()
-                } else {
-                    None
-                }
-            });
+            let dc = i16::try_from(writer.writer_dc).ok();
             let draining = writer.draining.load(Ordering::Relaxed);
             let degraded = writer.degraded.load(Ordering::Relaxed);
             let bound_clients = activity
@@ -245,8 +263,10 @@ impl MePool {
             };
 
             if !draining {
-                *live_writers_by_endpoint.entry(endpoint).or_insert(0) += 1;
                 if let Some(dc_idx) = dc {
+                    *live_writers_by_dc_endpoint
+                        .entry((dc_idx, endpoint))
+                        .or_insert(0) += 1;
                     *live_writers_by_dc.entry(dc_idx).or_insert(0) += 1;
                     if let Some(ema_ms) = rtt_ema_ms {
                         let entry = dc_rtt_agg.entry(dc_idx).or_insert((0.0, 0));
@@ -275,14 +295,43 @@ impl MePool {
         let mut dcs = Vec::<MeApiDcStatusSnapshot>::with_capacity(endpoints_by_dc.len());
         let mut available_endpoints = 0usize;
         let mut alive_writers = 0usize;
+        let floor_mode = self.floor_mode();
+        let adaptive_cpu_cores = (self
+            .me_adaptive_floor_cpu_cores_effective
+            .load(Ordering::Relaxed) as usize)
+            .max(1);
         for (dc, endpoints) in endpoints_by_dc {
             let endpoint_count = endpoints.len();
             let dc_available_endpoints = endpoints
                 .iter()
-                .filter(|endpoint| live_writers_by_endpoint.contains_key(endpoint))
+                .filter(|endpoint| live_writers_by_dc_endpoint.contains_key(&(dc, **endpoint)))
                 .count();
+            let base_required = self.required_writers_for_dc(endpoint_count);
             let dc_required_writers =
                 self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
+            let floor_min = if endpoint_count <= 1 {
+                (self
+                    .me_adaptive_floor_min_writers_single_endpoint
+                    .load(Ordering::Relaxed) as usize)
+                    .max(1)
+                    .min(base_required.max(1))
+            } else {
+                (self
+                    .me_adaptive_floor_min_writers_multi_endpoint
+                    .load(Ordering::Relaxed) as usize)
+                    .max(1)
+                    .min(base_required.max(1))
+            };
+            let extra_per_core = if endpoint_count <= 1 {
+                self.me_adaptive_floor_max_extra_writers_single_per_core
+                    .load(Ordering::Relaxed) as usize
+            } else {
+                self.me_adaptive_floor_max_extra_writers_multi_per_core
+                    .load(Ordering::Relaxed) as usize
+            };
+            let floor_max = base_required.saturating_add(adaptive_cpu_cores.saturating_mul(extra_per_core));
+            let floor_capped = matches!(floor_mode, MeFloorMode::Adaptive)
+                && dc_required_writers < base_required;
             let dc_alive_writers = live_writers_by_dc.get(&dc).copied().unwrap_or(0);
             let dc_load = activity
                 .active_sessions_by_target_dc
@@ -298,10 +347,24 @@ impl MePool {
 
             dcs.push(MeApiDcStatusSnapshot {
                 dc,
+                endpoint_writers: endpoints
+                    .iter()
+                    .map(|endpoint| MeApiDcEndpointWriterSnapshot {
+                        endpoint: *endpoint,
+                        active_writers: live_writers_by_dc_endpoint
+                            .get(&(dc, *endpoint))
+                            .copied()
+                            .unwrap_or(0),
+                    })
+                    .collect(),
                 endpoints: endpoints.into_iter().collect(),
                 available_endpoints: dc_available_endpoints,
                 available_pct: ratio_pct(dc_available_endpoints, endpoint_count),
                 required_writers: dc_required_writers,
+                floor_min,
+                floor_target: dc_required_writers,
+                floor_max,
+                floor_capped,
                 alive_writers: dc_alive_writers,
                 coverage_pct: ratio_pct(dc_alive_writers, dc_required_writers),
                 rtt_ms: dc_rtt_ms,
@@ -378,8 +441,68 @@ impl MePool {
             adaptive_floor_min_writers_single_endpoint: self
                 .me_adaptive_floor_min_writers_single_endpoint
                 .load(Ordering::Relaxed),
+            adaptive_floor_min_writers_multi_endpoint: self
+                .me_adaptive_floor_min_writers_multi_endpoint
+                .load(Ordering::Relaxed),
             adaptive_floor_recover_grace_secs: self
                 .me_adaptive_floor_recover_grace_secs
+                .load(Ordering::Relaxed),
+            adaptive_floor_writers_per_core_total: self
+                .me_adaptive_floor_writers_per_core_total
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_cpu_cores_override: self
+                .me_adaptive_floor_cpu_cores_override
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_max_extra_writers_single_per_core: self
+                .me_adaptive_floor_max_extra_writers_single_per_core
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_max_extra_writers_multi_per_core: self
+                .me_adaptive_floor_max_extra_writers_multi_per_core
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_max_active_writers_per_core: self
+                .me_adaptive_floor_max_active_writers_per_core
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_max_warm_writers_per_core: self
+                .me_adaptive_floor_max_warm_writers_per_core
+                .load(Ordering::Relaxed) as u16,
+            adaptive_floor_max_active_writers_global: self
+                .me_adaptive_floor_max_active_writers_global
+                .load(Ordering::Relaxed),
+            adaptive_floor_max_warm_writers_global: self
+                .me_adaptive_floor_max_warm_writers_global
+                .load(Ordering::Relaxed),
+            adaptive_floor_cpu_cores_detected: self
+                .me_adaptive_floor_cpu_cores_detected
+                .load(Ordering::Relaxed),
+            adaptive_floor_cpu_cores_effective: self
+                .me_adaptive_floor_cpu_cores_effective
+                .load(Ordering::Relaxed),
+            adaptive_floor_global_cap_raw: self
+                .me_adaptive_floor_global_cap_raw
+                .load(Ordering::Relaxed),
+            adaptive_floor_global_cap_effective: self
+                .me_adaptive_floor_global_cap_effective
+                .load(Ordering::Relaxed),
+            adaptive_floor_target_writers_total: self
+                .me_adaptive_floor_target_writers_total
+                .load(Ordering::Relaxed),
+            adaptive_floor_active_cap_configured: self
+                .me_adaptive_floor_active_cap_configured
+                .load(Ordering::Relaxed),
+            adaptive_floor_active_cap_effective: self
+                .me_adaptive_floor_active_cap_effective
+                .load(Ordering::Relaxed),
+            adaptive_floor_warm_cap_configured: self
+                .me_adaptive_floor_warm_cap_configured
+                .load(Ordering::Relaxed),
+            adaptive_floor_warm_cap_effective: self
+                .me_adaptive_floor_warm_cap_effective
+                .load(Ordering::Relaxed),
+            adaptive_floor_active_writers_current: self
+                .me_adaptive_floor_active_writers_current
+                .load(Ordering::Relaxed),
+            adaptive_floor_warm_writers_current: self
+                .me_adaptive_floor_warm_writers_current
                 .load(Ordering::Relaxed),
             me_keepalive_enabled: self.me_keepalive_enabled,
             me_keepalive_interval_secs: self.me_keepalive_interval.as_secs(),
@@ -418,6 +541,8 @@ impl MePool {
             me_deterministic_writer_sort: self
                 .me_deterministic_writer_sort
                 .load(Ordering::Relaxed),
+            me_writer_pick_mode: writer_pick_mode_label(self.writer_pick_mode()),
+            me_writer_pick_sample_size: self.writer_pick_sample_size() as u8,
             me_socks_kdf_policy: socks_kdf_policy_label(self.socks_kdf_policy()),
             quarantined_endpoints,
             network_path,
@@ -463,6 +588,13 @@ fn bind_stale_mode_label(mode: MeBindStaleMode) -> &'static str {
         MeBindStaleMode::Never => "never",
         MeBindStaleMode::Ttl => "ttl",
         MeBindStaleMode::Always => "always",
+    }
+}
+
+fn writer_pick_mode_label(mode: crate::config::MeWriterPickMode) -> &'static str {
+    match mode {
+        crate::config::MeWriterPickMode::SortedRr => "sorted_rr",
+        crate::config::MeWriterPickMode::P2c => "p2c",
     }
 }
 

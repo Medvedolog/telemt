@@ -331,7 +331,7 @@ pub async fn run_me_ping(pool: &Arc<MePool>, rng: &SecureRandom) -> Vec<MePingRe
             let mut error = None;
             let mut route = None;
 
-            match pool.connect_tcp(addr).await {
+            match pool.connect_tcp(addr, None).await {
                 Ok((stream, conn_rtt, upstream_egress)) => {
                     connect_ms = Some(conn_rtt);
                     route = route_from_egress(upstream_egress);

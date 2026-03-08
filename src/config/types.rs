@@ -212,6 +212,32 @@ impl MeRouteNoWriterMode {
     }
 }
 
+/// Middle-End writer selection mode for new client bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeWriterPickMode {
+    SortedRr,
+    #[default]
+    P2c,
+}
+
+impl MeWriterPickMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            MeWriterPickMode::SortedRr => 0,
+            MeWriterPickMode::P2c => 1,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => MeWriterPickMode::SortedRr,
+            1 => MeWriterPickMode::P2c,
+            _ => MeWriterPickMode::P2c,
+        }
+    }
+}
+
 /// Per-user unique source IP limit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -420,6 +446,48 @@ pub struct GeneralConfig {
     #[serde(default = "default_rpc_proxy_req_every")]
     pub rpc_proxy_req_every: u64,
 
+    /// Capacity of per-ME writer command channel.
+    #[serde(default = "default_me_writer_cmd_channel_capacity")]
+    pub me_writer_cmd_channel_capacity: usize,
+
+    /// Capacity of per-connection ME response route channel.
+    #[serde(default = "default_me_route_channel_capacity")]
+    pub me_route_channel_capacity: usize,
+
+    /// Capacity of per-client command queue from client reader to ME sender task.
+    #[serde(default = "default_me_c2me_channel_capacity")]
+    pub me_c2me_channel_capacity: usize,
+
+    /// Bounded wait in milliseconds for routing ME DATA to per-connection queue.
+    /// `0` keeps legacy no-wait behavior.
+    #[serde(default = "default_me_reader_route_data_wait_ms")]
+    pub me_reader_route_data_wait_ms: u64,
+
+    /// Maximum number of ME->Client responses coalesced before flush.
+    #[serde(default = "default_me_d2c_flush_batch_max_frames")]
+    pub me_d2c_flush_batch_max_frames: usize,
+
+    /// Maximum total payload bytes coalesced before flush.
+    #[serde(default = "default_me_d2c_flush_batch_max_bytes")]
+    pub me_d2c_flush_batch_max_bytes: usize,
+
+    /// Maximum wait in microseconds to coalesce additional ME->Client responses.
+    /// `0` disables timed coalescing.
+    #[serde(default = "default_me_d2c_flush_batch_max_delay_us")]
+    pub me_d2c_flush_batch_max_delay_us: u64,
+
+    /// Flush client writer immediately after quick-ack write.
+    #[serde(default = "default_me_d2c_ack_flush_immediate")]
+    pub me_d2c_ack_flush_immediate: bool,
+
+    /// Copy buffer size for client->DC direction in direct relay.
+    #[serde(default = "default_direct_relay_copy_buf_c2s_bytes")]
+    pub direct_relay_copy_buf_c2s_bytes: usize,
+
+    /// Copy buffer size for DC->client direction in direct relay.
+    #[serde(default = "default_direct_relay_copy_buf_s2c_bytes")]
+    pub direct_relay_copy_buf_s2c_bytes: usize,
+
     /// Max pending ciphertext buffer per client writer (bytes).
     /// Controls FakeTLS backpressure vs throughput.
     #[serde(default = "default_crypto_pending_buffer")]
@@ -520,9 +588,46 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_adaptive_floor_min_writers_single_endpoint")]
     pub me_adaptive_floor_min_writers_single_endpoint: u8,
 
+    /// Minimum writer target for multi-endpoint DC groups in adaptive floor mode.
+    #[serde(default = "default_me_adaptive_floor_min_writers_multi_endpoint")]
+    pub me_adaptive_floor_min_writers_multi_endpoint: u8,
+
     /// Grace period in seconds to hold static floor after activity in adaptive mode.
     #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
     pub me_adaptive_floor_recover_grace_secs: u64,
+
+    /// Global ME writer budget per logical CPU core in adaptive mode.
+    #[serde(default = "default_me_adaptive_floor_writers_per_core_total")]
+    pub me_adaptive_floor_writers_per_core_total: u16,
+
+    /// Override logical CPU core count for adaptive floor calculations.
+    /// Set to 0 to use runtime auto-detection.
+    #[serde(default = "default_me_adaptive_floor_cpu_cores_override")]
+    pub me_adaptive_floor_cpu_cores_override: u16,
+
+    /// Per-core max extra writers above base required floor for single-endpoint DC groups.
+    #[serde(default = "default_me_adaptive_floor_max_extra_writers_single_per_core")]
+    pub me_adaptive_floor_max_extra_writers_single_per_core: u16,
+
+    /// Per-core max extra writers above base required floor for multi-endpoint DC groups.
+    #[serde(default = "default_me_adaptive_floor_max_extra_writers_multi_per_core")]
+    pub me_adaptive_floor_max_extra_writers_multi_per_core: u16,
+
+    /// Hard cap for active ME writers per logical CPU core.
+    #[serde(default = "default_me_adaptive_floor_max_active_writers_per_core")]
+    pub me_adaptive_floor_max_active_writers_per_core: u16,
+
+    /// Hard cap for warm ME writers per logical CPU core.
+    #[serde(default = "default_me_adaptive_floor_max_warm_writers_per_core")]
+    pub me_adaptive_floor_max_warm_writers_per_core: u16,
+
+    /// Hard global cap for active ME writers.
+    #[serde(default = "default_me_adaptive_floor_max_active_writers_global")]
+    pub me_adaptive_floor_max_active_writers_global: u32,
+
+    /// Hard global cap for warm ME writers.
+    #[serde(default = "default_me_adaptive_floor_max_warm_writers_global")]
+    pub me_adaptive_floor_max_warm_writers_global: u32,
 
     /// Connect attempts for the selected upstream before returning error/fallback.
     #[serde(default = "default_upstream_connect_retry_attempts")]
@@ -582,6 +687,22 @@ pub struct GeneralConfig {
     /// Queue occupancy percent threshold for high backpressure timeout.
     #[serde(default = "default_me_route_backpressure_high_watermark_pct")]
     pub me_route_backpressure_high_watermark_pct: u8,
+
+    /// Health monitor interval in milliseconds while writer coverage is degraded.
+    #[serde(default = "default_me_health_interval_ms_unhealthy")]
+    pub me_health_interval_ms_unhealthy: u64,
+
+    /// Health monitor interval in milliseconds while writer coverage is stable.
+    #[serde(default = "default_me_health_interval_ms_healthy")]
+    pub me_health_interval_ms_healthy: u64,
+
+    /// Poll interval in milliseconds for conditional-admission state checks.
+    #[serde(default = "default_me_admission_poll_ms")]
+    pub me_admission_poll_ms: u64,
+
+    /// Cooldown for repetitive ME warning logs in milliseconds.
+    #[serde(default = "default_me_warn_rate_limit_ms")]
+    pub me_warn_rate_limit_ms: u64,
 
     /// ME route behavior when no writer is immediately available.
     #[serde(default)]
@@ -717,6 +838,14 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_deterministic_writer_sort")]
     pub me_deterministic_writer_sort: bool,
 
+    /// Writer selection mode for ME route bind path.
+    #[serde(default)]
+    pub me_writer_pick_mode: MeWriterPickMode,
+
+    /// Number of candidates sampled by writer picker in `p2c` mode.
+    #[serde(default = "default_me_writer_pick_sample_size")]
+    pub me_writer_pick_sample_size: u8,
+
     /// Enable NTP drift check at startup.
     #[serde(default = "default_ntp_check")]
     pub ntp_check: bool,
@@ -759,6 +888,16 @@ impl Default for GeneralConfig {
             me_keepalive_jitter_secs: default_keepalive_jitter(),
             me_keepalive_payload_random: default_true(),
             rpc_proxy_req_every: default_rpc_proxy_req_every(),
+            me_writer_cmd_channel_capacity: default_me_writer_cmd_channel_capacity(),
+            me_route_channel_capacity: default_me_route_channel_capacity(),
+            me_c2me_channel_capacity: default_me_c2me_channel_capacity(),
+            me_reader_route_data_wait_ms: default_me_reader_route_data_wait_ms(),
+            me_d2c_flush_batch_max_frames: default_me_d2c_flush_batch_max_frames(),
+            me_d2c_flush_batch_max_bytes: default_me_d2c_flush_batch_max_bytes(),
+            me_d2c_flush_batch_max_delay_us: default_me_d2c_flush_batch_max_delay_us(),
+            me_d2c_ack_flush_immediate: default_me_d2c_ack_flush_immediate(),
+            direct_relay_copy_buf_c2s_bytes: default_direct_relay_copy_buf_c2s_bytes(),
+            direct_relay_copy_buf_s2c_bytes: default_direct_relay_copy_buf_s2c_bytes(),
             me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
@@ -775,7 +914,16 @@ impl Default for GeneralConfig {
             me_floor_mode: MeFloorMode::default(),
             me_adaptive_floor_idle_secs: default_me_adaptive_floor_idle_secs(),
             me_adaptive_floor_min_writers_single_endpoint: default_me_adaptive_floor_min_writers_single_endpoint(),
+            me_adaptive_floor_min_writers_multi_endpoint: default_me_adaptive_floor_min_writers_multi_endpoint(),
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
+            me_adaptive_floor_writers_per_core_total: default_me_adaptive_floor_writers_per_core_total(),
+            me_adaptive_floor_cpu_cores_override: default_me_adaptive_floor_cpu_cores_override(),
+            me_adaptive_floor_max_extra_writers_single_per_core: default_me_adaptive_floor_max_extra_writers_single_per_core(),
+            me_adaptive_floor_max_extra_writers_multi_per_core: default_me_adaptive_floor_max_extra_writers_multi_per_core(),
+            me_adaptive_floor_max_active_writers_per_core: default_me_adaptive_floor_max_active_writers_per_core(),
+            me_adaptive_floor_max_warm_writers_per_core: default_me_adaptive_floor_max_warm_writers_per_core(),
+            me_adaptive_floor_max_active_writers_global: default_me_adaptive_floor_max_active_writers_global(),
+            me_adaptive_floor_max_warm_writers_global: default_me_adaptive_floor_max_warm_writers_global(),
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
             upstream_connect_budget_ms: default_upstream_connect_budget_ms(),
@@ -791,6 +939,10 @@ impl Default for GeneralConfig {
             me_route_backpressure_base_timeout_ms: default_me_route_backpressure_base_timeout_ms(),
             me_route_backpressure_high_timeout_ms: default_me_route_backpressure_high_timeout_ms(),
             me_route_backpressure_high_watermark_pct: default_me_route_backpressure_high_watermark_pct(),
+            me_health_interval_ms_unhealthy: default_me_health_interval_ms_unhealthy(),
+            me_health_interval_ms_healthy: default_me_health_interval_ms_healthy(),
+            me_admission_poll_ms: default_me_admission_poll_ms(),
+            me_warn_rate_limit_ms: default_me_warn_rate_limit_ms(),
             me_route_no_writer_mode: MeRouteNoWriterMode::default(),
             me_route_no_writer_wait_ms: default_me_route_no_writer_wait_ms(),
             me_route_inline_recovery_attempts: default_me_route_inline_recovery_attempts(),
@@ -831,6 +983,8 @@ impl Default for GeneralConfig {
             me_reinit_trigger_channel: default_me_reinit_trigger_channel(),
             me_reinit_coalesce_window_ms: default_me_reinit_coalesce_window_ms(),
             me_deterministic_writer_sort: default_me_deterministic_writer_sort(),
+            me_writer_pick_mode: MeWriterPickMode::default(),
+            me_writer_pick_sample_size: default_me_writer_pick_sample_size(),
             ntp_check: default_ntp_check(),
             ntp_servers: default_ntp_servers(),
             auto_degradation_enabled: default_true(),

@@ -55,7 +55,11 @@ impl MePool {
                     .iter()
                     .map(|(ip, port)| SocketAddr::new(*ip, *port))
                     .collect();
-                if self.active_writer_count_for_endpoints(&endpoints).await >= target_writers {
+                if self
+                    .active_writer_count_for_dc_endpoints(dc, &endpoints)
+                    .await
+                    >= target_writers
+                {
                     continue;
                 }
                 let pool = Arc::clone(self);
@@ -67,6 +71,7 @@ impl MePool {
                         target_writers,
                         rng_clone,
                         connect_concurrency,
+                        true,
                     )
                     .await
                 });
@@ -79,7 +84,7 @@ impl MePool {
                     .iter()
                     .map(|(ip, port)| SocketAddr::new(*ip, *port))
                     .collect();
-                if self.active_writer_count_for_endpoints(&endpoints).await == 0 {
+                if self.active_writer_count_for_dc_endpoints(*dc, &endpoints).await == 0 {
                     missing_dcs.push(*dc);
                 }
             }
@@ -110,6 +115,7 @@ impl MePool {
                                 target_writers,
                                 rng_clone_local,
                                 connect_concurrency,
+                                false,
                             )
                             .await
                     });
@@ -143,6 +149,7 @@ impl MePool {
         target_writers: usize,
         rng: Arc<SecureRandom>,
         connect_concurrency: usize,
+        allow_coverage_override: bool,
     ) -> bool {
         if addrs.is_empty() {
             return false;
@@ -156,7 +163,9 @@ impl MePool {
         let endpoint_set: HashSet<SocketAddr> = endpoints.iter().copied().collect();
 
         loop {
-            let alive = self.active_writer_count_for_endpoints(&endpoint_set).await;
+            let alive = self
+                .active_writer_count_for_dc_endpoints(dc, &endpoint_set)
+                .await;
             if alive >= target_writers {
                 info!(
                     dc = %dc,
@@ -174,9 +183,17 @@ impl MePool {
                 let pool = Arc::clone(&self);
                 let rng_clone = Arc::clone(&rng);
                 let endpoints_clone = endpoints.clone();
+                let generation = self.current_generation();
                 join.spawn(async move {
-                    pool.connect_endpoints_round_robin(&endpoints_clone, rng_clone.as_ref())
-                        .await
+                    pool.connect_endpoints_round_robin_with_generation_contour(
+                        dc,
+                        &endpoints_clone,
+                        rng_clone.as_ref(),
+                        generation,
+                        super::pool::WriterContour::Active,
+                        allow_coverage_override,
+                    )
+                    .await
                 });
             }
 
@@ -193,7 +210,9 @@ impl MePool {
                 }
             }
 
-            let alive_after = self.active_writer_count_for_endpoints(&endpoint_set).await;
+            let alive_after = self
+                .active_writer_count_for_dc_endpoints(dc, &endpoint_set)
+                .await;
             if alive_after >= target_writers {
                 info!(
                     dc = %dc,
@@ -204,12 +223,25 @@ impl MePool {
                 return true;
             }
             if !progress {
-                warn!(
-                    dc = %dc,
-                    alive = alive_after,
-                    target_writers,
-                    "All ME servers for DC failed at init"
-                );
+                let active_writers_current = self.active_contour_writer_count_total().await;
+                let active_cap_configured = self.adaptive_floor_active_cap_configured_total();
+                if !allow_coverage_override && active_writers_current >= active_cap_configured {
+                    info!(
+                        dc = %dc,
+                        alive = alive_after,
+                        target_writers,
+                        active_writers_current,
+                        active_cap_configured,
+                        "ME init saturation stopped by active writer cap"
+                    );
+                } else {
+                    warn!(
+                        dc = %dc,
+                        alive = alive_after,
+                        target_writers,
+                        "All ME servers for DC failed at init"
+                    );
+                }
                 return false;
             }
 

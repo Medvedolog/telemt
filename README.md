@@ -93,31 +93,6 @@ We welcome ideas, architectural feedback, and pull requests.
 
 ⚓ Our ***Middle-End Pool*** is fastest by design in standard scenarios, compared to other implementations of connecting to the Middle-End Proxy: non dramatically, but usual
 
-# GOTO
-- [Features](#features)
-- [Quick Start Guide](#quick-start-guide)
-- [How to use?](#how-to-use)
-  - [Systemd Method](#telemt-via-systemd)
-- [Configuration](#configuration)
-  - [Minimal Configuration](#minimal-configuration-for-first-start)
-  - [Advanced](#advanced)
-    - [Adtag](#adtag)
-    - [Listening and Announce IPs](#listening-and-announce-ips)
-    - [Upstream Manager](#upstream-manager)
-      - [IP](#bind-on-ip)
-      - [SOCKS](#socks45-as-upstream)
-- [FAQ](#faq)
-  - [Recognizability for DPI + crawler](#recognizability-for-dpi-and-crawler)
-  - [Telegram Calls](#telegram-calls-via-mtproxy)
-  - [DPI](#how-does-dpi-see-mtproxy-tls)
-  - [Whitelist on Network Level](#whitelist-on-ip)
-  - [Too many open files](#too-many-open-files)
-- [Build](#build)
-- [Docker](#docker)
-- [Why Rust?](#why-rust)
-
-## Features
-
 - Full support for all official MTProto proxy modes:
   - Classic
   - Secure - with `dd` prefix
@@ -128,59 +103,31 @@ We welcome ideas, architectural feedback, and pull requests.
 - Graceful shutdown on Ctrl+C
 - Extensive logging via `trace` and `debug` with `RUST_LOG` method
 
+# GOTO
+- [Quick Start Guide](#quick-start-guide)
+- [FAQ](#faq)
+  - [Recognizability for DPI and crawler](#recognizability-for-dpi-and-crawler)
+    - [Client WITH secret-key accesses the MTProxy resource:](#client-with-secret-key-accesses-the-mtproxy-resource)
+    - [Client WITHOUT secret-key gets transparent access to the specified resource:](#client-without-secret-key-gets-transparent-access-to-the-specified-resource)
+  - [Telegram Calls via MTProxy](#telegram-calls-via-mtproxy)
+  - [How does DPI see MTProxy TLS?](#how-does-dpi-see-mtproxy-tls)
+  - [Whitelist on IP](#whitelist-on-ip)
+  - [Too many open files](#too-many-open-files)
+- [Build](#build)
+- [Why Rust?](#why-rust)
+- [Issues](#issues)
+- [Roadmap](#roadmap)
+
+
 ## Quick Start Guide
-
-### [Quick Start Guide RU](docs/QUICK_START_GUIDE.ru.md)  
-### [Quick Start Guide EN](docs/QUICK_START_GUIDE.en.md)
-
-
-### Advanced
-#### Adtag (per-user)
-To use channel advertising and usage statistics from Telegram, get an Adtag from [@mtproxybot](https://t.me/mtproxybot). Set it per user in `[access.user_ad_tags]` (32 hex chars):
-```toml
-[access.user_ad_tags]
-username1 = "11111111111111111111111111111111"  # Replace with your tag from @mtproxybot
-username2 = "22222222222222222222222222222222"
-```
-#### Listening and Announce IPs
-To specify listening address and/or address in links, add to section `[[server.listeners]]` of config.toml:
-```toml
-[[server.listeners]]
-ip = "0.0.0.0"          # 0.0.0.0 = all IPs; your IP = specific listening
-announce_ip = "1.2.3.4" # IP in links; comment with # if not used
-```
-#### Upstream Manager
-To specify upstream, add to section `[[upstreams]]` of config.toml:
-##### Bind on IP
-```toml
-[[upstreams]]
-type = "direct"
-weight = 1
-enabled = true
-interface = "192.168.1.100" # Change to your outgoing IP
-```
-##### SOCKS4/5 as Upstream
-- Without Auth:
-```toml
-[[upstreams]]
-type = "socks5"            # Specify SOCKS4 or SOCKS5
-address = "1.2.3.4:1234"   # SOCKS-server Address
-weight = 1                 # Set Weight for Scenarios
-enabled = true
-```
-
-- With Auth:
-```toml
-[[upstreams]]
-type = "socks5"            # Specify SOCKS4 or SOCKS5
-address = "1.2.3.4:1234"   # SOCKS-server Address
-username = "user"          # Username for Auth on SOCKS-server
-password = "pass"          # Password for Auth on SOCKS-server
-weight = 1                 # Set Weight for Scenarios
-enabled = true
-```
+- [Quick Start Guide RU](docs/QUICK_START_GUIDE.ru.md)
+- [Quick Start Guide EN](docs/QUICK_START_GUIDE.en.md)
 
 ## FAQ
+
+- [FAQ RU](docs/FAQ.ru.md)
+- [FAQ EN](docs/FAQ.en.md)
+
 ### Recognizability for DPI and crawler
 Since version 1.1.0.0, we have debugged masking perfectly: for all clients without "presenting" a key, 
 we transparently direct traffic to the target host!
@@ -323,41 +270,6 @@ mv ./target/release/telemt /bin
 chmod +x /bin/telemt
 # Lets go!
 telemt config.toml
-```
-
-## Docker
-**Quick start (Docker Compose)**
-
-1. Edit `config.toml` in repo root (at least: port, users secrets, tls_domain)
-2. Start container:
-```bash
-docker compose up -d --build
-```
-3. Check logs:
-```bash
-docker compose logs -f telemt
-```
-4. Stop:
-```bash
-docker compose down
-```
-
-**Notes**
-- `docker-compose.yml` maps `./config.toml` to `/app/config.toml` (read-only)
-- By default it publishes `443:443` and runs with dropped capabilities (only `NET_BIND_SERVICE` is added)
-- If you really need host networking (usually only for some IPv6 setups) uncomment `network_mode: host`
-
-**Run without Compose**
-```bash
-docker build -t telemt:local .
-docker run --name telemt --restart unless-stopped \
-  -p 443:443 \
-  -e RUST_LOG=info \
-  -v "$PWD/config.toml:/app/config.toml:ro" \
-  --read-only \
-  --cap-drop ALL --cap-add NET_BIND_SERVICE \
-  --ulimit nofile=65536:65536 \
-  telemt:local
 ```
 
 ## Why Rust?

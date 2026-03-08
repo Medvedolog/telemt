@@ -54,6 +54,7 @@ impl MePool {
                     && let Some(addrs) = guard.get(&k).cloned()
                 {
                     guard.insert(-k, addrs);
+                    changed = true;
                 }
             }
         }
@@ -65,8 +66,13 @@ impl MePool {
                     && let Some(addrs) = guard.get(&k).cloned()
                 {
                     guard.insert(-k, addrs);
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.rebuild_endpoint_dc_map().await;
+            self.writer_available.notify_waiters();
         }
         if changed {
             SnapshotApplyOutcome::AppliedChanged
@@ -104,7 +110,10 @@ impl MePool {
     pub async fn reconnect_all(self: &Arc<Self>) {
         let ws = self.writers.read().await.clone();
         for w in ws {
-            if let Ok(()) = self.connect_one(w.addr, self.rng.as_ref()).await {
+            if let Ok(()) = self
+                .connect_one_for_dc(w.addr, w.writer_dc, self.rng.as_ref())
+                .await
+            {
                 self.mark_writer_draining(w.id).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }

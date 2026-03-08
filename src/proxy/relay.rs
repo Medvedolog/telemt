@@ -57,7 +57,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+use tokio::io::{
+    AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional_with_sizes,
+};
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 use crate::error::Result;
@@ -296,9 +298,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
 ///
 /// ## API compatibility
 ///
-/// Signature is identical to the previous implementation. The `_buffer_pool`
-/// parameter is retained for call-site compatibility — `copy_bidirectional`
-/// manages its own internal buffers (8 KB per direction).
+/// The `_buffer_pool` parameter is retained for call-site compatibility.
+/// Effective relay copy buffers are configured by `c2s_buf_size` / `s2c_buf_size`.
 ///
 /// ## Guarantees preserved
 ///
@@ -312,6 +313,8 @@ pub async fn relay_bidirectional<CR, CW, SR, SW>(
     client_writer: CW,
     server_reader: SR,
     server_writer: SW,
+    c2s_buf_size: usize,
+    s2c_buf_size: usize,
     user: &str,
     stats: Arc<Stats>,
     _buffer_pool: Arc<BufferPool>,
@@ -402,7 +405,12 @@ where
     // When the watchdog fires, select! drops the copy future,
     // releasing the &mut borrows on client and server.
     let copy_result = tokio::select! {
-        result = copy_bidirectional(&mut client, &mut server) => Some(result),
+        result = copy_bidirectional_with_sizes(
+            &mut client,
+            &mut server,
+            c2s_buf_size.max(1),
+            s2c_buf_size.max(1),
+        ) => Some(result),
         _ = watchdog => None, // Activity timeout — cancel relay
     };
 

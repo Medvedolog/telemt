@@ -285,6 +285,84 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_writer_cmd_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_writer_cmd_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_route_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_route_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_c2me_channel_capacity == 0 {
+            return Err(ProxyError::Config(
+                "general.me_c2me_channel_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_reader_route_data_wait_ms > 20 {
+            return Err(ProxyError::Config(
+                "general.me_reader_route_data_wait_ms must be within [0, 20]".to_string(),
+            ));
+        }
+
+        if !(1..=512).contains(&config.general.me_d2c_flush_batch_max_frames) {
+            return Err(ProxyError::Config(
+                "general.me_d2c_flush_batch_max_frames must be within [1, 512]".to_string(),
+            ));
+        }
+
+        if !(4096..=2 * 1024 * 1024).contains(&config.general.me_d2c_flush_batch_max_bytes) {
+            return Err(ProxyError::Config(
+                "general.me_d2c_flush_batch_max_bytes must be within [4096, 2097152]".to_string(),
+            ));
+        }
+
+        if config.general.me_d2c_flush_batch_max_delay_us > 5000 {
+            return Err(ProxyError::Config(
+                "general.me_d2c_flush_batch_max_delay_us must be within [0, 5000]".to_string(),
+            ));
+        }
+
+        if !(4096..=1024 * 1024).contains(&config.general.direct_relay_copy_buf_c2s_bytes) {
+            return Err(ProxyError::Config(
+                "general.direct_relay_copy_buf_c2s_bytes must be within [4096, 1048576]".to_string(),
+            ));
+        }
+
+        if !(8192..=2 * 1024 * 1024).contains(&config.general.direct_relay_copy_buf_s2c_bytes) {
+            return Err(ProxyError::Config(
+                "general.direct_relay_copy_buf_s2c_bytes must be within [8192, 2097152]".to_string(),
+            ));
+        }
+
+        if config.general.me_health_interval_ms_unhealthy == 0 {
+            return Err(ProxyError::Config(
+                "general.me_health_interval_ms_unhealthy must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_health_interval_ms_healthy == 0 {
+            return Err(ProxyError::Config(
+                "general.me_health_interval_ms_healthy must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_admission_poll_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_admission_poll_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_warn_rate_limit_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_warn_rate_limit_ms must be > 0".to_string(),
+            ));
+        }
+
         if config.access.user_max_unique_ips_window_secs == 0 {
             return Err(ProxyError::Config(
                 "access.user_max_unique_ips_window_secs must be > 0".to_string(),
@@ -309,6 +387,45 @@ impl ProxyConfig {
             return Err(ProxyError::Config(
                 "general.me_adaptive_floor_min_writers_single_endpoint must be within [1, 32]"
                     .to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_min_writers_multi_endpoint == 0
+            || config.general.me_adaptive_floor_min_writers_multi_endpoint > 32
+        {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_min_writers_multi_endpoint must be within [1, 32]"
+                    .to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_writers_per_core_total == 0 {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_writers_per_core_total must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_max_active_writers_per_core == 0 {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_max_active_writers_per_core must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_max_warm_writers_per_core == 0 {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_max_warm_writers_per_core must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_max_active_writers_global == 0 {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_max_active_writers_global must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_adaptive_floor_max_warm_writers_global == 0 {
+            return Err(ProxyError::Config(
+                "general.me_adaptive_floor_max_warm_writers_global must be > 0".to_string(),
             ));
         }
 
@@ -435,6 +552,12 @@ impl ProxyConfig {
         if !(10..=5000).contains(&config.general.me_route_no_writer_wait_ms) {
             return Err(ProxyError::Config(
                 "general.me_route_no_writer_wait_ms must be within [10, 5000]".to_string(),
+            ));
+        }
+
+        if !(2..=4).contains(&config.general.me_writer_pick_sample_size) {
+            return Err(ProxyError::Config(
+                "general.me_writer_pick_sample_size must be within [2, 4]".to_string(),
             ));
         }
 
@@ -1220,6 +1343,46 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let cfg = ProxyConfig::load(&path).unwrap();
         assert_eq!(cfg.general.me_floor_mode, MeFloorMode::Adaptive);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_adaptive_floor_max_active_writers_per_core_zero_is_rejected() {
+        let toml = r#"
+            [general]
+            me_adaptive_floor_max_active_writers_per_core = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_adaptive_floor_max_active_per_core_zero_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_adaptive_floor_max_active_writers_per_core must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_adaptive_floor_max_warm_writers_global_zero_is_rejected() {
+        let toml = r#"
+            [general]
+            me_adaptive_floor_max_warm_writers_global = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_adaptive_floor_max_warm_global_zero_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_adaptive_floor_max_warm_writers_global must be > 0"));
         let _ = std::fs::remove_file(path);
     }
 

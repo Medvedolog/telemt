@@ -9,7 +9,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use super::codec::WriterCommand;
 use super::MeResponse;
 
-const ROUTE_CHANNEL_CAPACITY: usize = 4096;
 const ROUTE_BACKPRESSURE_BASE_TIMEOUT_MS: u64 = 25;
 const ROUTE_BACKPRESSURE_HIGH_TIMEOUT_MS: u64 = 120;
 const ROUTE_BACKPRESSURE_HIGH_WATERMARK_PCT: u8 = 80;
@@ -78,6 +77,7 @@ impl RegistryInner {
 pub struct ConnRegistry {
     inner: RwLock<RegistryInner>,
     next_id: AtomicU64,
+    route_channel_capacity: usize,
     route_backpressure_base_timeout_ms: AtomicU64,
     route_backpressure_high_timeout_ms: AtomicU64,
     route_backpressure_high_watermark_pct: AtomicU8,
@@ -91,11 +91,12 @@ impl ConnRegistry {
             .as_secs()
     }
 
-    pub fn new() -> Self {
+    pub fn with_route_channel_capacity(route_channel_capacity: usize) -> Self {
         let start = rand::random::<u64>() | 1;
         Self {
             inner: RwLock::new(RegistryInner::new()),
             next_id: AtomicU64::new(start),
+            route_channel_capacity: route_channel_capacity.max(1),
             route_backpressure_base_timeout_ms: AtomicU64::new(
                 ROUTE_BACKPRESSURE_BASE_TIMEOUT_MS,
             ),
@@ -106,6 +107,11 @@ impl ConnRegistry {
                 ROUTE_BACKPRESSURE_HIGH_WATERMARK_PCT,
             ),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::with_route_channel_capacity(4096)
     }
 
     pub fn update_route_backpressure_policy(
@@ -127,7 +133,7 @@ impl ConnRegistry {
 
     pub async fn register(&self) -> (u64, mpsc::Receiver<MeResponse>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(self.route_channel_capacity);
         self.inner.write().await.map.insert(id, tx);
         (id, rx)
     }
@@ -179,11 +185,11 @@ impl ConnRegistry {
                     .route_backpressure_high_watermark_pct
                     .load(Ordering::Relaxed)
                     .clamp(1, 100);
-                let used = ROUTE_CHANNEL_CAPACITY.saturating_sub(tx.capacity());
-                let used_pct = if ROUTE_CHANNEL_CAPACITY == 0 {
+                let used = self.route_channel_capacity.saturating_sub(tx.capacity());
+                let used_pct = if self.route_channel_capacity == 0 {
                     100
                 } else {
-                    (used.saturating_mul(100) / ROUTE_CHANNEL_CAPACITY) as u8
+                    (used.saturating_mul(100) / self.route_channel_capacity) as u8
                 };
                 let high_profile = used_pct >= high_watermark_pct;
                 let timeout_ms = if high_profile {
@@ -225,6 +231,57 @@ impl ConnRegistry {
         }
     }
 
+    pub async fn route_with_timeout(
+        &self,
+        id: u64,
+        resp: MeResponse,
+        timeout_ms: u64,
+    ) -> RouteResult {
+        if timeout_ms == 0 {
+            return self.route_nowait(id, resp).await;
+        }
+
+        let tx = {
+            let inner = self.inner.read().await;
+            inner.map.get(&id).cloned()
+        };
+
+        let Some(tx) = tx else {
+            return RouteResult::NoConn;
+        };
+
+        match tx.try_send(resp) {
+            Ok(()) => RouteResult::Routed,
+            Err(TrySendError::Closed(_)) => RouteResult::ChannelClosed,
+            Err(TrySendError::Full(resp)) => {
+                let high_watermark_pct = self
+                    .route_backpressure_high_watermark_pct
+                    .load(Ordering::Relaxed)
+                    .clamp(1, 100);
+                let used = self.route_channel_capacity.saturating_sub(tx.capacity());
+                let used_pct = if self.route_channel_capacity == 0 {
+                    100
+                } else {
+                    (used.saturating_mul(100) / self.route_channel_capacity) as u8
+                };
+                let high_profile = used_pct >= high_watermark_pct;
+                let timeout_dur = Duration::from_millis(timeout_ms.max(1));
+
+                match tokio::time::timeout(timeout_dur, tx.send(resp)).await {
+                    Ok(Ok(())) => RouteResult::Routed,
+                    Ok(Err(_)) => RouteResult::ChannelClosed,
+                    Err(_) => {
+                        if high_profile {
+                            RouteResult::QueueFullHigh
+                        } else {
+                            RouteResult::QueueFullBase
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn bind_writer(
         &self,
         conn_id: u64,
@@ -262,6 +319,20 @@ impl ConnRegistry {
     pub async fn writer_idle_since_snapshot(&self) -> HashMap<u64, u64> {
         let inner = self.inner.read().await;
         inner.writer_idle_since_epoch_secs.clone()
+    }
+
+    pub async fn writer_idle_since_for_writer_ids(
+        &self,
+        writer_ids: &[u64],
+    ) -> HashMap<u64, u64> {
+        let inner = self.inner.read().await;
+        let mut out = HashMap::<u64, u64>::with_capacity(writer_ids.len());
+        for writer_id in writer_ids {
+            if let Some(idle_since) = inner.writer_idle_since_epoch_secs.get(writer_id).copied() {
+                out.insert(*writer_id, idle_since);
+            }
+        }
+        out
     }
 
     pub(super) async fn writer_activity_snapshot(&self) -> WriterActivitySnapshot {

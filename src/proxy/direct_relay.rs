@@ -64,6 +64,8 @@ where
         client_writer,
         tg_reader,
         tg_writer,
+        config.general.direct_relay_copy_buf_c2s_bytes,
+        config.general.direct_relay_copy_buf_s2c_bytes,
         user,
         Arc::clone(&stats),
         buffer_pool,

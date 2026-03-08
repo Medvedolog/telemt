@@ -29,7 +29,10 @@ use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::config::{LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel};
+use crate::config::{
+    LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel,
+    MeWriterPickMode,
+};
 use super::load::ProxyConfig;
 
 // ── Hot fields ────────────────────────────────────────────────────────────────
@@ -57,6 +60,8 @@ pub struct HotFields {
     pub me_bind_stale_ttl_secs: u64,
     pub me_secret_atomic_snapshot: bool,
     pub me_deterministic_writer_sort: bool,
+    pub me_writer_pick_mode: MeWriterPickMode,
+    pub me_writer_pick_sample_size: u8,
     pub me_single_endpoint_shadow_writers: u8,
     pub me_single_endpoint_outage_mode_enabled: bool,
     pub me_single_endpoint_outage_disable_quarantine: bool,
@@ -78,10 +83,30 @@ pub struct HotFields {
     pub me_floor_mode: MeFloorMode,
     pub me_adaptive_floor_idle_secs: u64,
     pub me_adaptive_floor_min_writers_single_endpoint: u8,
+    pub me_adaptive_floor_min_writers_multi_endpoint: u8,
     pub me_adaptive_floor_recover_grace_secs: u64,
+    pub me_adaptive_floor_writers_per_core_total: u16,
+    pub me_adaptive_floor_cpu_cores_override: u16,
+    pub me_adaptive_floor_max_extra_writers_single_per_core: u16,
+    pub me_adaptive_floor_max_extra_writers_multi_per_core: u16,
+    pub me_adaptive_floor_max_active_writers_per_core: u16,
+    pub me_adaptive_floor_max_warm_writers_per_core: u16,
+    pub me_adaptive_floor_max_active_writers_global: u32,
+    pub me_adaptive_floor_max_warm_writers_global: u32,
     pub me_route_backpressure_base_timeout_ms: u64,
     pub me_route_backpressure_high_timeout_ms: u64,
     pub me_route_backpressure_high_watermark_pct: u8,
+    pub me_reader_route_data_wait_ms: u64,
+    pub me_d2c_flush_batch_max_frames: usize,
+    pub me_d2c_flush_batch_max_bytes: usize,
+    pub me_d2c_flush_batch_max_delay_us: u64,
+    pub me_d2c_ack_flush_immediate: bool,
+    pub direct_relay_copy_buf_c2s_bytes: usize,
+    pub direct_relay_copy_buf_s2c_bytes: usize,
+    pub me_health_interval_ms_unhealthy: u64,
+    pub me_health_interval_ms_healthy: u64,
+    pub me_admission_poll_ms: u64,
+    pub me_warn_rate_limit_ms: u64,
     pub users:                   std::collections::HashMap<String, String>,
     pub user_ad_tags:            std::collections::HashMap<String, String>,
     pub user_max_tcp_conns:      std::collections::HashMap<String, usize>,
@@ -117,6 +142,8 @@ impl HotFields {
             me_bind_stale_ttl_secs: cfg.general.me_bind_stale_ttl_secs,
             me_secret_atomic_snapshot: cfg.general.me_secret_atomic_snapshot,
             me_deterministic_writer_sort: cfg.general.me_deterministic_writer_sort,
+            me_writer_pick_mode: cfg.general.me_writer_pick_mode,
+            me_writer_pick_sample_size: cfg.general.me_writer_pick_sample_size,
             me_single_endpoint_shadow_writers: cfg.general.me_single_endpoint_shadow_writers,
             me_single_endpoint_outage_mode_enabled: cfg
                 .general
@@ -150,12 +177,50 @@ impl HotFields {
             me_adaptive_floor_min_writers_single_endpoint: cfg
                 .general
                 .me_adaptive_floor_min_writers_single_endpoint,
+            me_adaptive_floor_min_writers_multi_endpoint: cfg
+                .general
+                .me_adaptive_floor_min_writers_multi_endpoint,
             me_adaptive_floor_recover_grace_secs: cfg
                 .general
                 .me_adaptive_floor_recover_grace_secs,
+            me_adaptive_floor_writers_per_core_total: cfg
+                .general
+                .me_adaptive_floor_writers_per_core_total,
+            me_adaptive_floor_cpu_cores_override: cfg
+                .general
+                .me_adaptive_floor_cpu_cores_override,
+            me_adaptive_floor_max_extra_writers_single_per_core: cfg
+                .general
+                .me_adaptive_floor_max_extra_writers_single_per_core,
+            me_adaptive_floor_max_extra_writers_multi_per_core: cfg
+                .general
+                .me_adaptive_floor_max_extra_writers_multi_per_core,
+            me_adaptive_floor_max_active_writers_per_core: cfg
+                .general
+                .me_adaptive_floor_max_active_writers_per_core,
+            me_adaptive_floor_max_warm_writers_per_core: cfg
+                .general
+                .me_adaptive_floor_max_warm_writers_per_core,
+            me_adaptive_floor_max_active_writers_global: cfg
+                .general
+                .me_adaptive_floor_max_active_writers_global,
+            me_adaptive_floor_max_warm_writers_global: cfg
+                .general
+                .me_adaptive_floor_max_warm_writers_global,
             me_route_backpressure_base_timeout_ms: cfg.general.me_route_backpressure_base_timeout_ms,
             me_route_backpressure_high_timeout_ms: cfg.general.me_route_backpressure_high_timeout_ms,
             me_route_backpressure_high_watermark_pct: cfg.general.me_route_backpressure_high_watermark_pct,
+            me_reader_route_data_wait_ms: cfg.general.me_reader_route_data_wait_ms,
+            me_d2c_flush_batch_max_frames: cfg.general.me_d2c_flush_batch_max_frames,
+            me_d2c_flush_batch_max_bytes: cfg.general.me_d2c_flush_batch_max_bytes,
+            me_d2c_flush_batch_max_delay_us: cfg.general.me_d2c_flush_batch_max_delay_us,
+            me_d2c_ack_flush_immediate: cfg.general.me_d2c_ack_flush_immediate,
+            direct_relay_copy_buf_c2s_bytes: cfg.general.direct_relay_copy_buf_c2s_bytes,
+            direct_relay_copy_buf_s2c_bytes: cfg.general.direct_relay_copy_buf_s2c_bytes,
+            me_health_interval_ms_unhealthy: cfg.general.me_health_interval_ms_unhealthy,
+            me_health_interval_ms_healthy: cfg.general.me_health_interval_ms_healthy,
+            me_admission_poll_ms: cfg.general.me_admission_poll_ms,
+            me_warn_rate_limit_ms: cfg.general.me_warn_rate_limit_ms,
             users:                   cfg.access.users.clone(),
             user_ad_tags:            cfg.access.user_ad_tags.clone(),
             user_max_tcp_conns:      cfg.access.user_max_tcp_conns.clone(),
@@ -248,6 +313,8 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.general.me_bind_stale_ttl_secs = new.general.me_bind_stale_ttl_secs;
     cfg.general.me_secret_atomic_snapshot = new.general.me_secret_atomic_snapshot;
     cfg.general.me_deterministic_writer_sort = new.general.me_deterministic_writer_sort;
+    cfg.general.me_writer_pick_mode = new.general.me_writer_pick_mode;
+    cfg.general.me_writer_pick_sample_size = new.general.me_writer_pick_sample_size;
     cfg.general.me_single_endpoint_shadow_writers = new.general.me_single_endpoint_shadow_writers;
     cfg.general.me_single_endpoint_outage_mode_enabled =
         new.general.me_single_endpoint_outage_mode_enabled;
@@ -273,14 +340,43 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.general.me_adaptive_floor_idle_secs = new.general.me_adaptive_floor_idle_secs;
     cfg.general.me_adaptive_floor_min_writers_single_endpoint =
         new.general.me_adaptive_floor_min_writers_single_endpoint;
+    cfg.general.me_adaptive_floor_min_writers_multi_endpoint =
+        new.general.me_adaptive_floor_min_writers_multi_endpoint;
     cfg.general.me_adaptive_floor_recover_grace_secs =
         new.general.me_adaptive_floor_recover_grace_secs;
+    cfg.general.me_adaptive_floor_writers_per_core_total =
+        new.general.me_adaptive_floor_writers_per_core_total;
+    cfg.general.me_adaptive_floor_cpu_cores_override =
+        new.general.me_adaptive_floor_cpu_cores_override;
+    cfg.general.me_adaptive_floor_max_extra_writers_single_per_core =
+        new.general.me_adaptive_floor_max_extra_writers_single_per_core;
+    cfg.general.me_adaptive_floor_max_extra_writers_multi_per_core =
+        new.general.me_adaptive_floor_max_extra_writers_multi_per_core;
+    cfg.general.me_adaptive_floor_max_active_writers_per_core =
+        new.general.me_adaptive_floor_max_active_writers_per_core;
+    cfg.general.me_adaptive_floor_max_warm_writers_per_core =
+        new.general.me_adaptive_floor_max_warm_writers_per_core;
+    cfg.general.me_adaptive_floor_max_active_writers_global =
+        new.general.me_adaptive_floor_max_active_writers_global;
+    cfg.general.me_adaptive_floor_max_warm_writers_global =
+        new.general.me_adaptive_floor_max_warm_writers_global;
     cfg.general.me_route_backpressure_base_timeout_ms =
         new.general.me_route_backpressure_base_timeout_ms;
     cfg.general.me_route_backpressure_high_timeout_ms =
         new.general.me_route_backpressure_high_timeout_ms;
     cfg.general.me_route_backpressure_high_watermark_pct =
         new.general.me_route_backpressure_high_watermark_pct;
+    cfg.general.me_reader_route_data_wait_ms = new.general.me_reader_route_data_wait_ms;
+    cfg.general.me_d2c_flush_batch_max_frames = new.general.me_d2c_flush_batch_max_frames;
+    cfg.general.me_d2c_flush_batch_max_bytes = new.general.me_d2c_flush_batch_max_bytes;
+    cfg.general.me_d2c_flush_batch_max_delay_us = new.general.me_d2c_flush_batch_max_delay_us;
+    cfg.general.me_d2c_ack_flush_immediate = new.general.me_d2c_ack_flush_immediate;
+    cfg.general.direct_relay_copy_buf_c2s_bytes = new.general.direct_relay_copy_buf_c2s_bytes;
+    cfg.general.direct_relay_copy_buf_s2c_bytes = new.general.direct_relay_copy_buf_s2c_bytes;
+    cfg.general.me_health_interval_ms_unhealthy = new.general.me_health_interval_ms_unhealthy;
+    cfg.general.me_health_interval_ms_healthy = new.general.me_health_interval_ms_healthy;
+    cfg.general.me_admission_poll_ms = new.general.me_admission_poll_ms;
+    cfg.general.me_warn_rate_limit_ms = new.general.me_warn_rate_limit_ms;
 
     cfg.access.users = new.access.users.clone();
     cfg.access.user_ad_tags = new.access.user_ad_tags.clone();
@@ -617,11 +713,15 @@ fn log_changes(
     }
     if old_hot.me_secret_atomic_snapshot != new_hot.me_secret_atomic_snapshot
         || old_hot.me_deterministic_writer_sort != new_hot.me_deterministic_writer_sort
+        || old_hot.me_writer_pick_mode != new_hot.me_writer_pick_mode
+        || old_hot.me_writer_pick_sample_size != new_hot.me_writer_pick_sample_size
     {
         info!(
-            "config reload: me_runtime_flags: secret_atomic_snapshot={} deterministic_sort={}",
+            "config reload: me_runtime_flags: secret_atomic_snapshot={} deterministic_sort={} writer_pick_mode={:?} writer_pick_sample_size={}",
             new_hot.me_secret_atomic_snapshot,
-            new_hot.me_deterministic_writer_sort
+            new_hot.me_deterministic_writer_sort,
+            new_hot.me_writer_pick_mode,
+            new_hot.me_writer_pick_sample_size,
         );
     }
     if old_hot.me_single_endpoint_shadow_writers != new_hot.me_single_endpoint_shadow_writers
@@ -697,15 +797,42 @@ fn log_changes(
         || old_hot.me_adaptive_floor_idle_secs != new_hot.me_adaptive_floor_idle_secs
         || old_hot.me_adaptive_floor_min_writers_single_endpoint
             != new_hot.me_adaptive_floor_min_writers_single_endpoint
+        || old_hot.me_adaptive_floor_min_writers_multi_endpoint
+            != new_hot.me_adaptive_floor_min_writers_multi_endpoint
         || old_hot.me_adaptive_floor_recover_grace_secs
             != new_hot.me_adaptive_floor_recover_grace_secs
+        || old_hot.me_adaptive_floor_writers_per_core_total
+            != new_hot.me_adaptive_floor_writers_per_core_total
+        || old_hot.me_adaptive_floor_cpu_cores_override
+            != new_hot.me_adaptive_floor_cpu_cores_override
+        || old_hot.me_adaptive_floor_max_extra_writers_single_per_core
+            != new_hot.me_adaptive_floor_max_extra_writers_single_per_core
+        || old_hot.me_adaptive_floor_max_extra_writers_multi_per_core
+            != new_hot.me_adaptive_floor_max_extra_writers_multi_per_core
+        || old_hot.me_adaptive_floor_max_active_writers_per_core
+            != new_hot.me_adaptive_floor_max_active_writers_per_core
+        || old_hot.me_adaptive_floor_max_warm_writers_per_core
+            != new_hot.me_adaptive_floor_max_warm_writers_per_core
+        || old_hot.me_adaptive_floor_max_active_writers_global
+            != new_hot.me_adaptive_floor_max_active_writers_global
+        || old_hot.me_adaptive_floor_max_warm_writers_global
+            != new_hot.me_adaptive_floor_max_warm_writers_global
     {
         info!(
-            "config reload: me_floor: mode={:?} idle={}s min_single={} recover_grace={}s",
+            "config reload: me_floor: mode={:?} idle={}s min_single={} min_multi={} recover_grace={}s per_core_total={} cores_override={} extra_single_per_core={} extra_multi_per_core={} max_active_per_core={} max_warm_per_core={} max_active_global={} max_warm_global={}",
             new_hot.me_floor_mode,
             new_hot.me_adaptive_floor_idle_secs,
             new_hot.me_adaptive_floor_min_writers_single_endpoint,
+            new_hot.me_adaptive_floor_min_writers_multi_endpoint,
             new_hot.me_adaptive_floor_recover_grace_secs,
+            new_hot.me_adaptive_floor_writers_per_core_total,
+            new_hot.me_adaptive_floor_cpu_cores_override,
+            new_hot.me_adaptive_floor_max_extra_writers_single_per_core,
+            new_hot.me_adaptive_floor_max_extra_writers_multi_per_core,
+            new_hot.me_adaptive_floor_max_active_writers_per_core,
+            new_hot.me_adaptive_floor_max_warm_writers_per_core,
+            new_hot.me_adaptive_floor_max_active_writers_global,
+            new_hot.me_adaptive_floor_max_warm_writers_global,
         );
     }
 
@@ -715,12 +842,41 @@ fn log_changes(
             != new_hot.me_route_backpressure_high_timeout_ms
         || old_hot.me_route_backpressure_high_watermark_pct
             != new_hot.me_route_backpressure_high_watermark_pct
+        || old_hot.me_reader_route_data_wait_ms != new_hot.me_reader_route_data_wait_ms
+        || old_hot.me_health_interval_ms_unhealthy
+            != new_hot.me_health_interval_ms_unhealthy
+        || old_hot.me_health_interval_ms_healthy != new_hot.me_health_interval_ms_healthy
+        || old_hot.me_admission_poll_ms != new_hot.me_admission_poll_ms
+        || old_hot.me_warn_rate_limit_ms != new_hot.me_warn_rate_limit_ms
     {
         info!(
-            "config reload: me_route_backpressure: base={}ms high={}ms watermark={}%",
+            "config reload: me_route_backpressure: base={}ms high={}ms watermark={}%; me_reader_route_data_wait_ms={}; me_health_interval: unhealthy={}ms healthy={}ms; me_admission_poll={}ms; me_warn_rate_limit={}ms",
             new_hot.me_route_backpressure_base_timeout_ms,
             new_hot.me_route_backpressure_high_timeout_ms,
             new_hot.me_route_backpressure_high_watermark_pct,
+            new_hot.me_reader_route_data_wait_ms,
+            new_hot.me_health_interval_ms_unhealthy,
+            new_hot.me_health_interval_ms_healthy,
+            new_hot.me_admission_poll_ms,
+            new_hot.me_warn_rate_limit_ms,
+        );
+    }
+
+    if old_hot.me_d2c_flush_batch_max_frames != new_hot.me_d2c_flush_batch_max_frames
+        || old_hot.me_d2c_flush_batch_max_bytes != new_hot.me_d2c_flush_batch_max_bytes
+        || old_hot.me_d2c_flush_batch_max_delay_us != new_hot.me_d2c_flush_batch_max_delay_us
+        || old_hot.me_d2c_ack_flush_immediate != new_hot.me_d2c_ack_flush_immediate
+        || old_hot.direct_relay_copy_buf_c2s_bytes != new_hot.direct_relay_copy_buf_c2s_bytes
+        || old_hot.direct_relay_copy_buf_s2c_bytes != new_hot.direct_relay_copy_buf_s2c_bytes
+    {
+        info!(
+            "config reload: relay_tuning: me_d2c_frames={} me_d2c_bytes={} me_d2c_delay_us={} me_ack_flush_immediate={} direct_buf_c2s={} direct_buf_s2c={}",
+            new_hot.me_d2c_flush_batch_max_frames,
+            new_hot.me_d2c_flush_batch_max_bytes,
+            new_hot.me_d2c_flush_batch_max_delay_us,
+            new_hot.me_d2c_ack_flush_immediate,
+            new_hot.direct_relay_copy_buf_c2s_bytes,
+            new_hot.direct_relay_copy_buf_s2c_bytes,
         );
     }
 

@@ -2,9 +2,10 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 
-use crate::config::{MeFloorMode, ProxyConfig, UserMaxUniqueIpsMode};
+use crate::config::{MeFloorMode, MeWriterPickMode, ProxyConfig, UserMaxUniqueIpsMode};
 
 use super::ApiShared;
+use super::runtime_init::build_runtime_startup_summary;
 
 #[derive(Serialize)]
 pub(super) struct SystemInfoData {
@@ -34,6 +35,9 @@ pub(super) struct RuntimeGatesData {
     pub(super) me_runtime_ready: bool,
     pub(super) me2dc_fallback_enabled: bool,
     pub(super) use_middle_proxy: bool,
+    pub(super) startup_status: &'static str,
+    pub(super) startup_stage: String,
+    pub(super) startup_progress_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -60,11 +64,22 @@ pub(super) struct EffectiveMiddleProxyLimits {
     pub(super) floor_mode: &'static str,
     pub(super) adaptive_floor_idle_secs: u64,
     pub(super) adaptive_floor_min_writers_single_endpoint: u8,
+    pub(super) adaptive_floor_min_writers_multi_endpoint: u8,
     pub(super) adaptive_floor_recover_grace_secs: u64,
+    pub(super) adaptive_floor_writers_per_core_total: u16,
+    pub(super) adaptive_floor_cpu_cores_override: u16,
+    pub(super) adaptive_floor_max_extra_writers_single_per_core: u16,
+    pub(super) adaptive_floor_max_extra_writers_multi_per_core: u16,
+    pub(super) adaptive_floor_max_active_writers_per_core: u16,
+    pub(super) adaptive_floor_max_warm_writers_per_core: u16,
+    pub(super) adaptive_floor_max_active_writers_global: u32,
+    pub(super) adaptive_floor_max_warm_writers_global: u32,
     pub(super) reconnect_max_concurrent_per_dc: u32,
     pub(super) reconnect_backoff_base_ms: u64,
     pub(super) reconnect_backoff_cap_ms: u64,
     pub(super) reconnect_fast_retry_count: u32,
+    pub(super) writer_pick_mode: &'static str,
+    pub(super) writer_pick_sample_size: u8,
     pub(super) me2dc_fallback: bool,
 }
 
@@ -137,12 +152,18 @@ pub(super) fn build_system_info_data(
     }
 }
 
-pub(super) fn build_runtime_gates_data(shared: &ApiShared, cfg: &ProxyConfig) -> RuntimeGatesData {
+pub(super) async fn build_runtime_gates_data(
+    shared: &ApiShared,
+    cfg: &ProxyConfig,
+) -> RuntimeGatesData {
+    let startup_summary = build_runtime_startup_summary(shared).await;
     let me_runtime_ready = if !cfg.general.use_middle_proxy {
         true
     } else {
         shared
             .me_pool
+            .read()
+            .await
             .as_ref()
             .map(|pool| pool.is_runtime_ready())
             .unwrap_or(false)
@@ -154,6 +175,9 @@ pub(super) fn build_runtime_gates_data(shared: &ApiShared, cfg: &ProxyConfig) ->
         me_runtime_ready,
         me2dc_fallback_enabled: cfg.general.me2dc_fallback,
         use_middle_proxy: cfg.general.use_middle_proxy,
+        startup_status: startup_summary.status,
+        startup_stage: startup_summary.stage,
+        startup_progress_pct: startup_summary.progress_pct,
     }
 }
 
@@ -183,11 +207,40 @@ pub(super) fn build_limits_effective_data(cfg: &ProxyConfig) -> EffectiveLimitsD
             adaptive_floor_min_writers_single_endpoint: cfg
                 .general
                 .me_adaptive_floor_min_writers_single_endpoint,
+            adaptive_floor_min_writers_multi_endpoint: cfg
+                .general
+                .me_adaptive_floor_min_writers_multi_endpoint,
             adaptive_floor_recover_grace_secs: cfg.general.me_adaptive_floor_recover_grace_secs,
+            adaptive_floor_writers_per_core_total: cfg
+                .general
+                .me_adaptive_floor_writers_per_core_total,
+            adaptive_floor_cpu_cores_override: cfg
+                .general
+                .me_adaptive_floor_cpu_cores_override,
+            adaptive_floor_max_extra_writers_single_per_core: cfg
+                .general
+                .me_adaptive_floor_max_extra_writers_single_per_core,
+            adaptive_floor_max_extra_writers_multi_per_core: cfg
+                .general
+                .me_adaptive_floor_max_extra_writers_multi_per_core,
+            adaptive_floor_max_active_writers_per_core: cfg
+                .general
+                .me_adaptive_floor_max_active_writers_per_core,
+            adaptive_floor_max_warm_writers_per_core: cfg
+                .general
+                .me_adaptive_floor_max_warm_writers_per_core,
+            adaptive_floor_max_active_writers_global: cfg
+                .general
+                .me_adaptive_floor_max_active_writers_global,
+            adaptive_floor_max_warm_writers_global: cfg
+                .general
+                .me_adaptive_floor_max_warm_writers_global,
             reconnect_max_concurrent_per_dc: cfg.general.me_reconnect_max_concurrent_per_dc,
             reconnect_backoff_base_ms: cfg.general.me_reconnect_backoff_base_ms,
             reconnect_backoff_cap_ms: cfg.general.me_reconnect_backoff_cap_ms,
             reconnect_fast_retry_count: cfg.general.me_reconnect_fast_retry_count,
+            writer_pick_mode: me_writer_pick_mode_label(cfg.general.me_writer_pick_mode),
+            writer_pick_sample_size: cfg.general.me_writer_pick_sample_size,
             me2dc_fallback: cfg.general.me2dc_fallback,
         },
         user_ip_policy: EffectiveUserIpPolicyLimits {
@@ -223,5 +276,12 @@ fn me_floor_mode_label(mode: MeFloorMode) -> &'static str {
     match mode {
         MeFloorMode::Static => "static",
         MeFloorMode::Adaptive => "adaptive",
+    }
+}
+
+fn me_writer_pick_mode_label(mode: MeWriterPickMode) -> &'static str {
+    match mode {
+        MeWriterPickMode::SortedRr => "sorted_rr",
+        MeWriterPickMode::P2c => "p2c",
     }
 }

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
@@ -18,6 +19,7 @@ pub struct UserIpTracker {
     max_ips: Arc<RwLock<HashMap<String, usize>>>,
     limit_mode: Arc<RwLock<UserMaxUniqueIpsMode>>,
     limit_window: Arc<RwLock<Duration>>,
+    last_compact_epoch_secs: Arc<AtomicU64>,
 }
 
 impl UserIpTracker {
@@ -28,6 +30,54 @@ impl UserIpTracker {
             max_ips: Arc::new(RwLock::new(HashMap::new())),
             limit_mode: Arc::new(RwLock::new(UserMaxUniqueIpsMode::ActiveWindow)),
             limit_window: Arc::new(RwLock::new(Duration::from_secs(30))),
+            last_compact_epoch_secs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn now_epoch_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    async fn maybe_compact_empty_users(&self) {
+        const COMPACT_INTERVAL_SECS: u64 = 60;
+        let now_epoch_secs = Self::now_epoch_secs();
+        let last_compact_epoch_secs = self.last_compact_epoch_secs.load(Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(last_compact_epoch_secs) < COMPACT_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .last_compact_epoch_secs
+            .compare_exchange(
+                last_compact_epoch_secs,
+                now_epoch_secs,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let mut active_ips = self.active_ips.write().await;
+        let mut recent_ips = self.recent_ips.write().await;
+        let mut users = Vec::<String>::with_capacity(active_ips.len().saturating_add(recent_ips.len()));
+        users.extend(active_ips.keys().cloned());
+        for user in recent_ips.keys() {
+            if !active_ips.contains_key(user) {
+                users.push(user.clone());
+            }
+        }
+
+        for user in users {
+            let active_empty = active_ips.get(&user).map(|ips| ips.is_empty()).unwrap_or(true);
+            let recent_empty = recent_ips.get(&user).map(|ips| ips.is_empty()).unwrap_or(true);
+            if active_empty && recent_empty {
+                active_ips.remove(&user);
+                recent_ips.remove(&user);
+            }
         }
     }
 
@@ -63,6 +113,7 @@ impl UserIpTracker {
     }
 
     pub async fn check_and_add(&self, username: &str, ip: IpAddr) -> Result<(), String> {
+        self.maybe_compact_empty_users().await;
         let limit = {
             let max_ips = self.max_ips.read().await;
             max_ips.get(username).copied()
@@ -116,6 +167,7 @@ impl UserIpTracker {
     }
 
     pub async fn remove_ip(&self, username: &str, ip: IpAddr) {
+        self.maybe_compact_empty_users().await;
         let mut active_ips = self.active_ips.write().await;
         if let Some(user_ips) = active_ips.get_mut(username) {
             if let Some(count) = user_ips.get_mut(&ip) {

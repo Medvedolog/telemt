@@ -1,13 +1,16 @@
 [Unit]
 Description=Telemt
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/bin
+WorkingDirectory=/etc/telemt
 ExecStart=/bin/telemt /etc/telemt.toml
 Restart=on-failure
-LimitNOFILE=65536
+LimitNOFILE=262144
+TasksMax=8192
+MemoryAccounting=yes
 
 [Install]
 WantedBy=multi-user.target

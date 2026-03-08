@@ -62,7 +62,7 @@ impl MePool {
 
     fn coverage_ratio(
         desired_by_dc: &HashMap<i32, HashSet<SocketAddr>>,
-        active_writer_addrs: &HashSet<SocketAddr>,
+        active_writer_addrs: &HashSet<(i32, SocketAddr)>,
     ) -> (f32, Vec<i32>) {
         if desired_by_dc.is_empty() {
             return (1.0, Vec::new());
@@ -76,7 +76,7 @@ impl MePool {
             }
             if endpoints
                 .iter()
-                .any(|addr| active_writer_addrs.contains(addr))
+                .any(|addr| active_writer_addrs.contains(&(*dc, *addr)))
             {
                 covered += 1;
             } else {
@@ -91,32 +91,25 @@ impl MePool {
     }
 
     pub async fn reconcile_connections(self: &Arc<Self>, rng: &SecureRandom) {
-        let writers = self.writers.read().await;
-        let current: HashSet<SocketAddr> = writers
-            .iter()
-            .filter(|w| !w.draining.load(Ordering::Relaxed))
-            .map(|w| w.addr)
-            .collect();
-        drop(writers);
-
         for family in self.family_order() {
             let map = self.proxy_map_for_family(family).await;
-            for (_dc, addrs) in &map {
+            for (dc, addrs) in &map {
                 let dc_addrs: Vec<SocketAddr> = addrs
                     .iter()
                     .map(|(ip, port)| SocketAddr::new(*ip, *port))
                     .collect();
-                if !dc_addrs.iter().any(|a| current.contains(a)) {
+                let dc_endpoints: HashSet<SocketAddr> = dc_addrs.iter().copied().collect();
+                if self.active_writer_count_for_dc_endpoints(*dc, &dc_endpoints).await == 0 {
                     let mut shuffled = dc_addrs.clone();
                     shuffled.shuffle(&mut rand::rng());
                     for addr in shuffled {
-                        if self.connect_one(addr, rng).await.is_ok() {
+                        if self.connect_one_for_dc(addr, *dc, rng).await.is_ok() {
                             break;
                         }
                     }
                 }
             }
-            if !self.decision.effective_multipath && !current.is_empty() {
+            if !self.decision.effective_multipath && self.connection_count() > 0 {
                 break;
             }
         }
@@ -174,26 +167,30 @@ impl MePool {
         core.saturating_add(rand::rng().random_range(0..=jitter))
     }
 
-    async fn fresh_writer_count_for_endpoints(
+    async fn fresh_writer_count_for_dc_endpoints(
         &self,
         generation: u64,
+        dc: i32,
         endpoints: &HashSet<SocketAddr>,
     ) -> usize {
         let ws = self.writers.read().await;
         ws.iter()
             .filter(|w| !w.draining.load(Ordering::Relaxed))
             .filter(|w| w.generation == generation)
+            .filter(|w| w.writer_dc == dc)
             .filter(|w| endpoints.contains(&w.addr))
             .count()
     }
 
-    pub(super) async fn active_writer_count_for_endpoints(
+    pub(super) async fn active_writer_count_for_dc_endpoints(
         &self,
+        dc: i32,
         endpoints: &HashSet<SocketAddr>,
     ) -> usize {
         let ws = self.writers.read().await;
         ws.iter()
             .filter(|w| !w.draining.load(Ordering::Relaxed))
+            .filter(|w| w.writer_dc == dc)
             .filter(|w| endpoints.contains(&w.addr))
             .count()
     }
@@ -220,7 +217,7 @@ impl MePool {
             let required = self.required_writers_for_dc(endpoint_list.len());
             let mut completed = false;
             let mut last_fresh_count = self
-                .fresh_writer_count_for_endpoints(generation, endpoints)
+                .fresh_writer_count_for_dc_endpoints(generation, *dc, endpoints)
                 .await;
 
             for pass_idx in 0..total_passes {
@@ -247,10 +244,12 @@ impl MePool {
 
                     let connected = self
                         .connect_endpoints_round_robin_with_generation_contour(
+                            *dc,
                             &endpoint_list,
                             rng,
                             generation,
                             WriterContour::Warm,
+                            false,
                         )
                         .await;
                     debug!(
@@ -265,7 +264,7 @@ impl MePool {
                 }
 
                 last_fresh_count = self
-                    .fresh_writer_count_for_endpoints(generation, endpoints)
+                    .fresh_writer_count_for_dc_endpoints(generation, *dc, endpoints)
                     .await;
                 if last_fresh_count >= required {
                     completed = true;
@@ -377,10 +376,10 @@ impl MePool {
         }
 
         let writers = self.writers.read().await;
-        let active_writer_addrs: HashSet<SocketAddr> = writers
+        let active_writer_addrs: HashSet<(i32, SocketAddr)> = writers
             .iter()
             .filter(|w| !w.draining.load(Ordering::Relaxed))
-            .map(|w| w.addr)
+            .map(|w| (w.writer_dc, w.addr))
             .collect();
         let min_ratio = Self::permille_to_ratio(
             self.me_pool_min_fresh_ratio_permille
@@ -410,6 +409,7 @@ impl MePool {
                     .iter()
                     .filter(|w| !w.draining.load(Ordering::Relaxed))
                     .filter(|w| w.generation == generation)
+                    .filter(|w| w.writer_dc == *dc)
                     .filter(|w| endpoints.contains(&w.addr))
                     .count();
                 if fresh_count < required {
@@ -438,9 +438,9 @@ impl MePool {
             self.promote_warm_generation_to_active(generation).await;
         }
 
-        let desired_addrs: HashSet<SocketAddr> = desired_by_dc
-            .values()
-            .flat_map(|set| set.iter().copied())
+        let desired_addrs: HashSet<(i32, SocketAddr)> = desired_by_dc
+            .iter()
+            .flat_map(|(dc, set)| set.iter().copied().map(|addr| (*dc, addr)))
             .collect();
 
         let stale_writer_ids: Vec<u64> = writers
@@ -450,7 +450,7 @@ impl MePool {
                 if hardswap {
                     w.generation < generation
                 } else {
-                    !desired_addrs.contains(&w.addr)
+                    !desired_addrs.contains(&(w.writer_dc, w.addr))
                 }
             })
             .map(|w| w.id)

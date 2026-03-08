@@ -7,10 +7,10 @@ use crate::transport::UpstreamRouteKind;
 
 use super::ApiShared;
 use super::model::{
-    DcStatus, DcStatusData, MeWriterStatus, MeWritersData, MeWritersSummary, MinimalAllData,
-    MinimalAllPayload, MinimalDcPathData, MinimalMeRuntimeData, MinimalQuarantineData,
-    UpstreamDcStatus, UpstreamStatus, UpstreamSummaryData, UpstreamsData, ZeroAllData,
-    ZeroCodeCount, ZeroCoreData, ZeroDesyncData, ZeroMiddleProxyData, ZeroPoolData,
+    DcEndpointWriters, DcStatus, DcStatusData, MeWriterStatus, MeWritersData, MeWritersSummary,
+    MinimalAllData, MinimalAllPayload, MinimalDcPathData, MinimalMeRuntimeData,
+    MinimalQuarantineData, UpstreamDcStatus, UpstreamStatus, UpstreamSummaryData, UpstreamsData,
+    ZeroAllData, ZeroCodeCount, ZeroCoreData, ZeroDesyncData, ZeroMiddleProxyData, ZeroPoolData,
     ZeroUpstreamData,
 };
 
@@ -297,7 +297,7 @@ async fn get_minimal_payload_cached(
         }
     }
 
-    let pool = shared.me_pool.as_ref()?;
+    let pool = shared.me_pool.read().await.clone()?;
     let status = pool.api_status_snapshot().await;
     let runtime = pool.api_runtime_snapshot().await;
     let generated_at_epoch_secs = status.generated_at_epoch_secs;
@@ -346,9 +346,21 @@ async fn get_minimal_payload_cached(
                     .into_iter()
                     .map(|value| value.to_string())
                     .collect(),
+                endpoint_writers: entry
+                    .endpoint_writers
+                    .into_iter()
+                    .map(|coverage| DcEndpointWriters {
+                        endpoint: coverage.endpoint.to_string(),
+                        active_writers: coverage.active_writers,
+                    })
+                    .collect(),
                 available_endpoints: entry.available_endpoints,
                 available_pct: entry.available_pct,
                 required_writers: entry.required_writers,
+                floor_min: entry.floor_min,
+                floor_target: entry.floor_target,
+                floor_max: entry.floor_max,
+                floor_capped: entry.floor_capped,
                 alive_writers: entry.alive_writers,
                 coverage_pct: entry.coverage_pct,
                 rtt_ms: entry.rtt_ms,
@@ -366,7 +378,35 @@ async fn get_minimal_payload_cached(
         adaptive_floor_idle_secs: runtime.adaptive_floor_idle_secs,
         adaptive_floor_min_writers_single_endpoint: runtime
             .adaptive_floor_min_writers_single_endpoint,
+        adaptive_floor_min_writers_multi_endpoint: runtime
+            .adaptive_floor_min_writers_multi_endpoint,
         adaptive_floor_recover_grace_secs: runtime.adaptive_floor_recover_grace_secs,
+        adaptive_floor_writers_per_core_total: runtime
+            .adaptive_floor_writers_per_core_total,
+        adaptive_floor_cpu_cores_override: runtime.adaptive_floor_cpu_cores_override,
+        adaptive_floor_max_extra_writers_single_per_core: runtime
+            .adaptive_floor_max_extra_writers_single_per_core,
+        adaptive_floor_max_extra_writers_multi_per_core: runtime
+            .adaptive_floor_max_extra_writers_multi_per_core,
+        adaptive_floor_max_active_writers_per_core: runtime
+            .adaptive_floor_max_active_writers_per_core,
+        adaptive_floor_max_warm_writers_per_core: runtime
+            .adaptive_floor_max_warm_writers_per_core,
+        adaptive_floor_max_active_writers_global: runtime
+            .adaptive_floor_max_active_writers_global,
+        adaptive_floor_max_warm_writers_global: runtime
+            .adaptive_floor_max_warm_writers_global,
+        adaptive_floor_cpu_cores_detected: runtime.adaptive_floor_cpu_cores_detected,
+        adaptive_floor_cpu_cores_effective: runtime.adaptive_floor_cpu_cores_effective,
+        adaptive_floor_global_cap_raw: runtime.adaptive_floor_global_cap_raw,
+        adaptive_floor_global_cap_effective: runtime.adaptive_floor_global_cap_effective,
+        adaptive_floor_target_writers_total: runtime.adaptive_floor_target_writers_total,
+        adaptive_floor_active_cap_configured: runtime.adaptive_floor_active_cap_configured,
+        adaptive_floor_active_cap_effective: runtime.adaptive_floor_active_cap_effective,
+        adaptive_floor_warm_cap_configured: runtime.adaptive_floor_warm_cap_configured,
+        adaptive_floor_warm_cap_effective: runtime.adaptive_floor_warm_cap_effective,
+        adaptive_floor_active_writers_current: runtime.adaptive_floor_active_writers_current,
+        adaptive_floor_warm_writers_current: runtime.adaptive_floor_warm_writers_current,
         me_keepalive_enabled: runtime.me_keepalive_enabled,
         me_keepalive_interval_secs: runtime.me_keepalive_interval_secs,
         me_keepalive_jitter_secs: runtime.me_keepalive_jitter_secs,
@@ -390,6 +430,8 @@ async fn get_minimal_payload_cached(
         me_single_endpoint_shadow_rotate_every_secs: runtime
             .me_single_endpoint_shadow_rotate_every_secs,
         me_deterministic_writer_sort: runtime.me_deterministic_writer_sort,
+        me_writer_pick_mode: runtime.me_writer_pick_mode,
+        me_writer_pick_sample_size: runtime.me_writer_pick_sample_size,
         me_socks_kdf_policy: runtime.me_socks_kdf_policy,
         quarantined_endpoints_total: runtime.quarantined_endpoints.len(),
         quarantined_endpoints: runtime

@@ -691,6 +691,135 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
 
     let _ = writeln!(
         out,
+        "# HELP telemt_me_writer_pick_total ME writer-pick outcomes by mode and result"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_pick_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"sorted_rr\",result=\"success_try\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_sorted_rr_success_try_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"sorted_rr\",result=\"success_fallback\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_sorted_rr_success_fallback_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"sorted_rr\",result=\"full\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_sorted_rr_full_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"sorted_rr\",result=\"closed\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_sorted_rr_closed_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"sorted_rr\",result=\"no_candidate\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_sorted_rr_no_candidate_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"p2c\",result=\"success_try\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_p2c_success_try_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"p2c\",result=\"success_fallback\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_p2c_success_fallback_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"p2c\",result=\"full\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_p2c_full_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"p2c\",result=\"closed\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_p2c_closed_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_total{{mode=\"p2c\",result=\"no_candidate\"}} {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_p2c_no_candidate_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_pick_blocking_fallback_total ME writer-pick blocking fallback attempts"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_writer_pick_blocking_fallback_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_blocking_fallback_total {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_blocking_fallback_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_pick_mode_switch_total Writer-pick mode switches via runtime updates"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_pick_mode_switch_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_writer_pick_mode_switch_total {}",
+        if me_allows_normal {
+            stats.get_me_writer_pick_mode_switch_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_me_socks_kdf_policy_total SOCKS KDF policy outcomes"
     );
     let _ = writeln!(out, "# TYPE telemt_me_socks_kdf_policy_total counter");
@@ -964,6 +1093,229 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         "telemt_me_floor_mode_switch_total{{from=\"adaptive\",to=\"static\"}} {}",
         if me_allows_normal {
             stats.get_me_floor_mode_switch_adaptive_to_static_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_cpu_cores_detected Runtime detected logical CPU cores for adaptive floor"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_cpu_cores_detected gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_cpu_cores_detected {}",
+        if me_allows_normal {
+            stats.get_me_floor_cpu_cores_detected_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_cpu_cores_effective Runtime effective logical CPU cores for adaptive floor"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_cpu_cores_effective gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_cpu_cores_effective {}",
+        if me_allows_normal {
+            stats.get_me_floor_cpu_cores_effective_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_global_cap_raw Runtime raw global adaptive floor cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_global_cap_raw gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_global_cap_raw {}",
+        if me_allows_normal {
+            stats.get_me_floor_global_cap_raw_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_global_cap_effective Runtime effective global adaptive floor cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_global_cap_effective gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_global_cap_effective {}",
+        if me_allows_normal {
+            stats.get_me_floor_global_cap_effective_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_target_writers_total Runtime adaptive floor target writers total"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_target_writers_total gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_target_writers_total {}",
+        if me_allows_normal {
+            stats.get_me_floor_target_writers_total_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_active_cap_configured Runtime configured active writer cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_active_cap_configured gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_active_cap_configured {}",
+        if me_allows_normal {
+            stats.get_me_floor_active_cap_configured_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_active_cap_effective Runtime effective active writer cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_active_cap_effective gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_active_cap_effective {}",
+        if me_allows_normal {
+            stats.get_me_floor_active_cap_effective_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_warm_cap_configured Runtime configured warm writer cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_warm_cap_configured gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_warm_cap_configured {}",
+        if me_allows_normal {
+            stats.get_me_floor_warm_cap_configured_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_adaptive_floor_warm_cap_effective Runtime effective warm writer cap"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_adaptive_floor_warm_cap_effective gauge"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_adaptive_floor_warm_cap_effective {}",
+        if me_allows_normal {
+            stats.get_me_floor_warm_cap_effective_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writers_active_current Current non-draining active ME writers"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writers_active_current gauge");
+    let _ = writeln!(
+        out,
+        "telemt_me_writers_active_current {}",
+        if me_allows_normal {
+            stats.get_me_writers_active_current_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writers_warm_current Current non-draining warm ME writers"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writers_warm_current gauge");
+    let _ = writeln!(
+        out,
+        "telemt_me_writers_warm_current {}",
+        if me_allows_normal {
+            stats.get_me_writers_warm_current_gauge()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_floor_cap_block_total Reconnect attempts blocked by adaptive floor caps"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_floor_cap_block_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_floor_cap_block_total {}",
+        if me_allows_normal {
+            stats.get_me_floor_cap_block_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_floor_swap_idle_total Adaptive floor cap recovery via idle writer swap"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_floor_swap_idle_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_floor_swap_idle_total {}",
+        if me_allows_normal {
+            stats.get_me_floor_swap_idle_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_floor_swap_idle_failed_total Failed idle swap attempts under adaptive floor caps"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_floor_swap_idle_failed_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_floor_swap_idle_failed_total {}",
+        if me_allows_normal {
+            stats.get_me_floor_swap_idle_failed_total()
         } else {
             0
         }

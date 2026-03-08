@@ -260,7 +260,7 @@ pub(super) fn build_security_whitelist_data(cfg: &ProxyConfig) -> SecurityWhitel
 
 pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> RuntimeMePoolStateData {
     let now_epoch_secs = now_epoch_secs();
-    let Some(pool) = &shared.me_pool else {
+    let Some(pool) = shared.me_pool.read().await.clone() else {
         return RuntimeMePoolStateData {
             enabled: false,
             reason: Some(SOURCE_UNAVAILABLE_REASON),
@@ -350,7 +350,7 @@ pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> Runt
 
 pub(super) async fn build_runtime_me_quality_data(shared: &ApiShared) -> RuntimeMeQualityData {
     let now_epoch_secs = now_epoch_secs();
-    let Some(pool) = &shared.me_pool else {
+    let Some(pool) = shared.me_pool.read().await.clone() else {
         return RuntimeMeQualityData {
             enabled: false,
             reason: Some(SOURCE_UNAVAILABLE_REASON),
@@ -486,7 +486,7 @@ pub(super) async fn build_runtime_upstream_quality_data(
 
 pub(super) async fn build_runtime_nat_stun_data(shared: &ApiShared) -> RuntimeNatStunData {
     let now_epoch_secs = now_epoch_secs();
-    let Some(pool) = &shared.me_pool else {
+    let Some(pool) = shared.me_pool.read().await.clone() else {
         return RuntimeNatStunData {
             enabled: false,
             reason: Some(SOURCE_UNAVAILABLE_REASON),

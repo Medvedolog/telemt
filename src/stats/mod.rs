@@ -6,7 +6,7 @@ pub mod beobachten;
 pub mod telemetry;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use lru::LruCache;
@@ -16,7 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use tracing::debug;
 
-use crate::config::MeTelemetryLevel;
+use crate::config::{MeTelemetryLevel, MeWriterPickMode};
 use self::telemetry::TelemetryPolicy;
 
 // ============= Stats =============
@@ -75,12 +75,38 @@ pub struct Stats {
     me_floor_mode_switch_total: AtomicU64,
     me_floor_mode_switch_static_to_adaptive_total: AtomicU64,
     me_floor_mode_switch_adaptive_to_static_total: AtomicU64,
+    me_floor_cpu_cores_detected_gauge: AtomicU64,
+    me_floor_cpu_cores_effective_gauge: AtomicU64,
+    me_floor_global_cap_raw_gauge: AtomicU64,
+    me_floor_global_cap_effective_gauge: AtomicU64,
+    me_floor_target_writers_total_gauge: AtomicU64,
+    me_floor_active_cap_configured_gauge: AtomicU64,
+    me_floor_active_cap_effective_gauge: AtomicU64,
+    me_floor_warm_cap_configured_gauge: AtomicU64,
+    me_floor_warm_cap_effective_gauge: AtomicU64,
+    me_writers_active_current_gauge: AtomicU64,
+    me_writers_warm_current_gauge: AtomicU64,
+    me_floor_cap_block_total: AtomicU64,
+    me_floor_swap_idle_total: AtomicU64,
+    me_floor_swap_idle_failed_total: AtomicU64,
     me_handshake_error_codes: DashMap<i32, AtomicU64>,
     me_route_drop_no_conn: AtomicU64,
     me_route_drop_channel_closed: AtomicU64,
     me_route_drop_queue_full: AtomicU64,
     me_route_drop_queue_full_base: AtomicU64,
     me_route_drop_queue_full_high: AtomicU64,
+    me_writer_pick_sorted_rr_success_try_total: AtomicU64,
+    me_writer_pick_sorted_rr_success_fallback_total: AtomicU64,
+    me_writer_pick_sorted_rr_full_total: AtomicU64,
+    me_writer_pick_sorted_rr_closed_total: AtomicU64,
+    me_writer_pick_sorted_rr_no_candidate_total: AtomicU64,
+    me_writer_pick_p2c_success_try_total: AtomicU64,
+    me_writer_pick_p2c_success_fallback_total: AtomicU64,
+    me_writer_pick_p2c_full_total: AtomicU64,
+    me_writer_pick_p2c_closed_total: AtomicU64,
+    me_writer_pick_p2c_no_candidate_total: AtomicU64,
+    me_writer_pick_blocking_fallback_total: AtomicU64,
+    me_writer_pick_mode_switch_total: AtomicU64,
     me_socks_kdf_strict_reject: AtomicU64,
     me_socks_kdf_compat_fallback: AtomicU64,
     secure_padding_invalid: AtomicU64,
@@ -111,6 +137,7 @@ pub struct Stats {
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
     user_stats: DashMap<String, UserStats>,
+    user_stats_last_cleanup_epoch_secs: AtomicU64,
     start_time: parking_lot::RwLock<Option<Instant>>,
 }
 
@@ -122,6 +149,7 @@ pub struct UserStats {
     pub octets_to_client: AtomicU64,
     pub msgs_from_client: AtomicU64,
     pub msgs_to_client: AtomicU64,
+    pub last_seen_epoch_secs: AtomicU64,
 }
 
 impl Stats {
@@ -168,6 +196,54 @@ impl Stats {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn touch_user_stats(stats: &UserStats) {
+        stats
+            .last_seen_epoch_secs
+            .store(Self::now_epoch_secs(), Ordering::Relaxed);
+    }
+
+    fn maybe_cleanup_user_stats(&self) {
+        const USER_STATS_CLEANUP_INTERVAL_SECS: u64 = 60;
+        const USER_STATS_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
+
+        let now_epoch_secs = Self::now_epoch_secs();
+        let last_cleanup_epoch_secs = self
+            .user_stats_last_cleanup_epoch_secs
+            .load(Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(last_cleanup_epoch_secs)
+            < USER_STATS_CLEANUP_INTERVAL_SECS
+        {
+            return;
+        }
+        if self
+            .user_stats_last_cleanup_epoch_secs
+            .compare_exchange(
+                last_cleanup_epoch_secs,
+                now_epoch_secs,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        self.user_stats.retain(|_, stats| {
+            if stats.curr_connects.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            let last_seen_epoch_secs = stats.last_seen_epoch_secs.load(Ordering::Relaxed);
+            now_epoch_secs.saturating_sub(last_seen_epoch_secs) <= USER_STATS_IDLE_TTL_SECS
+        });
     }
 
     pub fn apply_telemetry_policy(&self, policy: TelemetryPolicy) {
@@ -433,6 +509,93 @@ impl Stats {
             self.me_route_drop_queue_full_high.fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_writer_pick_success_try_total(&self, mode: MeWriterPickMode) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match mode {
+            MeWriterPickMode::SortedRr => {
+                self.me_writer_pick_sorted_rr_success_try_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MeWriterPickMode::P2c => {
+                self.me_writer_pick_p2c_success_try_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn increment_me_writer_pick_success_fallback_total(&self, mode: MeWriterPickMode) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match mode {
+            MeWriterPickMode::SortedRr => {
+                self.me_writer_pick_sorted_rr_success_fallback_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MeWriterPickMode::P2c => {
+                self.me_writer_pick_p2c_success_fallback_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn increment_me_writer_pick_full_total(&self, mode: MeWriterPickMode) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match mode {
+            MeWriterPickMode::SortedRr => {
+                self.me_writer_pick_sorted_rr_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MeWriterPickMode::P2c => {
+                self.me_writer_pick_p2c_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn increment_me_writer_pick_closed_total(&self, mode: MeWriterPickMode) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match mode {
+            MeWriterPickMode::SortedRr => {
+                self.me_writer_pick_sorted_rr_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MeWriterPickMode::P2c => {
+                self.me_writer_pick_p2c_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn increment_me_writer_pick_no_candidate_total(&self, mode: MeWriterPickMode) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match mode {
+            MeWriterPickMode::SortedRr => {
+                self.me_writer_pick_sorted_rr_no_candidate_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MeWriterPickMode::P2c => {
+                self.me_writer_pick_p2c_no_candidate_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn increment_me_writer_pick_blocking_fallback_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_writer_pick_blocking_fallback_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_writer_pick_mode_switch_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_writer_pick_mode_switch_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_socks_kdf_strict_reject(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_socks_kdf_strict_reject.fetch_add(1, Ordering::Relaxed);
@@ -676,6 +839,88 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn set_me_floor_cpu_cores_detected_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_cpu_cores_detected_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_cpu_cores_effective_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_cpu_cores_effective_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_global_cap_raw_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_global_cap_raw_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_global_cap_effective_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_global_cap_effective_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_target_writers_total_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_target_writers_total_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_active_cap_configured_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_active_cap_configured_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_active_cap_effective_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_active_cap_effective_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_warm_cap_configured_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_warm_cap_configured_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_floor_warm_cap_effective_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_warm_cap_effective_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_writers_active_current_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_writers_active_current_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn set_me_writers_warm_current_gauge(&self, value: u64) {
+        if self.telemetry_me_allows_normal() {
+            self.me_writers_warm_current_gauge
+                .store(value, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_cap_block_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_cap_block_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_swap_idle_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_swap_idle_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_floor_swap_idle_failed_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_floor_swap_idle_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn get_connects_all(&self) -> u64 { self.connects_all.load(Ordering::Relaxed) }
     pub fn get_connects_bad(&self) -> u64 { self.connects_bad.load(Ordering::Relaxed) }
     pub fn get_current_connections_direct(&self) -> u64 {
@@ -781,6 +1026,58 @@ impl Stats {
         self.me_floor_mode_switch_adaptive_to_static_total
             .load(Ordering::Relaxed)
     }
+    pub fn get_me_floor_cpu_cores_detected_gauge(&self) -> u64 {
+        self.me_floor_cpu_cores_detected_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_cpu_cores_effective_gauge(&self) -> u64 {
+        self.me_floor_cpu_cores_effective_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_global_cap_raw_gauge(&self) -> u64 {
+        self.me_floor_global_cap_raw_gauge.load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_global_cap_effective_gauge(&self) -> u64 {
+        self.me_floor_global_cap_effective_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_target_writers_total_gauge(&self) -> u64 {
+        self.me_floor_target_writers_total_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_active_cap_configured_gauge(&self) -> u64 {
+        self.me_floor_active_cap_configured_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_active_cap_effective_gauge(&self) -> u64 {
+        self.me_floor_active_cap_effective_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_warm_cap_configured_gauge(&self) -> u64 {
+        self.me_floor_warm_cap_configured_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_warm_cap_effective_gauge(&self) -> u64 {
+        self.me_floor_warm_cap_effective_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writers_active_current_gauge(&self) -> u64 {
+        self.me_writers_active_current_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writers_warm_current_gauge(&self) -> u64 {
+        self.me_writers_warm_current_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_cap_block_total(&self) -> u64 {
+        self.me_floor_cap_block_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_swap_idle_total(&self) -> u64 {
+        self.me_floor_swap_idle_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_floor_swap_idle_failed_total(&self) -> u64 {
+        self.me_floor_swap_idle_failed_total.load(Ordering::Relaxed)
+    }
     pub fn get_me_handshake_error_code_counts(&self) -> Vec<(i32, u64)> {
         let mut out: Vec<(i32, u64)> = self
             .me_handshake_error_codes
@@ -802,6 +1099,52 @@ impl Stats {
     }
     pub fn get_me_route_drop_queue_full_high(&self) -> u64 {
         self.me_route_drop_queue_full_high.load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_sorted_rr_success_try_total(&self) -> u64 {
+        self.me_writer_pick_sorted_rr_success_try_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_sorted_rr_success_fallback_total(&self) -> u64 {
+        self.me_writer_pick_sorted_rr_success_fallback_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_sorted_rr_full_total(&self) -> u64 {
+        self.me_writer_pick_sorted_rr_full_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_sorted_rr_closed_total(&self) -> u64 {
+        self.me_writer_pick_sorted_rr_closed_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_sorted_rr_no_candidate_total(&self) -> u64 {
+        self.me_writer_pick_sorted_rr_no_candidate_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_p2c_success_try_total(&self) -> u64 {
+        self.me_writer_pick_p2c_success_try_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_p2c_success_fallback_total(&self) -> u64 {
+        self.me_writer_pick_p2c_success_fallback_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_p2c_full_total(&self) -> u64 {
+        self.me_writer_pick_p2c_full_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_p2c_closed_total(&self) -> u64 {
+        self.me_writer_pick_p2c_closed_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_p2c_no_candidate_total(&self) -> u64 {
+        self.me_writer_pick_p2c_no_candidate_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_blocking_fallback_total(&self) -> u64 {
+        self.me_writer_pick_blocking_fallback_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_pick_mode_switch_total(&self) -> u64 {
+        self.me_writer_pick_mode_switch_total
+            .load(Ordering::Relaxed)
     }
     pub fn get_me_socks_kdf_strict_reject(&self) -> u64 {
         self.me_socks_kdf_strict_reject.load(Ordering::Relaxed)
@@ -888,34 +1231,36 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.connects.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .connects
-            .fetch_add(1, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.connects.fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_curr_connects(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.curr_connects.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .curr_connects
-            .fetch_add(1, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.curr_connects.fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn decrement_user_curr_connects(&self, user: &str) {
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             let counter = &stats.curr_connects;
             let mut current = counter.load(Ordering::Relaxed);
             loop {
@@ -945,60 +1290,60 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .octets_from_client
-            .fetch_add(bytes, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn add_user_octets_to(&self, user: &str, bytes: u64) {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .octets_to_client
-            .fetch_add(bytes, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_from(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .msgs_from_client
-            .fetch_add(1, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn increment_user_msgs_to(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
+        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
+            Self::touch_user_stats(stats.value());
             stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.user_stats
-            .entry(user.to_string())
-            .or_default()
-            .msgs_to_client
-            .fetch_add(1, Ordering::Relaxed);
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+        stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
     }
     
     pub fn get_user_total_octets(&self, user: &str) -> u64 {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 #[cfg(unix)]
@@ -26,6 +26,7 @@ mod protocol;
 mod proxy;
 mod stats;
 mod stream;
+mod startup;
 mod transport;
 mod tls_front;
 mod util;
@@ -39,6 +40,14 @@ use crate::proxy::ClientHandler;
 use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
+use crate::startup::{
+    COMPONENT_API_BOOTSTRAP, COMPONENT_CONFIG_LOAD, COMPONENT_CONFIG_WATCHER_START,
+    COMPONENT_DC_CONNECTIVITY_PING, COMPONENT_LISTENERS_BIND, COMPONENT_ME_CONNECTIVITY_PING,
+    COMPONENT_ME_POOL_CONSTRUCT, COMPONENT_ME_POOL_INIT_STAGE1, COMPONENT_ME_PROXY_CONFIG_V4,
+    COMPONENT_ME_PROXY_CONFIG_V6, COMPONENT_ME_SECRET_FETCH, COMPONENT_METRICS_START,
+    COMPONENT_NETWORK_PROBE, COMPONENT_RUNTIME_READY, COMPONENT_TLS_FRONT_BOOTSTRAP,
+    COMPONENT_TRACING_INIT, StartupMeStatus, StartupTracker,
+};
 use crate::stream::BufferPool;
 use crate::transport::middle_proxy::{
     MePool, ProxyConfigData, fetch_proxy_config_with_raw, format_me_route, format_sample_line,
@@ -373,6 +382,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let startup_tracker = Arc::new(StartupTracker::new(process_started_at_epoch_secs));
+    startup_tracker
+        .start_component(COMPONENT_CONFIG_LOAD, Some("load and validate config".to_string()))
+        .await;
     let (config_path, cli_silent, cli_log_level) = parse_cli();
 
     let mut config = match ProxyConfig::load(&config_path) {
@@ -399,6 +412,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         eprintln!("[telemt] Invalid network.dns_overrides: {}", e);
         std::process::exit(1);
     }
+    startup_tracker
+        .complete_component(COMPONENT_CONFIG_LOAD, Some("config is ready".to_string()))
+        .await;
 
     let has_rust_log = std::env::var("RUST_LOG").is_ok();
     let effective_log_level = if cli_silent {
@@ -410,6 +426,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
 
     let (filter_layer, filter_handle) = reload::Layer::new(EnvFilter::new("info"));
+    startup_tracker
+        .start_component(COMPONENT_TRACING_INIT, Some("initialize tracing subscriber".to_string()))
+        .await;
 
     // Configure color output based on config
     let fmt_layer = if config.general.disable_colors {
@@ -422,6 +441,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with(filter_layer)
         .with(fmt_layer)
         .init();
+    startup_tracker
+        .complete_component(COMPONENT_TRACING_INIT, Some("tracing initialized".to_string()))
+        .await;
 
     info!("Telemt MTProxy v{}", env!("CARGO_PKG_VERSION"));
     info!("Log level: {}", effective_log_level);
@@ -473,6 +495,95 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.general.upstream_connect_failfast_hard_errors,
         stats.clone(),
     ));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
+    ip_tracker
+        .set_limit_policy(
+            config.access.user_max_unique_ips_mode,
+            config.access.user_max_unique_ips_window_secs,
+        )
+        .await;
+    if !config.access.user_max_unique_ips.is_empty() {
+        info!(
+            "IP limits configured for {} users",
+            config.access.user_max_unique_ips.len()
+        );
+    }
+    if !config.network.dns_overrides.is_empty() {
+        info!(
+            "Runtime DNS overrides configured: {} entries",
+            config.network.dns_overrides.len()
+        );
+    }
+
+    let (api_config_tx, api_config_rx) = watch::channel(Arc::new(config.clone()));
+    let initial_admission_open = !config.general.use_middle_proxy;
+    let (admission_tx, admission_rx) = watch::channel(initial_admission_open);
+    let api_me_pool = Arc::new(RwLock::new(None::<Arc<MePool>>));
+    startup_tracker
+        .start_component(COMPONENT_API_BOOTSTRAP, Some("spawn API listener task".to_string()))
+        .await;
+
+    if config.server.api.enabled {
+        let listen = match config.server.api.listen.parse::<SocketAddr>() {
+            Ok(listen) => listen,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    listen = %config.server.api.listen,
+                    "Invalid server.api.listen; API is disabled"
+                );
+                SocketAddr::from(([127, 0, 0, 1], 0))
+            }
+        };
+        if listen.port() != 0 {
+            let stats_api = stats.clone();
+            let ip_tracker_api = ip_tracker.clone();
+            let me_pool_api = api_me_pool.clone();
+            let upstream_manager_api = upstream_manager.clone();
+            let config_rx_api = api_config_rx.clone();
+            let admission_rx_api = admission_rx.clone();
+            let config_path_api = std::path::PathBuf::from(&config_path);
+            let startup_tracker_api = startup_tracker.clone();
+            tokio::spawn(async move {
+                api::serve(
+                    listen,
+                    stats_api,
+                    ip_tracker_api,
+                    me_pool_api,
+                    upstream_manager_api,
+                    config_rx_api,
+                    admission_rx_api,
+                    config_path_api,
+                    None,
+                    None,
+                    process_started_at_epoch_secs,
+                    startup_tracker_api,
+                )
+                .await;
+            });
+            startup_tracker
+                .complete_component(
+                    COMPONENT_API_BOOTSTRAP,
+                    Some(format!("api task spawned on {}", listen)),
+                )
+                .await;
+        } else {
+            startup_tracker
+                .skip_component(
+                    COMPONENT_API_BOOTSTRAP,
+                    Some("server.api.listen has zero port".to_string()),
+                )
+                .await;
+        }
+    } else {
+        startup_tracker
+            .skip_component(
+                COMPONENT_API_BOOTSTRAP,
+                Some("server.api.enabled is false".to_string()),
+            )
+            .await;
+    }
 
     let mut tls_domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
     tls_domains.push(config.censorship.tls_domain.clone());
@@ -483,6 +594,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start TLS front fetching in background immediately, in parallel with STUN probing.
+    startup_tracker
+        .start_component(
+            COMPONENT_TLS_FRONT_BOOTSTRAP,
+            Some("initialize TLS front cache/bootstrap tasks".to_string()),
+        )
+        .await;
     let tls_cache: Option<Arc<TlsFrontCache>> = if config.censorship.tls_emulation {
         let cache = Arc::new(TlsFrontCache::new(
             &tls_domains,
@@ -603,9 +720,26 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         Some(cache)
     } else {
+        startup_tracker
+            .skip_component(
+                COMPONENT_TLS_FRONT_BOOTSTRAP,
+                Some("censorship.tls_emulation is false".to_string()),
+            )
+            .await;
         None
     };
+    if tls_cache.is_some() {
+        startup_tracker
+            .complete_component(
+                COMPONENT_TLS_FRONT_BOOTSTRAP,
+                Some("tls front cache is initialized".to_string()),
+            )
+            .await;
+    }
 
+    startup_tracker
+        .start_component(COMPONENT_NETWORK_PROBE, Some("probe network capabilities".to_string()))
+        .await;
     let probe = run_probe(
         &config.network,
         config.general.middle_proxy_nat_probe,
@@ -614,31 +748,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     .await?;
     let decision = decide_network_capabilities(&config.network, &probe);
     log_probe_result(&probe, &decision);
+    startup_tracker
+        .complete_component(
+            COMPONENT_NETWORK_PROBE,
+            Some("network capabilities determined".to_string()),
+        )
+        .await;
 
     let prefer_ipv6 = decision.prefer_ipv6();
     let mut use_middle_proxy = config.general.use_middle_proxy;
     let beobachten = Arc::new(BeobachtenStore::new());
     let rng = Arc::new(SecureRandom::new());
-
-    // IP Tracker initialization
-    let ip_tracker = Arc::new(UserIpTracker::new());
-    ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
-    ip_tracker
-        .set_limit_policy(
-            config.access.user_max_unique_ips_mode,
-            config.access.user_max_unique_ips_window_secs,
-        )
-        .await;
-    
-    if !config.access.user_max_unique_ips.is_empty() {
-        info!("IP limits configured for {} users", config.access.user_max_unique_ips.len());
-    }
-    if !config.network.dns_overrides.is_empty() {
-        info!(
-            "Runtime DNS overrides configured: {} entries",
-            config.network.dns_overrides.len()
-        );
-    }
 
     // Connection concurrency limit
     let max_connections = Arc::new(Semaphore::new(10_000));
@@ -655,6 +775,59 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "No usable IP family for Middle Proxy detected; me2dc_fallback=false, ME init retries stay active"
             );
         }
+    }
+
+    if use_middle_proxy {
+        startup_tracker
+            .set_me_status(StartupMeStatus::Initializing, COMPONENT_ME_SECRET_FETCH)
+            .await;
+        startup_tracker
+            .start_component(
+                COMPONENT_ME_SECRET_FETCH,
+                Some("fetch proxy-secret from source/cache".to_string()),
+            )
+            .await;
+        startup_tracker
+            .set_me_retry_limit(if !me2dc_fallback || me_init_retry_attempts == 0 {
+                "unlimited".to_string()
+            } else {
+                me_init_retry_attempts.to_string()
+            })
+            .await;
+    } else {
+        startup_tracker
+            .set_me_status(StartupMeStatus::Skipped, "skipped")
+            .await;
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_SECRET_FETCH,
+                Some("middle proxy mode disabled".to_string()),
+            )
+            .await;
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_PROXY_CONFIG_V4,
+                Some("middle proxy mode disabled".to_string()),
+            )
+            .await;
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_PROXY_CONFIG_V6,
+                Some("middle proxy mode disabled".to_string()),
+            )
+            .await;
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_POOL_CONSTRUCT,
+                Some("middle proxy mode disabled".to_string()),
+            )
+            .await;
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_POOL_INIT_STAGE1,
+                Some("middle proxy mode disabled".to_string()),
+            )
+            .await;
     }
 
     // =====================================================================
@@ -694,6 +867,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             {
                 Ok(proxy_secret) => break Some(proxy_secret),
                 Err(e) => {
+                    startup_tracker
+                        .set_me_last_error(Some(e.to_string()))
+                        .await;
                     if me2dc_fallback {
                         error!(
                             error = %e,
@@ -713,6 +889,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         };
         match proxy_secret {
             Some(proxy_secret) => {
+                startup_tracker
+                    .complete_component(
+                        COMPONENT_ME_SECRET_FETCH,
+                        Some("proxy-secret loaded".to_string()),
+                    )
+                    .await;
                 info!(
                     secret_len = proxy_secret.len(),
                     key_sig = format_args!(
@@ -731,6 +913,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "Proxy-secret loaded"
                 );
 
+                startup_tracker
+                    .start_component(
+                        COMPONENT_ME_PROXY_CONFIG_V4,
+                        Some("load startup proxy-config v4".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .set_me_status(StartupMeStatus::Initializing, COMPONENT_ME_PROXY_CONFIG_V4)
+                    .await;
                 let cfg_v4 = load_startup_proxy_config_snapshot(
                     "https://core.telegram.org/getProxyConfig",
                     config.general.proxy_config_v4_cache_path.as_deref(),
@@ -738,6 +929,30 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "getProxyConfig",
                 )
                 .await;
+                if cfg_v4.is_some() {
+                    startup_tracker
+                        .complete_component(
+                            COMPONENT_ME_PROXY_CONFIG_V4,
+                            Some("proxy-config v4 loaded".to_string()),
+                        )
+                        .await;
+                } else {
+                    startup_tracker
+                        .fail_component(
+                            COMPONENT_ME_PROXY_CONFIG_V4,
+                            Some("proxy-config v4 unavailable".to_string()),
+                        )
+                        .await;
+                }
+                startup_tracker
+                    .start_component(
+                        COMPONENT_ME_PROXY_CONFIG_V6,
+                        Some("load startup proxy-config v6".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .set_me_status(StartupMeStatus::Initializing, COMPONENT_ME_PROXY_CONFIG_V6)
+                    .await;
                 let cfg_v6 = load_startup_proxy_config_snapshot(
                     "https://core.telegram.org/getProxyConfigV6",
                     config.general.proxy_config_v6_cache_path.as_deref(),
@@ -745,8 +960,32 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "getProxyConfigV6",
                 )
                 .await;
+                if cfg_v6.is_some() {
+                    startup_tracker
+                        .complete_component(
+                            COMPONENT_ME_PROXY_CONFIG_V6,
+                            Some("proxy-config v6 loaded".to_string()),
+                        )
+                        .await;
+                } else {
+                    startup_tracker
+                        .fail_component(
+                            COMPONENT_ME_PROXY_CONFIG_V6,
+                            Some("proxy-config v6 unavailable".to_string()),
+                        )
+                        .await;
+                }
 
                 if let (Some(cfg_v4), Some(cfg_v6)) = (cfg_v4, cfg_v6) {
+                    startup_tracker
+                        .start_component(
+                            COMPONENT_ME_POOL_CONSTRUCT,
+                            Some("construct ME pool".to_string()),
+                        )
+                        .await;
+                    startup_tracker
+                        .set_me_status(StartupMeStatus::Initializing, COMPONENT_ME_POOL_CONSTRUCT)
+                        .await;
                     let pool = MePool::new(
                         proxy_tag.clone(),
                         proxy_secret,
@@ -786,7 +1025,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         config.general.me_floor_mode,
                         config.general.me_adaptive_floor_idle_secs,
                         config.general.me_adaptive_floor_min_writers_single_endpoint,
+                        config.general.me_adaptive_floor_min_writers_multi_endpoint,
                         config.general.me_adaptive_floor_recover_grace_secs,
+                        config.general.me_adaptive_floor_writers_per_core_total,
+                        config.general.me_adaptive_floor_cpu_cores_override,
+                        config.general.me_adaptive_floor_max_extra_writers_single_per_core,
+                        config.general.me_adaptive_floor_max_extra_writers_multi_per_core,
+                        config.general.me_adaptive_floor_max_active_writers_per_core,
+                        config.general.me_adaptive_floor_max_warm_writers_per_core,
+                        config.general.me_adaptive_floor_max_active_writers_global,
+                        config.general.me_adaptive_floor_max_warm_writers_global,
                         config.general.hardswap,
                         config.general.me_pool_drain_ttl_secs,
                         config.general.effective_me_pool_force_close_secs(),
@@ -799,21 +1047,61 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         config.general.me_bind_stale_ttl_secs,
                         config.general.me_secret_atomic_snapshot,
                         config.general.me_deterministic_writer_sort,
+                        config.general.me_writer_pick_mode,
+                        config.general.me_writer_pick_sample_size,
                         config.general.me_socks_kdf_policy,
+                        config.general.me_writer_cmd_channel_capacity,
+                        config.general.me_route_channel_capacity,
                         config.general.me_route_backpressure_base_timeout_ms,
                         config.general.me_route_backpressure_high_timeout_ms,
                         config.general.me_route_backpressure_high_watermark_pct,
+                        config.general.me_reader_route_data_wait_ms,
+                        config.general.me_health_interval_ms_unhealthy,
+                        config.general.me_health_interval_ms_healthy,
+                        config.general.me_warn_rate_limit_ms,
                         config.general.me_route_no_writer_mode,
                         config.general.me_route_no_writer_wait_ms,
                         config.general.me_route_inline_recovery_attempts,
                         config.general.me_route_inline_recovery_wait_ms,
                     );
+                    startup_tracker
+                        .complete_component(
+                            COMPONENT_ME_POOL_CONSTRUCT,
+                            Some("ME pool object created".to_string()),
+                        )
+                        .await;
+                    *api_me_pool.write().await = Some(pool.clone());
+                    startup_tracker
+                        .start_component(
+                            COMPONENT_ME_POOL_INIT_STAGE1,
+                            Some("initialize ME pool writers".to_string()),
+                        )
+                        .await;
+                    startup_tracker
+                        .set_me_status(
+                            StartupMeStatus::Initializing,
+                            COMPONENT_ME_POOL_INIT_STAGE1,
+                        )
+                        .await;
 
                     let mut init_attempt: u32 = 0;
                     loop {
                         init_attempt = init_attempt.saturating_add(1);
+                        startup_tracker.set_me_init_attempt(init_attempt).await;
                         match pool.init(pool_size, &rng).await {
                             Ok(()) => {
+                                startup_tracker
+                                    .set_me_last_error(None)
+                                    .await;
+                                startup_tracker
+                                    .complete_component(
+                                        COMPONENT_ME_POOL_INIT_STAGE1,
+                                        Some("ME pool initialized".to_string()),
+                                    )
+                                    .await;
+                                startup_tracker
+                                    .set_me_status(StartupMeStatus::Ready, "ready")
+                                    .await;
                                 info!(
                                     attempt = init_attempt,
                                     "Middle-End pool initialized successfully"
@@ -833,8 +1121,20 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 break Some(pool);
                             }
                             Err(e) => {
+                                startup_tracker
+                                    .set_me_last_error(Some(e.to_string()))
+                                    .await;
                                 let retries_limited = me2dc_fallback && me_init_retry_attempts > 0;
                                 if retries_limited && init_attempt >= me_init_retry_attempts {
+                                    startup_tracker
+                                        .fail_component(
+                                            COMPONENT_ME_POOL_INIT_STAGE1,
+                                            Some("ME init retry budget exhausted".to_string()),
+                                        )
+                                        .await;
+                                    startup_tracker
+                                        .set_me_status(StartupMeStatus::Failed, "failed")
+                                        .await;
                                     error!(
                                         error = %e,
                                         attempt = init_attempt,
@@ -874,10 +1174,60 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
+                    startup_tracker
+                        .skip_component(
+                            COMPONENT_ME_POOL_CONSTRUCT,
+                            Some("ME configs are incomplete".to_string()),
+                        )
+                        .await;
+                    startup_tracker
+                        .fail_component(
+                            COMPONENT_ME_POOL_INIT_STAGE1,
+                            Some("ME configs are incomplete".to_string()),
+                        )
+                        .await;
+                    startup_tracker
+                        .set_me_status(StartupMeStatus::Failed, "failed")
+                        .await;
                     None
                 }
             }
-            None => None,
+            None => {
+                startup_tracker
+                    .fail_component(
+                        COMPONENT_ME_SECRET_FETCH,
+                        Some("proxy-secret unavailable".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .skip_component(
+                        COMPONENT_ME_PROXY_CONFIG_V4,
+                        Some("proxy-secret unavailable".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .skip_component(
+                        COMPONENT_ME_PROXY_CONFIG_V6,
+                        Some("proxy-secret unavailable".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .skip_component(
+                        COMPONENT_ME_POOL_CONSTRUCT,
+                        Some("proxy-secret unavailable".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .fail_component(
+                        COMPONENT_ME_POOL_INIT_STAGE1,
+                        Some("proxy-secret unavailable".to_string()),
+                    )
+                    .await;
+                startup_tracker
+                    .set_me_status(StartupMeStatus::Failed, "failed")
+                    .await;
+                None
+            }
         }
     } else {
         None
@@ -885,12 +1235,33 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // If ME failed to initialize, force direct-only mode.
     if me_pool.is_some() {
+        startup_tracker
+            .set_transport_mode("middle_proxy")
+            .await;
+        startup_tracker
+            .set_degraded(false)
+            .await;
         info!("Transport: Middle-End Proxy - all DC-over-RPC");
     } else {
         let _ = use_middle_proxy;
         use_middle_proxy = false;
         // Make runtime config reflect direct-only mode for handlers.
         config.general.use_middle_proxy = false;
+        startup_tracker
+            .set_transport_mode("direct")
+            .await;
+        startup_tracker
+            .set_degraded(true)
+            .await;
+        if me2dc_fallback {
+            startup_tracker
+                .set_me_status(StartupMeStatus::Failed, "fallback_to_direct")
+                .await;
+        } else {
+            startup_tracker
+                .set_me_status(StartupMeStatus::Skipped, "skipped")
+                .await;
+        }
         info!("Transport: Direct DC - TCP - standard DC-over-TCP");
     }
 
@@ -905,6 +1276,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let buffer_pool = Arc::new(BufferPool::with_config(16 * 1024, 4096));
 
     // Middle-End ping before DC connectivity
+    if me_pool.is_some() {
+        startup_tracker
+            .start_component(
+                COMPONENT_ME_CONNECTIVITY_PING,
+                Some("run startup ME connectivity check".to_string()),
+            )
+            .await;
+    } else {
+        startup_tracker
+            .skip_component(
+                COMPONENT_ME_CONNECTIVITY_PING,
+                Some("ME pool is not available".to_string()),
+            )
+            .await;
+    }
     if let Some(ref pool) = me_pool {
         let me_results = run_me_ping(pool, &rng).await;
 
@@ -974,9 +1360,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         }
         info!("============================================================");
+        startup_tracker
+            .complete_component(
+                COMPONENT_ME_CONNECTIVITY_PING,
+                Some("startup ME connectivity check completed".to_string()),
+            )
+            .await;
     }
 
     info!("================= Telegram DC Connectivity =================");
+    startup_tracker
+        .start_component(
+            COMPONENT_DC_CONNECTIVITY_PING,
+            Some("run startup DC connectivity check".to_string()),
+        )
+        .await;
 
     let ping_results = upstream_manager
         .ping_all_dcs(
@@ -1056,9 +1454,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 			info!("============================================================");
 		}
 	}
+    startup_tracker
+        .complete_component(
+            COMPONENT_DC_CONNECTIVITY_PING,
+            Some("startup DC connectivity check completed".to_string()),
+        )
+        .await;
 
     let initialized_secs = process_started_at.elapsed().as_secs();
     let second_suffix = if initialized_secs == 1 { "" } else { "s" };
+    startup_tracker
+        .start_component(
+            COMPONENT_RUNTIME_READY,
+            Some("finalize startup runtime state".to_string()),
+        )
+        .await;
     info!("===================== Telegram Startup =====================");
     info!(
         "  DC/ME Initialized in {} second{}",
@@ -1069,6 +1479,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if let Some(ref pool) = me_pool {
         pool.set_runtime_ready(true);
     }
+    *api_me_pool.write().await = me_pool.clone();
 
     // Background tasks
     let um_clone = upstream_manager.clone();
@@ -1100,6 +1511,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // ── Hot-reload watcher ────────────────────────────────────────────────
     // Uses inotify to detect file changes instantly (SIGHUP also works).
     // detected_ip_v4/v6 are passed so newly added users get correct TG links.
+    startup_tracker
+        .start_component(
+            COMPONENT_CONFIG_WATCHER_START,
+            Some("spawn config hot-reload watcher".to_string()),
+        )
+        .await;
     let (config_rx, mut log_level_rx): (
         tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
         tokio::sync::watch::Receiver<LogLevel>,
@@ -1109,6 +1526,23 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         detected_ip_v4,
         detected_ip_v6,
     );
+    startup_tracker
+        .complete_component(
+            COMPONENT_CONFIG_WATCHER_START,
+            Some("config hot-reload watcher started".to_string()),
+        )
+        .await;
+    let mut config_rx_api_bridge = config_rx.clone();
+    let api_config_tx_bridge = api_config_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            if config_rx_api_bridge.changed().await.is_err() {
+                break;
+            }
+            let cfg = config_rx_api_bridge.borrow_and_update().clone();
+            api_config_tx_bridge.send_replace(cfg);
+        }
+    });
 
     let stats_policy = stats.clone();
     let mut config_rx_policy = config_rx.clone();
@@ -1126,6 +1560,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     cfg.general.me_route_backpressure_base_timeout_ms,
                     cfg.general.me_route_backpressure_high_timeout_ms,
                     cfg.general.me_route_backpressure_high_watermark_pct,
+                    cfg.general.me_reader_route_data_wait_ms,
                 );
             }
         }
@@ -1239,6 +1674,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    startup_tracker
+        .start_component(
+            COMPONENT_LISTENERS_BIND,
+            Some("bind TCP/Unix listeners".to_string()),
+        )
+        .await;
     let mut listeners = Vec::new();
 
     for listener_conf in &config.server.listeners {
@@ -1340,7 +1781,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         print_proxy_links(&host, port, &config);
     }
 
-    let (admission_tx, admission_rx) = watch::channel(true);
     if config.general.use_middle_proxy {
         if let Some(pool) = me_pool.as_ref() {
             let initial_open = pool.admission_ready_conditional_cast().await;
@@ -1353,11 +1793,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
             let pool_for_gate = pool.clone();
             let admission_tx_gate = admission_tx.clone();
+            let mut config_rx_gate = config_rx.clone();
+            let mut admission_poll_ms = config.general.me_admission_poll_ms.max(1);
             tokio::spawn(async move {
                 let mut gate_open = initial_open;
                 let mut open_streak = if initial_open { 1u32 } else { 0u32 };
                 let mut close_streak = if initial_open { 0u32 } else { 1u32 };
                 loop {
+                    tokio::select! {
+                        changed = config_rx_gate.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let cfg = config_rx_gate.borrow_and_update().clone();
+                            admission_poll_ms = cfg.general.me_admission_poll_ms.max(1);
+                            continue;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(admission_poll_ms)) => {}
+                    }
                     let ready = pool_for_gate.admission_ready_conditional_cast().await;
                     if ready {
                         open_streak = open_streak.saturating_add(1);
@@ -1382,7 +1835,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             });
         } else {
@@ -1490,6 +1942,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    startup_tracker
+        .complete_component(
+            COMPONENT_LISTENERS_BIND,
+            Some(format!(
+                "listeners configured tcp={} unix={}",
+                listeners.len(),
+                has_unix_listener
+            )),
+        )
+        .await;
 
     if listeners.is_empty() && !has_unix_listener {
         error!("No listeners. Exiting.");
@@ -1523,6 +1985,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Some(port) = config.server.metrics_port {
+        startup_tracker
+            .start_component(
+                COMPONENT_METRICS_START,
+                Some(format!("spawn metrics endpoint on {}", port)),
+            )
+            .await;
         let stats = stats.clone();
         let beobachten = beobachten.clone();
         let config_rx_metrics = config_rx.clone();
@@ -1539,48 +2007,28 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )
             .await;
         });
+        startup_tracker
+            .complete_component(
+                COMPONENT_METRICS_START,
+                Some("metrics task spawned".to_string()),
+            )
+            .await;
+    } else {
+        startup_tracker
+            .skip_component(
+                COMPONENT_METRICS_START,
+                Some("server.metrics_port is not configured".to_string()),
+            )
+            .await;
     }
 
-    if config.server.api.enabled {
-        let listen = match config.server.api.listen.parse::<SocketAddr>() {
-            Ok(listen) => listen,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    listen = %config.server.api.listen,
-                    "Invalid server.api.listen; API is disabled"
-                );
-                SocketAddr::from(([127, 0, 0, 1], 0))
-            }
-        };
-        if listen.port() != 0 {
-            let stats = stats.clone();
-            let ip_tracker_api = ip_tracker.clone();
-            let me_pool_api = me_pool.clone();
-            let upstream_manager_api = upstream_manager.clone();
-            let config_rx_api = config_rx.clone();
-            let admission_rx_api = admission_rx.clone();
-            let config_path_api = std::path::PathBuf::from(&config_path);
-            let startup_detected_ip_v4 = detected_ip_v4;
-            let startup_detected_ip_v6 = detected_ip_v6;
-            tokio::spawn(async move {
-                api::serve(
-                    listen,
-                    stats,
-                    ip_tracker_api,
-                    me_pool_api,
-                    upstream_manager_api,
-                    config_rx_api,
-                    admission_rx_api,
-                    config_path_api,
-                    startup_detected_ip_v4,
-                    startup_detected_ip_v6,
-                    process_started_at_epoch_secs,
-                )
-                .await;
-            });
-        }
-    }
+    startup_tracker
+        .complete_component(
+            COMPONENT_RUNTIME_READY,
+            Some("startup pipeline is fully initialized".to_string()),
+        )
+        .await;
+    startup_tracker.mark_ready().await;
 
     for (listener, listener_proxy_protocol) in listeners {
         let mut config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();

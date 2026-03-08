@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::io::ErrorKind;
 
+use bytes::Bytes;
 use bytes::BytesMut;
 use rand::Rng;
 use tokio::sync::mpsc;
@@ -49,12 +50,18 @@ impl MePool {
         }
     }
 
-    pub(crate) async fn connect_one(self: &Arc<Self>, addr: SocketAddr, rng: &SecureRandom) -> Result<()> {
+    pub(crate) async fn connect_one_for_dc(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        writer_dc: i32,
+        rng: &SecureRandom,
+    ) -> Result<()> {
         self.connect_one_with_generation_contour(
             addr,
             rng,
             self.current_generation(),
             WriterContour::Active,
+            writer_dc,
         )
         .await
     }
@@ -65,23 +72,68 @@ impl MePool {
         rng: &SecureRandom,
         generation: u64,
         contour: WriterContour,
+        writer_dc: i32,
     ) -> Result<()> {
+        self.connect_one_with_generation_contour_for_dc(addr, rng, generation, contour, writer_dc)
+            .await
+    }
+
+    pub(super) async fn connect_one_with_generation_contour_for_dc(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        rng: &SecureRandom,
+        generation: u64,
+        contour: WriterContour,
+        writer_dc: i32,
+    ) -> Result<()> {
+        self.connect_one_with_generation_contour_for_dc_with_cap_policy(
+            addr,
+            rng,
+            generation,
+            contour,
+            writer_dc,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn connect_one_with_generation_contour_for_dc_with_cap_policy(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        rng: &SecureRandom,
+        generation: u64,
+        contour: WriterContour,
+        writer_dc: i32,
+        allow_coverage_override: bool,
+    ) -> Result<()> {
+        if !self
+            .can_open_writer_for_contour(contour, allow_coverage_override)
+            .await
+        {
+            return Err(ProxyError::Proxy(format!(
+                "ME {contour:?} writer cap reached"
+            )));
+        }
+
         let secret_len = self.proxy_secret.read().await.secret.len();
         if secret_len < 32 {
             return Err(ProxyError::Proxy("proxy-secret too short for ME auth".into()));
         }
 
-        let (stream, _connect_ms, upstream_egress) = self.connect_tcp(addr).await?;
+        let dc_idx = i16::try_from(writer_dc).ok();
+        let (stream, _connect_ms, upstream_egress) = self.connect_tcp(addr, dc_idx).await?;
         let hs = self.handshake_only(stream, addr, upstream_egress, rng).await?;
 
         let writer_id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
         let contour = Arc::new(AtomicU8::new(contour.as_u8()));
         let cancel = CancellationToken::new();
         let degraded = Arc::new(AtomicBool::new(false));
+        let rtt_ema_ms_x10 = Arc::new(AtomicU32::new(0));
         let draining = Arc::new(AtomicBool::new(false));
         let draining_started_at_epoch_secs = Arc::new(AtomicU64::new(0));
+        let drain_deadline_epoch_secs = Arc::new(AtomicU64::new(0));
         let allow_drain_fallback = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = mpsc::channel::<WriterCommand>(4096);
+        let (tx, mut rx) = mpsc::channel::<WriterCommand>(self.writer_cmd_channel_capacity);
         let mut rpc_writer = RpcWriter {
             writer: hs.wr,
             key: hs.write_key,
@@ -111,14 +163,17 @@ impl MePool {
         let writer = MeWriter {
             id: writer_id,
             addr,
+            writer_dc,
             generation,
             contour: contour.clone(),
             created_at: Instant::now(),
             tx: tx.clone(),
             cancel: cancel.clone(),
             degraded: degraded.clone(),
+            rtt_ema_ms_x10: rtt_ema_ms_x10.clone(),
             draining: draining.clone(),
             draining_started_at_epoch_secs: draining_started_at_epoch_secs.clone(),
+            drain_deadline_epoch_secs: drain_deadline_epoch_secs.clone(),
             allow_drain_fallback: allow_drain_fallback.clone(),
         };
         self.writers.write().await.push(writer.clone());
@@ -153,6 +208,7 @@ impl MePool {
         let keepalive_jitter_signal = self.me_keepalive_jitter;
         let cancel_reader_token = cancel.clone();
         let cancel_ping_token = cancel_ping.clone();
+        let reader_route_data_wait_ms = self.me_reader_route_data_wait_ms.clone();
 
         tokio::spawn(async move {
             let res = reader_loop(
@@ -169,6 +225,8 @@ impl MePool {
                 stats_reader,
                 writer_id,
                 degraded.clone(),
+                rtt_ema_ms_x10.clone(),
+                reader_route_data_wait_ms,
                 cancel_reader_token.clone(),
             )
             .await;
@@ -254,17 +312,47 @@ impl MePool {
                 p.extend_from_slice(&sent_id.to_le_bytes());
                 {
                     let mut tracker = ping_tracker_ping.lock().await;
-                    let before = tracker.len();
-                    tracker.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(120));
-                    let expired = before.saturating_sub(tracker.len());
-                    if expired > 0 {
-                        stats_ping.increment_me_keepalive_timeout_by(expired as u64);
+                    let now_epoch_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mut run_cleanup = false;
+                    if let Some(pool) = pool_ping.upgrade() {
+                        let last_cleanup_ms = pool
+                            .ping_tracker_last_cleanup_epoch_ms
+                            .load(Ordering::Relaxed);
+                        if now_epoch_ms.saturating_sub(last_cleanup_ms) >= 30_000
+                            && pool
+                                .ping_tracker_last_cleanup_epoch_ms
+                                .compare_exchange(
+                                    last_cleanup_ms,
+                                    now_epoch_ms,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                        {
+                            run_cleanup = true;
+                        }
+                    }
+
+                    if run_cleanup {
+                        let before = tracker.len();
+                        tracker.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(120));
+                        let expired = before.saturating_sub(tracker.len());
+                        if expired > 0 {
+                            stats_ping.increment_me_keepalive_timeout_by(expired as u64);
+                        }
                     }
                     tracker.insert(sent_id, (std::time::Instant::now(), writer_id));
                 }
                 ping_id = ping_id.wrapping_add(1);
                 stats_ping.increment_me_keepalive_sent();
-                if tx_ping.send(WriterCommand::DataAndFlush(p)).await.is_err() {
+                if tx_ping
+                    .send(WriterCommand::DataAndFlush(Bytes::from(p)))
+                    .await
+                    .is_err()
+                {
                     stats_ping.increment_me_keepalive_failed();
                     debug!("ME ping failed, removing dead writer");
                     cancel_ping.cancel();
@@ -338,7 +426,11 @@ impl MePool {
                     meta.proto_flags,
                 );
 
-                if tx_signal.send(WriterCommand::DataAndFlush(payload)).await.is_err() {
+                if tx_signal
+                    .send(WriterCommand::DataAndFlush(payload))
+                    .await
+                    .is_err()
+                {
                     stats_signal.increment_me_rpc_proxy_req_signal_failed_total();
                     let _ = pool.registry.unregister(conn_id).await;
                     cancel_signal.cancel();
@@ -369,7 +461,7 @@ impl MePool {
                 close_payload.extend_from_slice(&conn_id.to_le_bytes());
 
                 if tx_signal
-                    .send(WriterCommand::DataAndFlush(close_payload))
+                    .send(WriterCommand::DataAndFlush(Bytes::from(close_payload)))
                     .await
                     .is_err()
                 {
@@ -404,6 +496,7 @@ impl MePool {
     async fn remove_writer_only(self: &Arc<Self>, writer_id: u64) -> Vec<BoundConn> {
         let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         let mut removed_addr: Option<SocketAddr> = None;
+        let mut removed_dc: Option<i32> = None;
         let mut removed_uptime: Option<Duration> = None;
         let mut trigger_refill = false;
         {
@@ -417,6 +510,7 @@ impl MePool {
                 self.stats.increment_me_writer_removed_total();
                 w.cancel.cancel();
                 removed_addr = Some(w.addr);
+                removed_dc = Some(w.writer_dc);
                 removed_uptime = Some(w.created_at.elapsed());
                 trigger_refill = !was_draining;
                 if trigger_refill {
@@ -431,11 +525,12 @@ impl MePool {
         }
         if trigger_refill
             && let Some(addr) = removed_addr
+            && let Some(writer_dc) = removed_dc
         {
             if let Some(uptime) = removed_uptime {
                 self.maybe_quarantine_flapping_endpoint(addr, uptime).await;
             }
-            self.trigger_immediate_refill(addr);
+            self.trigger_immediate_refill_for_dc(addr, writer_dc);
         }
         self.rtt_stats.lock().await.remove(&writer_id);
         self.registry.writer_lost(writer_id).await
@@ -454,8 +549,14 @@ impl MePool {
                 let already_draining = w.draining.swap(true, Ordering::Relaxed);
                 w.allow_drain_fallback
                     .store(allow_drain_fallback, Ordering::Relaxed);
+                let now_epoch_secs = Self::now_epoch_secs();
                 w.draining_started_at_epoch_secs
-                    .store(Self::now_epoch_secs(), Ordering::Relaxed);
+                    .store(now_epoch_secs, Ordering::Relaxed);
+                let drain_deadline_epoch_secs = timeout
+                    .map(|duration| now_epoch_secs.saturating_add(duration.as_secs()))
+                    .unwrap_or(0);
+                w.drain_deadline_epoch_secs
+                    .store(drain_deadline_epoch_secs, Ordering::Relaxed);
                 if !already_draining {
                     self.stats.increment_pool_drain_active();
                 }
@@ -479,26 +580,6 @@ impl MePool {
             allow_drain_fallback,
             "ME writer marked draining"
         );
-
-        let pool = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let deadline = timeout.map(|t| Instant::now() + t);
-            while let Some(p) = pool.upgrade() {
-                if let Some(deadline_at) = deadline
-                    && Instant::now() >= deadline_at
-                {
-                    warn!(writer_id, "Drain timeout, force-closing");
-                    p.stats.increment_pool_force_close_total();
-                    let _ = p.remove_writer_and_close_clients(writer_id).await;
-                    break;
-                }
-                if p.registry.is_writer_empty(writer_id).await {
-                    let _ = p.remove_writer_only(writer_id).await;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
     }
 
     pub(crate) async fn mark_writer_draining(self: &Arc<Self>, writer_id: u64) {

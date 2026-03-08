@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -237,6 +237,8 @@ pub struct UpstreamManager {
     connect_budget: Duration,
     unhealthy_fail_threshold: u32,
     connect_failfast_hard_errors: bool,
+    no_upstreams_warn_epoch_ms: Arc<AtomicU64>,
+    no_healthy_warn_epoch_ms: Arc<AtomicU64>,
     stats: Arc<Stats>,
 }
 
@@ -262,8 +264,33 @@ impl UpstreamManager {
             connect_budget: Duration::from_millis(connect_budget_ms.max(1)),
             unhealthy_fail_threshold: unhealthy_fail_threshold.max(1),
             connect_failfast_hard_errors,
+            no_upstreams_warn_epoch_ms: Arc::new(AtomicU64::new(0)),
+            no_healthy_warn_epoch_ms: Arc::new(AtomicU64::new(0)),
             stats,
         }
+    }
+
+    fn now_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn should_emit_warn(last_epoch_ms: &AtomicU64, cooldown_ms: u64) -> bool {
+        let now_epoch_ms = Self::now_epoch_ms();
+        let previous_epoch_ms = last_epoch_ms.load(Ordering::Relaxed);
+        if now_epoch_ms.saturating_sub(previous_epoch_ms) < cooldown_ms {
+            return false;
+        }
+        last_epoch_ms
+            .compare_exchange(
+                previous_epoch_ms,
+                now_epoch_ms,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     pub fn try_api_snapshot(&self) -> Option<UpstreamApiSnapshot> {
@@ -533,12 +560,22 @@ impl UpstreamManager {
             .collect();
 
         if filtered_upstreams.is_empty() {
-            warn!(scope = scope, "No upstreams available! Using first (direct?)");
+            if Self::should_emit_warn(
+                self.no_upstreams_warn_epoch_ms.as_ref(),
+                5_000,
+            ) {
+                warn!(scope = scope, "No upstreams available! Using first (direct?)");
+            }
             return None;
         }
 
         if healthy.is_empty() {
-            warn!(scope = scope, "No healthy upstreams available! Using random.");
+            if Self::should_emit_warn(
+                self.no_healthy_warn_epoch_ms.as_ref(),
+                5_000,
+            ) {
+                warn!(scope = scope, "No healthy upstreams available! Using random.");
+            }
             return Some(filtered_upstreams[rand::rng().gen_range(0..filtered_upstreams.len())]);
         }
 
