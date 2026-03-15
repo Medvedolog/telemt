@@ -8,7 +8,8 @@ use crate::stats::Stats;
 
 use super::ApiShared;
 use super::config_store::{
-    ensure_expected_revision, load_config_from_disk, save_config_to_disk,
+    AccessSection, ensure_expected_revision, load_config_from_disk, save_access_sections_to_disk,
+    save_config_to_disk,
 };
 use super::model::{
     ApiFailure, CreateUserRequest, CreateUserResponse, PatchUserRequest, RotateSecretRequest,
@@ -21,6 +22,12 @@ pub(super) async fn create_user(
     expected_revision: Option<String>,
     shared: &ApiShared,
 ) -> Result<(CreateUserResponse, String), ApiFailure> {
+    let touches_user_ad_tags = body.user_ad_tag.is_some();
+    let touches_user_max_tcp_conns = body.max_tcp_conns.is_some();
+    let touches_user_expirations = body.expiration_rfc3339.is_some();
+    let touches_user_data_quota = body.data_quota_bytes.is_some();
+    let touches_user_max_unique_ips = body.max_unique_ips.is_some();
+
     if !is_valid_username(&body.username) {
         return Err(ApiFailure::bad_request(
             "username must match [A-Za-z0-9_.-] and be 1..64 chars",
@@ -84,19 +91,37 @@ pub(super) async fn create_user(
     cfg.validate()
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
 
-    let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
+    let mut touched_sections = vec![AccessSection::Users];
+    if touches_user_ad_tags {
+        touched_sections.push(AccessSection::UserAdTags);
+    }
+    if touches_user_max_tcp_conns {
+        touched_sections.push(AccessSection::UserMaxTcpConns);
+    }
+    if touches_user_expirations {
+        touched_sections.push(AccessSection::UserExpirations);
+    }
+    if touches_user_data_quota {
+        touched_sections.push(AccessSection::UserDataQuota);
+    }
+    if touches_user_max_unique_ips {
+        touched_sections.push(AccessSection::UserMaxUniqueIps);
+    }
+
+    let revision = save_access_sections_to_disk(&shared.config_path, &cfg, &touched_sections).await?;
     drop(_guard);
 
     if let Some(limit) = updated_limit {
         shared.ip_tracker.set_user_limit(&body.username, limit).await;
     }
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
 
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user = users
@@ -118,8 +143,8 @@ pub(super) async fn create_user(
             links: build_user_links(
                 &cfg,
                 &secret,
-                shared.startup_detected_ip_v4,
-                shared.startup_detected_ip_v6,
+                detected_ip_v4,
+                detected_ip_v6,
             ),
         });
 
@@ -185,12 +210,13 @@ pub(super) async fn patch_user(
     if let Some(limit) = updated_limit {
         shared.ip_tracker.set_user_limit(user, limit).await;
     }
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user_info = users
@@ -229,15 +255,24 @@ pub(super) async fn rotate_secret(
     cfg.access.users.insert(user.to_string(), secret.clone());
     cfg.validate()
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
-    let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
+    let touched_sections = [
+        AccessSection::Users,
+        AccessSection::UserAdTags,
+        AccessSection::UserMaxTcpConns,
+        AccessSection::UserExpirations,
+        AccessSection::UserDataQuota,
+        AccessSection::UserMaxUniqueIps,
+    ];
+    let revision = save_access_sections_to_disk(&shared.config_path, &cfg, &touched_sections).await?;
     drop(_guard);
 
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user_info = users
@@ -287,7 +322,15 @@ pub(super) async fn delete_user(
 
     cfg.validate()
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
-    let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
+    let touched_sections = [
+        AccessSection::Users,
+        AccessSection::UserAdTags,
+        AccessSection::UserMaxTcpConns,
+        AccessSection::UserExpirations,
+        AccessSection::UserDataQuota,
+        AccessSection::UserMaxUniqueIps,
+    ];
+    let revision = save_access_sections_to_disk(&shared.config_path, &cfg, &touched_sections).await?;
     drop(_guard);
     shared.ip_tracker.remove_user_limit(user).await;
     shared.ip_tracker.clear_user_ips(user).await;
@@ -343,7 +386,16 @@ pub(super) async fn users_from_config(
                 .get(&username)
                 .map(chrono::DateTime::<chrono::Utc>::to_rfc3339),
             data_quota_bytes: cfg.access.user_data_quota.get(&username).copied(),
-            max_unique_ips: cfg.access.user_max_unique_ips.get(&username).copied(),
+            max_unique_ips: cfg
+                .access
+                .user_max_unique_ips
+                .get(&username)
+                .copied()
+                .filter(|limit| *limit > 0)
+                .or(
+                    (cfg.access.user_max_unique_ips_global_each > 0)
+                        .then_some(cfg.access.user_max_unique_ips_global_each),
+                ),
             current_connections: stats.get_user_curr_connects(&username),
             active_unique_ips: active_ip_list.len(),
             active_unique_ips_list: active_ip_list,
@@ -418,17 +470,6 @@ fn resolve_link_hosts(
         return vec![host.to_string()];
     }
 
-    let mut startup_hosts = Vec::new();
-    if let Some(ip) = startup_detected_ip_v4 {
-        push_unique_host(&mut startup_hosts, &ip.to_string());
-    }
-    if let Some(ip) = startup_detected_ip_v6 {
-        push_unique_host(&mut startup_hosts, &ip.to_string());
-    }
-    if !startup_hosts.is_empty() {
-        return startup_hosts;
-    }
-
     let mut hosts = Vec::new();
     for listener in &cfg.server.listeners {
         if let Some(host) = listener
@@ -443,24 +484,44 @@ fn resolve_link_hosts(
         if let Some(ip) = listener.announce_ip {
             if !ip.is_unspecified() {
                 push_unique_host(&mut hosts, &ip.to_string());
+                continue;
+            }
+        }
+        if listener.ip.is_unspecified() {
+            let detected_ip = if listener.ip.is_ipv4() {
+                startup_detected_ip_v4
+            } else {
+                startup_detected_ip_v6
+            };
+            if let Some(ip) = detected_ip {
+                push_unique_host(&mut hosts, &ip.to_string());
+            } else {
+                push_unique_host(&mut hosts, &listener.ip.to_string());
             }
             continue;
         }
-        if !listener.ip.is_unspecified() {
-            push_unique_host(&mut hosts, &listener.ip.to_string());
-        }
+        push_unique_host(&mut hosts, &listener.ip.to_string());
     }
 
-    if hosts.is_empty() {
-        if let Some(host) = cfg.server.listen_addr_ipv4.as_deref() {
-            push_host_from_legacy_listen(&mut hosts, host);
-        }
-        if let Some(host) = cfg.server.listen_addr_ipv6.as_deref() {
-            push_host_from_legacy_listen(&mut hosts, host);
-        }
+    if !hosts.is_empty() {
+        return hosts;
     }
 
-    hosts
+    if let Some(ip) = startup_detected_ip_v4.or(startup_detected_ip_v6) {
+        return vec![ip.to_string()];
+    }
+
+    if let Some(host) = cfg.server.listen_addr_ipv4.as_deref() {
+        push_host_from_legacy_listen(&mut hosts, host);
+    }
+    if let Some(host) = cfg.server.listen_addr_ipv6.as_deref() {
+        push_host_from_legacy_listen(&mut hosts, host);
+    }
+    if !hosts.is_empty() {
+        return hosts;
+    }
+
+    vec!["UNKNOWN".to_string()]
 }
 
 fn push_host_from_legacy_listen(hosts: &mut Vec<String>, raw: &str) {

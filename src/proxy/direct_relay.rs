@@ -5,14 +5,19 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
-use crate::error::Result;
+use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
 use crate::proxy::handshake::{HandshakeSuccess, encrypt_tg_nonce_with_ciphers, generate_tg_nonce};
 use crate::proxy::relay::relay_bidirectional;
+use crate::proxy::route_mode::{
+    RelayRouteMode, RouteCutoverState, ROUTE_SWITCH_ERROR_MSG, affected_cutover_state,
+    cutover_stagger_delay,
+};
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::UpstreamManager;
@@ -26,6 +31,9 @@ pub(crate) async fn handle_via_direct<R, W>(
     config: Arc<ProxyConfig>,
     buffer_pool: Arc<BufferPool>,
     rng: Arc<SecureRandom>,
+    mut route_rx: watch::Receiver<RouteCutoverState>,
+    route_snapshot: RouteCutoverState,
+    session_id: u64,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -69,8 +77,36 @@ where
         user,
         Arc::clone(&stats),
         buffer_pool,
-    )
-    .await;
+    );
+    tokio::pin!(relay_result);
+    let relay_result = loop {
+        if let Some(cutover) = affected_cutover_state(
+            &route_rx,
+            RelayRouteMode::Direct,
+            route_snapshot.generation,
+        ) {
+            let delay = cutover_stagger_delay(session_id, cutover.generation);
+            warn!(
+                user = %user,
+                target_mode = cutover.mode.as_str(),
+                cutover_generation = cutover.generation,
+                delay_ms = delay.as_millis() as u64,
+                "Cutover affected direct session, closing client connection"
+            );
+            tokio::time::sleep(delay).await;
+            break Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+        }
+        tokio::select! {
+            result = &mut relay_result => {
+                break result;
+            }
+            changed = route_rx.changed() => {
+                if changed.is_err() {
+                    break relay_result.await;
+                }
+            }
+        }
+    };
 
     stats.decrement_current_connections_direct();
     stats.decrement_user_curr_connects(user);

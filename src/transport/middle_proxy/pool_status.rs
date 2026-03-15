@@ -19,6 +19,12 @@ pub(crate) struct MeApiWriterStatusSnapshot {
     pub bound_clients: usize,
     pub idle_for_secs: Option<u64>,
     pub rtt_ema_ms: Option<f64>,
+    pub matches_active_generation: bool,
+    pub in_desired_map: bool,
+    pub allow_drain_fallback: bool,
+    pub drain_started_at_epoch_secs: Option<u64>,
+    pub drain_deadline_epoch_secs: Option<u64>,
+    pub drain_over_ttl: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +41,8 @@ pub(crate) struct MeApiDcStatusSnapshot {
     pub floor_capped: bool,
     pub alive_writers: usize,
     pub coverage_pct: f64,
+    pub fresh_alive_writers: usize,
+    pub fresh_coverage_pct: f64,
     pub rtt_ms: Option<f64>,
     pub load: usize,
 }
@@ -55,6 +63,8 @@ pub(crate) struct MeApiStatusSnapshot {
     pub required_writers: usize,
     pub alive_writers: usize,
     pub coverage_pct: f64,
+    pub fresh_alive_writers: usize,
+    pub fresh_coverage_pct: f64,
     pub writers: Vec<MeApiWriterStatusSnapshot>,
     pub dcs: Vec<MeApiDcStatusSnapshot>,
 }
@@ -213,6 +223,8 @@ impl MePool {
 
     pub(crate) async fn api_status_snapshot(&self) -> MeApiStatusSnapshot {
         let now_epoch_secs = Self::now_epoch_secs();
+        let active_generation = self.current_generation();
+        let drain_ttl_secs = self.me_pool_drain_ttl_secs.load(Ordering::Relaxed);
 
         let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
         if self.decision.ipv4_me {
@@ -239,6 +251,7 @@ impl MePool {
 
         let mut live_writers_by_dc_endpoint = HashMap::<(i16, SocketAddr), usize>::new();
         let mut live_writers_by_dc = HashMap::<i16, usize>::new();
+        let mut fresh_writers_by_dc = HashMap::<i16, usize>::new();
         let mut dc_rtt_agg = HashMap::<i16, (f64, u64)>::new();
         let mut writer_rows = Vec::<MeApiWriterStatusSnapshot>::with_capacity(writers.len());
 
@@ -247,6 +260,10 @@ impl MePool {
             let dc = i16::try_from(writer.writer_dc).ok();
             let draining = writer.draining.load(Ordering::Relaxed);
             let degraded = writer.degraded.load(Ordering::Relaxed);
+            let matches_active_generation = writer.generation == active_generation;
+            let in_desired_map = dc
+                .and_then(|dc_idx| endpoints_by_dc.get(&dc_idx))
+                .is_some_and(|endpoints| endpoints.contains(&endpoint));
             let bound_clients = activity
                 .bound_clients_by_writer
                 .get(&writer.id)
@@ -256,6 +273,21 @@ impl MePool {
                 .get(&writer.id)
                 .map(|idle_ts| now_epoch_secs.saturating_sub(*idle_ts));
             let rtt_ema_ms = rtt.get(&writer.id).map(|(_, ema)| *ema);
+            let allow_drain_fallback = writer.allow_drain_fallback.load(Ordering::Relaxed);
+            let drain_started_at_epoch_secs = writer
+                .draining_started_at_epoch_secs
+                .load(Ordering::Relaxed);
+            let drain_deadline_epoch_secs = writer
+                .drain_deadline_epoch_secs
+                .load(Ordering::Relaxed);
+            let drain_started_at_epoch_secs =
+                (drain_started_at_epoch_secs != 0).then_some(drain_started_at_epoch_secs);
+            let drain_deadline_epoch_secs =
+                (drain_deadline_epoch_secs != 0).then_some(drain_deadline_epoch_secs);
+            let drain_over_ttl = draining
+                && drain_ttl_secs > 0
+                && drain_started_at_epoch_secs
+                    .is_some_and(|started| now_epoch_secs.saturating_sub(started) > drain_ttl_secs);
             let state = match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
                 WriterContour::Warm => "warm",
                 WriterContour::Active => "active",
@@ -273,6 +305,9 @@ impl MePool {
                         entry.0 += ema_ms;
                         entry.1 += 1;
                     }
+                    if matches_active_generation && in_desired_map {
+                        *fresh_writers_by_dc.entry(dc_idx).or_insert(0) += 1;
+                    }
                 }
             }
 
@@ -287,6 +322,12 @@ impl MePool {
                 bound_clients,
                 idle_for_secs,
                 rtt_ema_ms,
+                matches_active_generation,
+                in_desired_map,
+                allow_drain_fallback,
+                drain_started_at_epoch_secs,
+                drain_deadline_epoch_secs,
+                drain_over_ttl,
             });
         }
 
@@ -295,6 +336,7 @@ impl MePool {
         let mut dcs = Vec::<MeApiDcStatusSnapshot>::with_capacity(endpoints_by_dc.len());
         let mut available_endpoints = 0usize;
         let mut alive_writers = 0usize;
+        let mut fresh_alive_writers = 0usize;
         let floor_mode = self.floor_mode();
         let adaptive_cpu_cores = (self
             .me_adaptive_floor_cpu_cores_effective
@@ -333,6 +375,7 @@ impl MePool {
             let floor_capped = matches!(floor_mode, MeFloorMode::Adaptive)
                 && dc_required_writers < base_required;
             let dc_alive_writers = live_writers_by_dc.get(&dc).copied().unwrap_or(0);
+            let dc_fresh_alive_writers = fresh_writers_by_dc.get(&dc).copied().unwrap_or(0);
             let dc_load = activity
                 .active_sessions_by_target_dc
                 .get(&dc)
@@ -344,6 +387,7 @@ impl MePool {
 
             available_endpoints += dc_available_endpoints;
             alive_writers += dc_alive_writers;
+            fresh_alive_writers += dc_fresh_alive_writers;
 
             dcs.push(MeApiDcStatusSnapshot {
                 dc,
@@ -367,6 +411,8 @@ impl MePool {
                 floor_capped,
                 alive_writers: dc_alive_writers,
                 coverage_pct: ratio_pct(dc_alive_writers, dc_required_writers),
+                fresh_alive_writers: dc_fresh_alive_writers,
+                fresh_coverage_pct: ratio_pct(dc_fresh_alive_writers, dc_required_writers),
                 rtt_ms: dc_rtt_ms,
                 load: dc_load,
             });
@@ -381,6 +427,8 @@ impl MePool {
             required_writers,
             alive_writers,
             coverage_pct: ratio_pct(alive_writers, required_writers),
+            fresh_alive_writers,
+            fresh_coverage_pct: ratio_pct(fresh_alive_writers, required_writers),
             writers: writer_rows,
             dcs,
         }

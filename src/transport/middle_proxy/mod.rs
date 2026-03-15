@@ -18,6 +18,7 @@ mod registry;
 mod rotation;
 mod send;
 mod secret;
+mod selftest;
 mod wire;
 mod pool_status;
 
@@ -37,6 +38,9 @@ pub use config_updater::{
     me_config_updater, save_proxy_config_cache,
 };
 pub use rotation::{MeReinitTrigger, me_reinit_scheduler, me_rotation_task};
+pub(crate) use selftest::{
+    bnd_snapshot, timeskew_snapshot, upstream_bnd_snapshots,
+};
 pub use wire::proto_flags_for_tag;
 
 #[derive(Debug)]

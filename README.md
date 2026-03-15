@@ -19,22 +19,9 @@
 
 ### 🇷🇺 RU
 
-#### Релиз 3.3.5 LTS - 6 марта
+#### Релиз 3.3.15 Semistable
 
-6 марта мы выпустили Telemt **3.3.5**
-
-Это [3.3.5 - первая LTS-версия telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)!
-
-В ней используется:
-- новый алгоритм ME NoWait для непревзойдённо быстрого восстановления пула
-- Adaptive Floor, поддерживающий количество ME Writer на оптимальном уровне
-- модель усовершенствованного доступа к KDF Fingerprint на RwLock
-- строгая привязка Middle-End к DC-ID с предсказуемым алгоритмом деградации и самовосстановления
-
-Telemt Control API V1 в 3.3.5 включает:
-- несколько режимов работы в зависимости от доступных ресурсов
-- снапшот-модель для живых метрик без вмешательства в hot-path
-- минималистичный набор запросов для управления пользователями
+[3.3.15](https://github.com/telemt/telemt/releases/tag/3.3.15) по итогам работы в продакшн признан одним из самых стабильных и рекомендуется к использованию, когда cutting-edge фичи некритичны!
 
 Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **API**, **статистики**, **UX**
 
@@ -53,22 +40,9 @@ Telemt Control API V1 в 3.3.5 включает:
 
 ### 🇬🇧 EN
 
-#### Release 3.3.5 LTS - March 6
+#### Release 3.3.15 Semistable
 
-On March 6, we released Telemt **3.3.3**
-
-This is [3.3.5 - the first LTS release of telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)
-
-It introduces:
-- the new ME NoWait algorithm for exceptionally fast pool recovery
-- Adaptive Floor, which maintains the number of ME Writers at an optimal level
-- an improved KDF Fingerprint access model based on RwLock
-- strict binding of Middle-End instances to DC-ID with a predictable degradation and self-recovery algorithm
-
-Telemt Control API V1 in version 3.3.5 includes:
-- multiple operating modes depending on available resources
-- a snapshot-based model for live metrics without interfering with the hot path
-- a minimalistic request set for user management
+[3.3.15](https://github.com/telemt/telemt/releases/tag/3.3.15) is, based on the results of his work in production, recognized as one of the most stable and recommended for use when cutting-edge features are not so necessary!
 
 We are looking forward to your feedback and improvement proposals — especially regarding **API**, **statistics**, **UX**
 
@@ -264,6 +238,11 @@ git clone https://github.com/telemt/telemt
 cd telemt
 # Starting Release Build
 cargo build --release
+
+# Low-RAM devices (1 GB, e.g. NanoPi Neo3 / Raspberry Pi Zero 2):
+# release profile uses lto = "thin" to reduce peak linker memory.
+# If your custom toolchain overrides profiles, avoid enabling fat LTO.
+
 # Move to /bin
 mv ./target/release/telemt /bin
 # Make executable
@@ -271,6 +250,12 @@ chmod +x /bin/telemt
 # Lets go!
 telemt config.toml
 ```
+
+### OpenBSD
+- Build and service setup guide: [OpenBSD Guide (EN)](docs/OPENBSD.en.md)
+- Example rc.d script: [contrib/openbsd/telemt.rcd](contrib/openbsd/telemt.rcd)
+- Status: OpenBSD sandbox hardening with `pledge(2)` and `unveil(2)` is not implemented yet.
+
 
 ## Why Rust?
 - Long-running reliability and idempotent behavior

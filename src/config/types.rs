@@ -794,6 +794,11 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_pool_drain_ttl_secs")]
     pub me_pool_drain_ttl_secs: u64,
 
+    /// Maximum allowed number of draining ME writers before oldest ones are force-closed in batches.
+    /// Set to 0 to disable threshold-based draining cleanup and keep timeout-only behavior.
+    #[serde(default = "default_me_pool_drain_threshold")]
+    pub me_pool_drain_threshold: u64,
+
     /// Policy for new binds on stale draining writers.
     #[serde(default)]
     pub me_bind_stale_mode: MeBindStaleMode,
@@ -973,6 +978,7 @@ impl Default for GeneralConfig {
             me_secret_atomic_snapshot: default_me_secret_atomic_snapshot(),
             proxy_secret_len_max: default_proxy_secret_len_max(),
             me_pool_drain_ttl_secs: default_me_pool_drain_ttl_secs(),
+            me_pool_drain_threshold: default_me_pool_drain_threshold(),
             me_bind_stale_mode: MeBindStaleMode::default(),
             me_bind_stale_ttl_secs: default_me_bind_stale_ttl_secs(),
             me_pool_min_fresh_ratio: default_me_pool_min_fresh_ratio(),
@@ -1044,7 +1050,7 @@ impl Default for LinksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiConfig {
     /// Enable or disable REST API.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Listen address for API in `IP:PORT` format.
@@ -1096,7 +1102,7 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_true(),
             listen: default_api_listen(),
             whitelist: default_api_whitelist(),
             auth_header: String::new(),
@@ -1317,6 +1323,11 @@ pub struct AccessConfig {
     #[serde(default)]
     pub user_max_unique_ips: HashMap<String, usize>,
 
+    /// Global per-user unique IP limit applied when a user has no individual override.
+    /// `0` disables the inherited limit.
+    #[serde(default = "default_user_max_unique_ips_global_each")]
+    pub user_max_unique_ips_global_each: usize,
+
     #[serde(default)]
     pub user_max_unique_ips_mode: UserMaxUniqueIpsMode,
 
@@ -1342,6 +1353,7 @@ impl Default for AccessConfig {
             user_expirations: HashMap::new(),
             user_data_quota: HashMap::new(),
             user_max_unique_ips: HashMap::new(),
+            user_max_unique_ips_global_each: default_user_max_unique_ips_global_each(),
             user_max_unique_ips_mode: UserMaxUniqueIpsMode::default(),
             user_max_unique_ips_window_secs: default_user_max_unique_ips_window_secs(),
             replay_check_len: default_replay_check_len(),

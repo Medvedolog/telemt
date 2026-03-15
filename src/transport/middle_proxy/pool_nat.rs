@@ -159,7 +159,13 @@ impl MePool {
         addr: std::net::SocketAddr,
         reflected: Option<std::net::SocketAddr>,
     ) -> std::net::SocketAddr {
-        let ip = if let Some(r) = reflected {
+        let ip = if let Some(nat_ip) = self.nat_ip_cfg {
+            match (addr.ip(), nat_ip) {
+                (IpAddr::V4(_), IpAddr::V4(dst)) => IpAddr::V4(dst),
+                (IpAddr::V6(_), IpAddr::V6(dst)) => IpAddr::V6(dst),
+                _ => addr.ip(),
+            }
+        } else if let Some(r) = reflected {
             // Use reflected IP (not port) only when local address is non-public.
             if is_bogon(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
                 r.ip()

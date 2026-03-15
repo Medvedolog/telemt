@@ -213,6 +213,7 @@ pub struct UpstreamApiPolicySnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpstreamEgressInfo {
+    pub upstream_id: usize,
     pub route_kind: UpstreamRouteKind,
     pub local_addr: Option<SocketAddr>,
     pub direct_bind_ip: Option<IpAddr>,
@@ -389,7 +390,7 @@ impl UpstreamManager {
         out
     }
 
-    fn resolve_bind_address(
+    pub(crate) fn resolve_bind_address(
         interface: &Option<String>,
         bind_addresses: &Option<Vec<String>>,
         target: SocketAddr,
@@ -398,7 +399,7 @@ impl UpstreamManager {
     ) -> Option<IpAddr> {
         let want_ipv6 = target.is_ipv6();
 
-        if let Some(addrs) = bind_addresses {
+        if let Some(addrs) = bind_addresses.as_ref().filter(|v| !v.is_empty()) {
             let mut candidates: Vec<IpAddr> = addrs
                 .iter()
                 .filter_map(|s| s.parse::<IpAddr>().ok())
@@ -430,7 +431,7 @@ impl UpstreamManager {
                         warn!(
                             interface = %iface,
                             target = %target,
-                            "Configured interface has no addresses for target family; falling back to direct connect without bind"
+                            "Configured interface has no addresses for target family"
                         );
                         candidates.clear();
                     }
@@ -453,10 +454,11 @@ impl UpstreamManager {
                 warn!(
                     interface = interface.as_deref().unwrap_or(""),
                     target = %target,
-                    "No valid bind_addresses left for interface; falling back to direct connect without bind"
+                    "No valid bind_addresses left for interface"
                 );
-                return None;
             }
+
+            return None;
         }
 
         if let Some(iface) = interface {
@@ -672,7 +674,7 @@ impl UpstreamManager {
             self.stats.increment_upstream_connect_attempt_total();
             let start = Instant::now();
             match self
-                .connect_via_upstream(&upstream, target, bind_rr.clone(), attempt_timeout)
+                .connect_via_upstream(idx, &upstream, target, bind_rr.clone(), attempt_timeout)
                 .await
             {
                 Ok((stream, egress)) => {
@@ -779,6 +781,7 @@ impl UpstreamManager {
 
     async fn connect_via_upstream(
         &self,
+        upstream_id: usize,
         config: &UpstreamConfig,
         target: SocketAddr,
         bind_rr: Option<Arc<AtomicUsize>>,
@@ -793,6 +796,13 @@ impl UpstreamManager {
                     bind_rr.as_deref(),
                     true,
                 );
+                if bind_ip.is_none()
+                    && bind_addresses.as_ref().is_some_and(|v| !v.is_empty())
+                {
+                    return Err(ProxyError::Config(format!(
+                        "No valid bind_addresses for target family {target}"
+                    )));
+                }
 
                 let socket = create_outgoing_socket_bound(target, bind_ip)?;
                 if let Some(ip) = bind_ip {
@@ -828,6 +838,7 @@ impl UpstreamManager {
                 Ok((
                     stream,
                     UpstreamEgressInfo {
+                        upstream_id,
                         route_kind: UpstreamRouteKind::Direct,
                         local_addr,
                         direct_bind_ip: bind_ip,
@@ -906,6 +917,7 @@ impl UpstreamManager {
                 Ok((
                     stream,
                     UpstreamEgressInfo {
+                        upstream_id,
                         route_kind: UpstreamRouteKind::Socks4,
                         local_addr,
                         direct_bind_ip: None,
@@ -986,6 +998,7 @@ impl UpstreamManager {
                 Ok((
                     stream,
                     UpstreamEgressInfo {
+                        upstream_id,
                         route_kind: UpstreamRouteKind::Socks5,
                         local_addr,
                         direct_bind_ip: None,
@@ -1048,7 +1061,7 @@ impl UpstreamManager {
 
                     let result = tokio::time::timeout(
                         Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                        self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr_v6)
+                        self.ping_single_dc(*upstream_idx, upstream_config, Some(bind_rr.clone()), addr_v6)
                     ).await;
 
                     let ping_result = match result {
@@ -1099,7 +1112,7 @@ impl UpstreamManager {
 
                     let result = tokio::time::timeout(
                         Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                        self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr_v4)
+                        self.ping_single_dc(*upstream_idx, upstream_config, Some(bind_rr.clone()), addr_v4)
                     ).await;
 
                     let ping_result = match result {
@@ -1162,7 +1175,7 @@ impl UpstreamManager {
                             }
                             let result = tokio::time::timeout(
                                 Duration::from_secs(DC_PING_TIMEOUT_SECS),
-                                self.ping_single_dc(upstream_config, Some(bind_rr.clone()), addr)
+                                self.ping_single_dc(*upstream_idx, upstream_config, Some(bind_rr.clone()), addr)
                             ).await;
 
                             let ping_result = match result {
@@ -1233,6 +1246,7 @@ impl UpstreamManager {
 
     async fn ping_single_dc(
         &self,
+        upstream_id: usize,
         config: &UpstreamConfig,
         bind_rr: Option<Arc<AtomicUsize>>,
         target: SocketAddr,
@@ -1240,6 +1254,7 @@ impl UpstreamManager {
         let start = Instant::now();
         let _ = self
             .connect_via_upstream(
+                upstream_id,
                 config,
                 target,
                 bind_rr,
@@ -1418,6 +1433,7 @@ impl UpstreamManager {
                             let result = tokio::time::timeout(
                                 Duration::from_secs(HEALTH_CHECK_CONNECT_TIMEOUT_SECS),
                                 self.connect_via_upstream(
+                                    i,
                                     &config,
                                     endpoint,
                                     Some(bind_rr.clone()),
@@ -1633,5 +1649,33 @@ mod tests {
             addr: "127.0.0.1:443".to_string(),
         };
         assert!(!UpstreamManager::is_hard_connect_error(&error));
+    }
+
+    #[test]
+    fn resolve_bind_address_prefers_explicit_bind_ip() {
+        let target = "203.0.113.10:443".parse::<SocketAddr>().unwrap();
+        let bind = UpstreamManager::resolve_bind_address(
+            &Some("198.51.100.20".to_string()),
+            &Some(vec!["198.51.100.10".to_string()]),
+            target,
+            None,
+            true,
+        );
+
+        assert_eq!(bind, Some("198.51.100.10".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolve_bind_address_does_not_fallback_to_interface_when_bind_addresses_present() {
+        let target = "203.0.113.10:443".parse::<SocketAddr>().unwrap();
+        let bind = UpstreamManager::resolve_bind_address(
+            &Some("198.51.100.20".to_string()),
+            &Some(vec!["2001:db8::10".to_string()]),
+            target,
+            None,
+            true,
+        );
+
+        assert_eq!(bind, None);
     }
 }

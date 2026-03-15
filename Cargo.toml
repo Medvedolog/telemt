@@ -1,6 +1,6 @@
 [package]
 name = "telemt"
-version = "3.3.14"
+version = "3.3.18"
 edition = "2024"
 
 [dependencies]
@@ -73,3 +73,6 @@ futures = "0.3"
 [[bench]]
 name = "crypto_bench"
 harness = false
+
+[profile.release]
+lto = "thin"

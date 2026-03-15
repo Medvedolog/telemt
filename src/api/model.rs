@@ -236,6 +236,8 @@ pub(super) struct MeWritersSummary {
     pub(super) required_writers: usize,
     pub(super) alive_writers: usize,
     pub(super) coverage_pct: f64,
+    pub(super) fresh_alive_writers: usize,
+    pub(super) fresh_coverage_pct: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -250,6 +252,12 @@ pub(super) struct MeWriterStatus {
     pub(super) bound_clients: usize,
     pub(super) idle_for_secs: Option<u64>,
     pub(super) rtt_ema_ms: Option<f64>,
+    pub(super) matches_active_generation: bool,
+    pub(super) in_desired_map: bool,
+    pub(super) allow_drain_fallback: bool,
+    pub(super) drain_started_at_epoch_secs: Option<u64>,
+    pub(super) drain_deadline_epoch_secs: Option<u64>,
+    pub(super) drain_over_ttl: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -276,6 +284,8 @@ pub(super) struct DcStatus {
     pub(super) floor_capped: bool,
     pub(super) alive_writers: usize,
     pub(super) coverage_pct: f64,
+    pub(super) fresh_alive_writers: usize,
+    pub(super) fresh_coverage_pct: f64,
     pub(super) rtt_ms: Option<f64>,
     pub(super) load: usize,
 }

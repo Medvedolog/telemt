@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, trace, warn};
 
 use crate::config::ProxyConfig;
@@ -16,6 +16,10 @@ use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{*, secure_padding_len};
 use crate::proxy::handshake::HandshakeSuccess;
+use crate::proxy::route_mode::{
+    RelayRouteMode, RouteCutoverState, ROUTE_SWITCH_ERROR_MSG, affected_cutover_state,
+    cutover_stagger_delay,
+};
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::middle_proxy::{MePool, MeResponse, proto_flags_for_tag};
@@ -228,6 +232,9 @@ pub(crate) async fn handle_via_middle_proxy<R, W>(
     _buffer_pool: Arc<BufferPool>,
     local_addr: SocketAddr,
     rng: Arc<SecureRandom>,
+    mut route_rx: watch::Receiver<RouteCutoverState>,
+    route_snapshot: RouteCutoverState,
+    session_id: u64,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -266,6 +273,27 @@ where
     stats.increment_user_connects(&user);
     stats.increment_user_curr_connects(&user);
     stats.increment_current_connections_me();
+
+    if let Some(cutover) = affected_cutover_state(
+        &route_rx,
+        RelayRouteMode::Middle,
+        route_snapshot.generation,
+    ) {
+        let delay = cutover_stagger_delay(session_id, cutover.generation);
+        warn!(
+            conn_id,
+            target_mode = cutover.mode.as_str(),
+            cutover_generation = cutover.generation,
+            delay_ms = delay.as_millis() as u64,
+            "Cutover affected middle session before relay start, closing client connection"
+        );
+        tokio::time::sleep(delay).await;
+        let _ = me_pool.send_close(conn_id).await;
+        me_pool.registry().unregister(conn_id).await;
+        stats.decrement_current_connections_me();
+        stats.decrement_user_curr_connects(&user);
+        return Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+    }
 
     // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
     let user_tag: Option<Vec<u8>> = config
@@ -354,7 +382,7 @@ where
 
                     let mut batch_frames = 0usize;
                     let mut batch_bytes = 0usize;
-                    let mut flush_immediately = false;
+                    let mut flush_immediately;
 
                     match process_me_writer_response(
                         first,
@@ -498,46 +526,75 @@ where
     let mut main_result: Result<()> = Ok(());
     let mut client_closed = false;
     let mut frame_counter: u64 = 0;
+    let mut route_watch_open = true;
     loop {
-        match read_client_payload(
-            &mut crypto_reader,
-            proto_tag,
-            frame_limit,
-            &forensics,
-            &mut frame_counter,
-            &stats,
-        ).await {
-            Ok(Some((payload, quickack))) => {
-                trace!(conn_id, bytes = payload.len(), "C->ME frame");
-                forensics.bytes_c2me = forensics
-                    .bytes_c2me
-                    .saturating_add(payload.len() as u64);
-                stats.add_user_octets_from(&user, payload.len() as u64);
-                let mut flags = proto_flags;
-                if quickack {
-                    flags |= RPC_FLAG_QUICKACK;
-                }
-                if payload.len() >= 8 && payload[..8].iter().all(|b| *b == 0) {
-                    flags |= RPC_FLAG_NOT_ENCRYPTED;
-                }
-                // Keep client read loop lightweight: route heavy ME send path via a dedicated task.
-                if enqueue_c2me_command(&c2me_tx, C2MeCommand::Data { payload, flags })
-                    .await
-                    .is_err()
-                {
-                    main_result = Err(ProxyError::Proxy("ME sender channel closed".into()));
-                    break;
+        if let Some(cutover) = affected_cutover_state(
+            &route_rx,
+            RelayRouteMode::Middle,
+            route_snapshot.generation,
+        ) {
+            let delay = cutover_stagger_delay(session_id, cutover.generation);
+            warn!(
+                conn_id,
+                target_mode = cutover.mode.as_str(),
+                cutover_generation = cutover.generation,
+                delay_ms = delay.as_millis() as u64,
+                "Cutover affected middle session, closing client connection"
+            );
+            tokio::time::sleep(delay).await;
+            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
+            main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+            break;
+        }
+
+        tokio::select! {
+            changed = route_rx.changed(), if route_watch_open => {
+                if changed.is_err() {
+                    route_watch_open = false;
                 }
             }
-            Ok(None) => {
-                debug!(conn_id, "Client EOF");
-                client_closed = true;
-                let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
-                break;
-            }
-            Err(e) => {
-                main_result = Err(e);
-                break;
+            payload_result = read_client_payload(
+                &mut crypto_reader,
+                proto_tag,
+                frame_limit,
+                &forensics,
+                &mut frame_counter,
+                &stats,
+            ) => {
+                match payload_result {
+                    Ok(Some((payload, quickack))) => {
+                        trace!(conn_id, bytes = payload.len(), "C->ME frame");
+                        forensics.bytes_c2me = forensics
+                            .bytes_c2me
+                            .saturating_add(payload.len() as u64);
+                        stats.add_user_octets_from(&user, payload.len() as u64);
+                        let mut flags = proto_flags;
+                        if quickack {
+                            flags |= RPC_FLAG_QUICKACK;
+                        }
+                        if payload.len() >= 8 && payload[..8].iter().all(|b| *b == 0) {
+                            flags |= RPC_FLAG_NOT_ENCRYPTED;
+                        }
+                        // Keep client read loop lightweight: route heavy ME send path via a dedicated task.
+                        if enqueue_c2me_command(&c2me_tx, C2MeCommand::Data { payload, flags })
+                            .await
+                            .is_err()
+                        {
+                            main_result = Err(ProxyError::Proxy("ME sender channel closed".into()));
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(conn_id, "Client EOF");
+                        client_closed = true;
+                        let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
+                        break;
+                    }
+                    Err(e) => {
+                        main_result = Err(e);
+                        break;
+                    }
+                }
             }
         }
     }

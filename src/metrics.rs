@@ -17,6 +17,7 @@ use crate::config::ProxyConfig;
 use crate::ip_tracker::UserIpTracker;
 use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::Stats;
+use crate::transport::{ListenOptions, create_listener};
 
 pub async fn serve(
     port: u16,
@@ -26,16 +27,90 @@ pub async fn serve(
     config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
     whitelist: Vec<IpNetwork>,
 ) {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!(error = %e, "Failed to bind metrics on {}", addr);
-            return;
-        }
-    };
-    info!("Metrics endpoint: http://{}/metrics and /beobachten", addr);
+    let whitelist = Arc::new(whitelist);
+    let mut listener_v4 = None;
+    let mut listener_v6 = None;
 
+    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    match bind_metrics_listener(addr_v4, false) {
+        Ok(listener) => {
+            info!("Metrics endpoint: http://{}/metrics and /beobachten", addr_v4);
+            listener_v4 = Some(listener);
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to bind metrics on {}", addr_v4);
+        }
+    }
+
+    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    match bind_metrics_listener(addr_v6, true) {
+        Ok(listener) => {
+            info!("Metrics endpoint: http://[::]:{}/metrics and /beobachten", port);
+            listener_v6 = Some(listener);
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to bind metrics on {}", addr_v6);
+        }
+    }
+
+    match (listener_v4, listener_v6) {
+        (None, None) => {
+            warn!("Metrics listener is unavailable on both IPv4 and IPv6");
+        }
+        (Some(listener), None) | (None, Some(listener)) => {
+            serve_listener(
+                listener, stats, beobachten, ip_tracker, config_rx, whitelist,
+            )
+            .await;
+        }
+        (Some(listener4), Some(listener6)) => {
+            let stats_v6 = stats.clone();
+            let beobachten_v6 = beobachten.clone();
+            let ip_tracker_v6 = ip_tracker.clone();
+            let config_rx_v6 = config_rx.clone();
+            let whitelist_v6 = whitelist.clone();
+            tokio::spawn(async move {
+                serve_listener(
+                    listener6,
+                    stats_v6,
+                    beobachten_v6,
+                    ip_tracker_v6,
+                    config_rx_v6,
+                    whitelist_v6,
+                )
+                .await;
+            });
+            serve_listener(
+                listener4,
+                stats,
+                beobachten,
+                ip_tracker,
+                config_rx,
+                whitelist,
+            )
+            .await;
+        }
+    }
+}
+
+fn bind_metrics_listener(addr: SocketAddr, ipv6_only: bool) -> std::io::Result<TcpListener> {
+    let options = ListenOptions {
+        reuse_port: false,
+        ipv6_only,
+        ..Default::default()
+    };
+    let socket = create_listener(addr, &options)?;
+    TcpListener::from_std(socket.into())
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    stats: Arc<Stats>,
+    beobachten: Arc<BeobachtenStore>,
+    ip_tracker: Arc<UserIpTracker>,
+    config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
+    whitelist: Arc<Vec<IpNetwork>>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -1699,14 +1774,24 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
             "# HELP telemt_user_unique_ips_recent_window Per-user unique IPs seen in configured observation window"
         );
         let _ = writeln!(out, "# TYPE telemt_user_unique_ips_recent_window gauge");
-        let _ = writeln!(out, "# HELP telemt_user_unique_ips_limit Per-user configured unique IP limit (0 means unlimited)");
+        let _ = writeln!(out, "# HELP telemt_user_unique_ips_limit Effective per-user unique IP limit (0 means unlimited)");
         let _ = writeln!(out, "# TYPE telemt_user_unique_ips_limit gauge");
         let _ = writeln!(out, "# HELP telemt_user_unique_ips_utilization Per-user unique IP usage ratio (0 for unlimited)");
         let _ = writeln!(out, "# TYPE telemt_user_unique_ips_utilization gauge");
 
         for user in unique_users {
             let current = ip_counts.get(&user).copied().unwrap_or(0);
-            let limit = config.access.user_max_unique_ips.get(&user).copied().unwrap_or(0);
+            let limit = config
+                .access
+                .user_max_unique_ips
+                .get(&user)
+                .copied()
+                .filter(|limit| *limit > 0)
+                .or(
+                    (config.access.user_max_unique_ips_global_each > 0)
+                        .then_some(config.access.user_max_unique_ips_global_each),
+                )
+                .unwrap_or(0);
             let utilization = if limit > 0 {
                 current as f64 / limit as f64
             } else {
@@ -1827,6 +1912,25 @@ mod tests {
         assert!(output.contains("telemt_handshake_timeouts_total 0"));
         assert!(output.contains("telemt_user_unique_ips_current{user="));
         assert!(output.contains("telemt_user_unique_ips_recent_window{user="));
+    }
+
+    #[tokio::test]
+    async fn test_render_uses_global_each_unique_ip_limit() {
+        let stats = Stats::new();
+        stats.increment_user_connects("alice");
+        stats.increment_user_curr_connects("alice");
+        let tracker = UserIpTracker::new();
+        tracker
+            .check_and_add("alice", "203.0.113.10".parse().unwrap())
+            .await
+            .unwrap();
+        let mut config = ProxyConfig::default();
+        config.access.user_max_unique_ips_global_each = 2;
+
+        let output = render_metrics(&stats, &config, &tracker).await;
+
+        assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 2"));
+        assert!(output.contains("telemt_user_unique_ips_utilization{user=\"alice\"} 0.500000"));
     }
 
     #[tokio::test]

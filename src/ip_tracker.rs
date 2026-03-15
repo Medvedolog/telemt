@@ -17,6 +17,7 @@ pub struct UserIpTracker {
     active_ips: Arc<RwLock<HashMap<String, HashMap<IpAddr, usize>>>>,
     recent_ips: Arc<RwLock<HashMap<String, HashMap<IpAddr, Instant>>>>,
     max_ips: Arc<RwLock<HashMap<String, usize>>>,
+    default_max_ips: Arc<RwLock<usize>>,
     limit_mode: Arc<RwLock<UserMaxUniqueIpsMode>>,
     limit_window: Arc<RwLock<Duration>>,
     last_compact_epoch_secs: Arc<AtomicU64>,
@@ -28,6 +29,7 @@ impl UserIpTracker {
             active_ips: Arc::new(RwLock::new(HashMap::new())),
             recent_ips: Arc::new(RwLock::new(HashMap::new())),
             max_ips: Arc::new(RwLock::new(HashMap::new())),
+            default_max_ips: Arc::new(RwLock::new(0)),
             limit_mode: Arc::new(RwLock::new(UserMaxUniqueIpsMode::ActiveWindow)),
             limit_window: Arc::new(RwLock::new(Duration::from_secs(30))),
             last_compact_epoch_secs: Arc::new(AtomicU64::new(0)),
@@ -100,7 +102,10 @@ impl UserIpTracker {
         limits.remove(username);
     }
 
-    pub async fn load_limits(&self, limits: &HashMap<String, usize>) {
+    pub async fn load_limits(&self, default_limit: usize, limits: &HashMap<String, usize>) {
+        let mut default_max_ips = self.default_max_ips.write().await;
+        *default_max_ips = default_limit;
+        drop(default_max_ips);
         let mut max_ips = self.max_ips.write().await;
         max_ips.clone_from(limits);
     }
@@ -114,9 +119,14 @@ impl UserIpTracker {
 
     pub async fn check_and_add(&self, username: &str, ip: IpAddr) -> Result<(), String> {
         self.maybe_compact_empty_users().await;
+        let default_max_ips = *self.default_max_ips.read().await;
         let limit = {
             let max_ips = self.max_ips.read().await;
-            max_ips.get(username).copied()
+            max_ips
+                .get(username)
+                .copied()
+                .filter(|limit| *limit > 0)
+                .or((default_max_ips > 0).then_some(default_max_ips))
         };
         let mode = *self.limit_mode.read().await;
         let window = *self.limit_window.read().await;
@@ -255,10 +265,16 @@ impl UserIpTracker {
     pub async fn get_stats(&self) -> Vec<(String, usize, usize)> {
         let active_ips = self.active_ips.read().await;
         let max_ips = self.max_ips.read().await;
+        let default_max_ips = *self.default_max_ips.read().await;
 
         let mut stats = Vec::new();
         for (username, user_ips) in active_ips.iter() {
-            let limit = max_ips.get(username).copied().unwrap_or(0);
+            let limit = max_ips
+                .get(username)
+                .copied()
+                .filter(|limit| *limit > 0)
+                .or((default_max_ips > 0).then_some(default_max_ips))
+                .unwrap_or(0);
             stats.push((username.clone(), user_ips.len(), limit));
         }
 
@@ -293,8 +309,13 @@ impl UserIpTracker {
     }
 
     pub async fn get_user_limit(&self, username: &str) -> Option<usize> {
+        let default_max_ips = *self.default_max_ips.read().await;
         let max_ips = self.max_ips.read().await;
-        max_ips.get(username).copied()
+        max_ips
+            .get(username)
+            .copied()
+            .filter(|limit| *limit > 0)
+            .or((default_max_ips > 0).then_some(default_max_ips))
     }
 
     pub async fn format_stats(&self) -> String {
@@ -546,7 +567,7 @@ mod tests {
         config_limits.insert("user1".to_string(), 5);
         config_limits.insert("user2".to_string(), 3);
 
-        tracker.load_limits(&config_limits).await;
+        tracker.load_limits(0, &config_limits).await;
 
         assert_eq!(tracker.get_user_limit("user1").await, Some(5));
         assert_eq!(tracker.get_user_limit("user2").await, Some(3));
@@ -560,14 +581,44 @@ mod tests {
         let mut first = HashMap::new();
         first.insert("user1".to_string(), 2);
         first.insert("user2".to_string(), 3);
-        tracker.load_limits(&first).await;
+        tracker.load_limits(0, &first).await;
 
         let mut second = HashMap::new();
         second.insert("user2".to_string(), 5);
-        tracker.load_limits(&second).await;
+        tracker.load_limits(0, &second).await;
 
         assert_eq!(tracker.get_user_limit("user1").await, None);
         assert_eq!(tracker.get_user_limit("user2").await, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_global_each_limit_applies_without_user_override() {
+        let tracker = UserIpTracker::new();
+        tracker.load_limits(2, &HashMap::new()).await;
+
+        let ip1 = test_ipv4(172, 16, 0, 1);
+        let ip2 = test_ipv4(172, 16, 0, 2);
+        let ip3 = test_ipv4(172, 16, 0, 3);
+
+        assert!(tracker.check_and_add("test_user", ip1).await.is_ok());
+        assert!(tracker.check_and_add("test_user", ip2).await.is_ok());
+        assert!(tracker.check_and_add("test_user", ip3).await.is_err());
+        assert_eq!(tracker.get_user_limit("test_user").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_user_override_wins_over_global_each_limit() {
+        let tracker = UserIpTracker::new();
+        let mut limits = HashMap::new();
+        limits.insert("test_user".to_string(), 1);
+        tracker.load_limits(3, &limits).await;
+
+        let ip1 = test_ipv4(172, 17, 0, 1);
+        let ip2 = test_ipv4(172, 17, 0, 2);
+
+        assert!(tracker.check_and_add("test_user", ip1).await.is_ok());
+        assert!(tracker.check_and_add("test_user", ip2).await.is_err());
+        assert_eq!(tracker.get_user_limit("test_user").await, Some(1));
     }
 
     #[tokio::test]

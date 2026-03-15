@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 
 use crate::config::{MeFloorMode, MeWriterPickMode, ProxyConfig, UserMaxUniqueIpsMode};
+use crate::proxy::route_mode::RelayRouteMode;
 
 use super::ApiShared;
 use super::runtime_init::build_runtime_startup_summary;
@@ -35,6 +36,10 @@ pub(super) struct RuntimeGatesData {
     pub(super) me_runtime_ready: bool,
     pub(super) me2dc_fallback_enabled: bool,
     pub(super) use_middle_proxy: bool,
+    pub(super) route_mode: &'static str,
+    pub(super) reroute_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reroute_to_direct_at_epoch_secs: Option<u64>,
     pub(super) startup_status: &'static str,
     pub(super) startup_stage: String,
     pub(super) startup_progress_pct: f64,
@@ -85,6 +90,7 @@ pub(super) struct EffectiveMiddleProxyLimits {
 
 #[derive(Serialize)]
 pub(super) struct EffectiveUserIpPolicyLimits {
+    pub(super) global_each: usize,
     pub(super) mode: &'static str,
     pub(super) window_secs: u64,
 }
@@ -157,6 +163,16 @@ pub(super) async fn build_runtime_gates_data(
     cfg: &ProxyConfig,
 ) -> RuntimeGatesData {
     let startup_summary = build_runtime_startup_summary(shared).await;
+    let route_state = shared.route_runtime.snapshot();
+    let route_mode = route_state.mode.as_str();
+    let reroute_active = cfg.general.use_middle_proxy
+        && cfg.general.me2dc_fallback
+        && matches!(route_state.mode, RelayRouteMode::Direct);
+    let reroute_to_direct_at_epoch_secs = if reroute_active {
+        shared.route_runtime.direct_since_epoch_secs()
+    } else {
+        None
+    };
     let me_runtime_ready = if !cfg.general.use_middle_proxy {
         true
     } else {
@@ -175,6 +191,9 @@ pub(super) async fn build_runtime_gates_data(
         me_runtime_ready,
         me2dc_fallback_enabled: cfg.general.me2dc_fallback,
         use_middle_proxy: cfg.general.use_middle_proxy,
+        route_mode,
+        reroute_active,
+        reroute_to_direct_at_epoch_secs,
         startup_status: startup_summary.status,
         startup_stage: startup_summary.stage,
         startup_progress_pct: startup_summary.progress_pct,
@@ -244,6 +263,7 @@ pub(super) fn build_limits_effective_data(cfg: &ProxyConfig) -> EffectiveLimitsD
             me2dc_fallback: cfg.general.me2dc_fallback,
         },
         user_ip_policy: EffectiveUserIpPolicyLimits {
+            global_each: cfg.access.user_max_unique_ips_global_each,
             mode: user_max_unique_ips_mode_label(cfg.access.user_max_unique_ips_mode),
             window_secs: cfg.access.user_max_unique_ips_window_secs,
         },

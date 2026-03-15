@@ -21,9 +21,11 @@
 //! `network.*`, `use_middle_proxy`) are **not** applied; a warning is emitted.
 //! Non-hot changes are never mixed into the runtime config snapshot.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::Duration;
 
 use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::{mpsc, watch};
@@ -33,7 +35,10 @@ use crate::config::{
     LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel,
     MeWriterPickMode,
 };
-use super::load::ProxyConfig;
+use super::load::{LoadedConfig, ProxyConfig};
+
+const HOT_RELOAD_STABLE_SNAPSHOTS: u8 = 2;
+const HOT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(50);
 
 // ── Hot fields ────────────────────────────────────────────────────────────────
 
@@ -50,6 +55,7 @@ pub struct HotFields {
     pub me_reinit_coalesce_window_ms: u64,
     pub hardswap:                bool,
     pub me_pool_drain_ttl_secs:  u64,
+    pub me_pool_drain_threshold: u64,
     pub me_pool_min_fresh_ratio: f32,
     pub me_reinit_drain_timeout_secs: u64,
     pub me_hardswap_warmup_delay_min_ms: u64,
@@ -113,6 +119,7 @@ pub struct HotFields {
     pub user_expirations:        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     pub user_data_quota:         std::collections::HashMap<String, u64>,
     pub user_max_unique_ips:     std::collections::HashMap<String, usize>,
+    pub user_max_unique_ips_global_each: usize,
     pub user_max_unique_ips_mode: crate::config::UserMaxUniqueIpsMode,
     pub user_max_unique_ips_window_secs: u64,
 }
@@ -130,6 +137,7 @@ impl HotFields {
             me_reinit_coalesce_window_ms: cfg.general.me_reinit_coalesce_window_ms,
             hardswap:                cfg.general.hardswap,
             me_pool_drain_ttl_secs:  cfg.general.me_pool_drain_ttl_secs,
+            me_pool_drain_threshold: cfg.general.me_pool_drain_threshold,
             me_pool_min_fresh_ratio: cfg.general.me_pool_min_fresh_ratio,
             me_reinit_drain_timeout_secs: cfg.general.me_reinit_drain_timeout_secs,
             me_hardswap_warmup_delay_min_ms: cfg.general.me_hardswap_warmup_delay_min_ms,
@@ -227,6 +235,7 @@ impl HotFields {
             user_expirations:        cfg.access.user_expirations.clone(),
             user_data_quota:         cfg.access.user_data_quota.clone(),
             user_max_unique_ips:     cfg.access.user_max_unique_ips.clone(),
+            user_max_unique_ips_global_each: cfg.access.user_max_unique_ips_global_each,
             user_max_unique_ips_mode: cfg.access.user_max_unique_ips_mode,
             user_max_unique_ips_window_secs: cfg.access.user_max_unique_ips_window_secs,
         }
@@ -287,6 +296,149 @@ fn listeners_equal(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WatchManifest {
+    files: BTreeSet<PathBuf>,
+    dirs: BTreeSet<PathBuf>,
+}
+
+impl WatchManifest {
+    fn from_source_files(source_files: &[PathBuf]) -> Self {
+        let mut files = BTreeSet::new();
+        let mut dirs = BTreeSet::new();
+
+        for path in source_files {
+            let normalized = normalize_watch_path(path);
+            files.insert(normalized.clone());
+            if let Some(parent) = normalized.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+
+        Self { files, dirs }
+    }
+
+    fn matches_event_paths(&self, event_paths: &[PathBuf]) -> bool {
+        event_paths
+            .iter()
+            .map(|path| normalize_watch_path(path))
+            .any(|path| self.files.contains(&path))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReloadState {
+    applied_snapshot_hash: Option<u64>,
+    candidate_snapshot_hash: Option<u64>,
+    candidate_hits: u8,
+}
+
+impl ReloadState {
+    fn new(applied_snapshot_hash: Option<u64>) -> Self {
+        Self {
+            applied_snapshot_hash,
+            candidate_snapshot_hash: None,
+            candidate_hits: 0,
+        }
+    }
+
+    fn is_applied(&self, hash: u64) -> bool {
+        self.applied_snapshot_hash == Some(hash)
+    }
+
+    fn observe_candidate(&mut self, hash: u64) -> u8 {
+        if self.candidate_snapshot_hash == Some(hash) {
+            self.candidate_hits = self.candidate_hits.saturating_add(1);
+        } else {
+            self.candidate_snapshot_hash = Some(hash);
+            self.candidate_hits = 1;
+        }
+        self.candidate_hits
+    }
+
+    fn reset_candidate(&mut self) {
+        self.candidate_snapshot_hash = None;
+        self.candidate_hits = 0;
+    }
+
+    fn mark_applied(&mut self, hash: u64) {
+        self.applied_snapshot_hash = Some(hash);
+        self.reset_candidate();
+    }
+}
+
+fn normalize_watch_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+fn sync_watch_paths<W: Watcher>(
+    watcher: &mut W,
+    current: &BTreeSet<PathBuf>,
+    next: &BTreeSet<PathBuf>,
+    recursive_mode: RecursiveMode,
+    kind: &str,
+) {
+    for path in current.difference(next) {
+        if let Err(e) = watcher.unwatch(path) {
+            warn!(path = %path.display(), error = %e, "config watcher: failed to unwatch {kind}");
+        }
+    }
+
+    for path in next.difference(current) {
+        if let Err(e) = watcher.watch(path, recursive_mode) {
+            warn!(path = %path.display(), error = %e, "config watcher: failed to watch {kind}");
+        }
+    }
+}
+
+fn apply_watch_manifest<W1: Watcher, W2: Watcher>(
+    notify_watcher: Option<&mut W1>,
+    poll_watcher: Option<&mut W2>,
+    manifest_state: &Arc<StdRwLock<WatchManifest>>,
+    next_manifest: WatchManifest,
+) {
+    let current_manifest = manifest_state
+        .read()
+        .map(|manifest| manifest.clone())
+        .unwrap_or_default();
+
+    if current_manifest == next_manifest {
+        return;
+    }
+
+    if let Some(watcher) = notify_watcher {
+        sync_watch_paths(
+            watcher,
+            &current_manifest.dirs,
+            &next_manifest.dirs,
+            RecursiveMode::NonRecursive,
+            "config directory",
+        );
+    }
+
+    if let Some(watcher) = poll_watcher {
+        sync_watch_paths(
+            watcher,
+            &current_manifest.files,
+            &next_manifest.files,
+            RecursiveMode::NonRecursive,
+            "config file",
+        );
+    }
+
+    if let Ok(mut manifest) = manifest_state.write() {
+        *manifest = next_manifest;
+    }
+}
+
 fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     let mut cfg = old.clone();
 
@@ -302,6 +454,7 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.general.me_reinit_coalesce_window_ms = new.general.me_reinit_coalesce_window_ms;
     cfg.general.hardswap = new.general.hardswap;
     cfg.general.me_pool_drain_ttl_secs = new.general.me_pool_drain_ttl_secs;
+    cfg.general.me_pool_drain_threshold = new.general.me_pool_drain_threshold;
     cfg.general.me_pool_min_fresh_ratio = new.general.me_pool_min_fresh_ratio;
     cfg.general.me_reinit_drain_timeout_secs = new.general.me_reinit_drain_timeout_secs;
     cfg.general.me_hardswap_warmup_delay_min_ms = new.general.me_hardswap_warmup_delay_min_ms;
@@ -384,6 +537,7 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.access.user_expirations = new.access.user_expirations.clone();
     cfg.access.user_data_quota = new.access.user_data_quota.clone();
     cfg.access.user_max_unique_ips = new.access.user_max_unique_ips.clone();
+    cfg.access.user_max_unique_ips_global_each = new.access.user_max_unique_ips_global_each;
     cfg.access.user_max_unique_ips_mode = new.access.user_max_unique_ips_mode;
     cfg.access.user_max_unique_ips_window_secs = new.access.user_max_unique_ips_window_secs;
 
@@ -675,6 +829,13 @@ fn log_changes(
         );
     }
 
+    if old_hot.me_pool_drain_threshold != new_hot.me_pool_drain_threshold {
+        info!(
+            "config reload: me_pool_drain_threshold: {} → {}",
+            old_hot.me_pool_drain_threshold, new_hot.me_pool_drain_threshold,
+        );
+    }
+
     if (old_hot.me_pool_min_fresh_ratio - new_hot.me_pool_min_fresh_ratio).abs() > f32::EPSILON {
         info!(
             "config reload: me_pool_min_fresh_ratio: {:.3} → {:.3}",
@@ -951,12 +1112,14 @@ fn log_changes(
             new_hot.user_max_unique_ips.len()
         );
     }
-    if old_hot.user_max_unique_ips_mode != new_hot.user_max_unique_ips_mode
+    if old_hot.user_max_unique_ips_global_each != new_hot.user_max_unique_ips_global_each
+        || old_hot.user_max_unique_ips_mode != new_hot.user_max_unique_ips_mode
         || old_hot.user_max_unique_ips_window_secs
             != new_hot.user_max_unique_ips_window_secs
     {
         info!(
-            "config reload: user_max_unique_ips policy mode={:?} window={}s",
+            "config reload: user_max_unique_ips policy global_each={} mode={:?} window={}s",
+            new_hot.user_max_unique_ips_global_each,
             new_hot.user_max_unique_ips_mode,
             new_hot.user_max_unique_ips_window_secs
         );
@@ -970,18 +1133,42 @@ fn reload_config(
     log_tx: &watch::Sender<LogLevel>,
     detected_ip_v4: Option<IpAddr>,
     detected_ip_v6: Option<IpAddr>,
-) {
-    let new_cfg = match ProxyConfig::load(config_path) {
-        Ok(c) => c,
+    reload_state: &mut ReloadState,
+) -> Option<WatchManifest> {
+    let loaded = match ProxyConfig::load_with_metadata(config_path) {
+        Ok(loaded) => loaded,
         Err(e) => {
+            reload_state.reset_candidate();
             error!("config reload: failed to parse {:?}: {}", config_path, e);
-            return;
+            return None;
         }
     };
+    let LoadedConfig {
+        config: new_cfg,
+        source_files,
+        rendered_hash,
+    } = loaded;
+    let next_manifest = WatchManifest::from_source_files(&source_files);
 
     if let Err(e) = new_cfg.validate() {
+        reload_state.reset_candidate();
         error!("config reload: validation failed: {}; keeping old config", e);
-        return;
+        return Some(next_manifest);
+    }
+
+    if reload_state.is_applied(rendered_hash) {
+        return Some(next_manifest);
+    }
+
+    let candidate_hits = reload_state.observe_candidate(rendered_hash);
+    if candidate_hits < HOT_RELOAD_STABLE_SNAPSHOTS {
+        info!(
+            snapshot_hash = rendered_hash,
+            candidate_hits,
+            required_hits = HOT_RELOAD_STABLE_SNAPSHOTS,
+            "config reload: candidate snapshot observed but not stable yet"
+        );
+        return Some(next_manifest);
     }
 
     let old_cfg = config_tx.borrow().clone();
@@ -996,17 +1183,19 @@ fn reload_config(
     }
 
     if !hot_changed {
-        return;
+        reload_state.mark_applied(rendered_hash);
+        return Some(next_manifest);
     }
 
     if old_hot.dns_overrides != applied_hot.dns_overrides
         && let Err(e) = crate::network::dns_overrides::install_entries(&applied_hot.dns_overrides)
     {
+        reload_state.reset_candidate();
         error!(
             "config reload: invalid network.dns_overrides: {}; keeping old config",
             e
         );
-        return;
+        return Some(next_manifest);
     }
 
     log_changes(
@@ -1018,6 +1207,8 @@ fn reload_config(
         detected_ip_v6,
     );
     config_tx.send(Arc::new(applied_cfg)).ok();
+    reload_state.mark_applied(rendered_hash);
+    Some(next_manifest)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1040,80 +1231,86 @@ pub fn spawn_config_watcher(
     let (config_tx, config_rx) = watch::channel(initial);
     let (log_tx, log_rx)       = watch::channel(initial_level);
 
-    // Bridge: sync notify callbacks → async task via mpsc.
-    let (notify_tx, mut notify_rx) = mpsc::channel::<()>(4);
+    let config_path = normalize_watch_path(&config_path);
+    let initial_loaded = ProxyConfig::load_with_metadata(&config_path).ok();
+    let initial_manifest = initial_loaded
+        .as_ref()
+        .map(|loaded| WatchManifest::from_source_files(&loaded.source_files))
+        .unwrap_or_else(|| WatchManifest::from_source_files(std::slice::from_ref(&config_path)));
+    let initial_snapshot_hash = initial_loaded.as_ref().map(|loaded| loaded.rendered_hash);
 
-    // Canonicalize so path matches what notify returns (absolute) in events.
-    let config_path = match config_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => config_path.to_path_buf(),
-    };
-
-    // Watch the parent directory rather than the file itself, because many
-    // editors (vim, nano) and systemd write via rename, which would cause
-    // inotify to lose track of the original inode.
-    let watch_dir = config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-
-    // ── inotify watcher (instant on local fs) ────────────────────────────
-    let config_file = config_path.clone();
-    let tx_inotify  = notify_tx.clone();
-    let inotify_ok = match recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(event) = res else { return };
-        let is_our_file = event.paths.iter().any(|p| p == &config_file);
-        if !is_our_file { return; }
-        if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
-            let _ = tx_inotify.try_send(());
-        }
-    }) {
-        Ok(mut w) => match w.watch(&watch_dir, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                info!("config watcher: inotify active on {:?}", config_path);
-                Box::leak(Box::new(w));
-                true
-            }
-            Err(e) => { warn!("config watcher: inotify watch failed: {}", e); false }
-        },
-        Err(e) => { warn!("config watcher: inotify unavailable: {}", e); false }
-    };
-
-    // ── poll watcher (always active, fixes Docker bind mounts / NFS) ─────
-    // inotify does not receive events for files mounted from the host into
-    // a container. PollWatcher compares file contents every 3 s and fires
-    // on any change regardless of the underlying fs.
-    let config_file2 = config_path.clone();
-    let tx_poll      = notify_tx.clone();
-    match notify::poll::PollWatcher::new(
-        move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            let is_our_file = event.paths.iter().any(|p| p == &config_file2);
-            if !is_our_file { return; }
-            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
-                let _ = tx_poll.try_send(());
-            }
-        },
-        notify::Config::default()
-            .with_poll_interval(std::time::Duration::from_secs(3))
-            .with_compare_contents(true),
-    ) {
-        Ok(mut w) => match w.watch(&config_path, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                if inotify_ok {
-                    info!("config watcher: poll watcher also active (Docker/NFS safe)");
-                } else {
-                    info!("config watcher: poll watcher active on {:?} (3s interval)", config_path);
-                }
-                Box::leak(Box::new(w));
-            }
-            Err(e) => warn!("config watcher: poll watch failed: {}", e),
-        },
-        Err(e) => warn!("config watcher: poll watcher unavailable: {}", e),
-    }
-
-    // ── event loop ───────────────────────────────────────────────────────
     tokio::spawn(async move {
+        let (notify_tx, mut notify_rx) = mpsc::channel::<()>(4);
+        let manifest_state = Arc::new(StdRwLock::new(WatchManifest::default()));
+        let mut reload_state = ReloadState::new(initial_snapshot_hash);
+
+        let tx_inotify = notify_tx.clone();
+        let manifest_for_inotify = manifest_state.clone();
+        let mut inotify_watcher = match recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+                return;
+            }
+            let is_our_file = manifest_for_inotify
+                .read()
+                .map(|manifest| manifest.matches_event_paths(&event.paths))
+                .unwrap_or(false);
+            if is_our_file {
+                let _ = tx_inotify.try_send(());
+            }
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                warn!("config watcher: inotify unavailable: {}", e);
+                None
+            }
+        };
+        apply_watch_manifest(
+            inotify_watcher.as_mut(),
+            Option::<&mut notify::poll::PollWatcher>::None,
+            &manifest_state,
+            initial_manifest.clone(),
+        );
+        if inotify_watcher.is_some() {
+            info!("config watcher: inotify active on {:?}", config_path);
+        }
+
+        let tx_poll = notify_tx.clone();
+        let manifest_for_poll = manifest_state.clone();
+        let mut poll_watcher = match notify::poll::PollWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+                    return;
+                }
+                let is_our_file = manifest_for_poll
+                    .read()
+                    .map(|manifest| manifest.matches_event_paths(&event.paths))
+                    .unwrap_or(false);
+                if is_our_file {
+                    let _ = tx_poll.try_send(());
+                }
+            },
+            notify::Config::default()
+                .with_poll_interval(Duration::from_secs(3))
+                .with_compare_contents(true),
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                warn!("config watcher: poll watcher unavailable: {}", e);
+                None
+            }
+        };
+        apply_watch_manifest(
+            Option::<&mut notify::RecommendedWatcher>::None,
+            poll_watcher.as_mut(),
+            &manifest_state,
+            initial_manifest.clone(),
+        );
+        if poll_watcher.is_some() {
+            info!("config watcher: poll watcher active (Docker/NFS safe)");
+        }
+
         #[cfg(unix)]
         let mut sighup = {
             use tokio::signal::unix::{SignalKind, signal};
@@ -1133,11 +1330,25 @@ pub fn spawn_config_watcher(
             #[cfg(not(unix))]
             if notify_rx.recv().await.is_none() { break; }
 
-            // Debounce: drain extra events that arrive within 50 ms.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Debounce: drain extra events that arrive within a short quiet window.
+            tokio::time::sleep(HOT_RELOAD_DEBOUNCE).await;
             while notify_rx.try_recv().is_ok() {}
 
-            reload_config(&config_path, &config_tx, &log_tx, detected_ip_v4, detected_ip_v6);
+            if let Some(next_manifest) = reload_config(
+                &config_path,
+                &config_tx,
+                &log_tx,
+                detected_ip_v4,
+                detected_ip_v6,
+                &mut reload_state,
+            ) {
+                apply_watch_manifest(
+                    inotify_watcher.as_mut(),
+                    poll_watcher.as_mut(),
+                    &manifest_state,
+                    next_manifest,
+                );
+            }
         }
     });
 
@@ -1150,6 +1361,40 @@ mod tests {
 
     fn sample_config() -> ProxyConfig {
         ProxyConfig::default()
+    }
+
+    fn write_reload_config(path: &Path, ad_tag: Option<&str>, server_port: Option<u16>) {
+        let mut config = String::from(
+            r#"
+                [censorship]
+                tls_domain = "example.com"
+
+                [access.users]
+                user = "00000000000000000000000000000000"
+            "#,
+        );
+
+        if ad_tag.is_some() {
+            config.push_str("\n[general]\n");
+            if let Some(tag) = ad_tag {
+                config.push_str(&format!("ad_tag = \"{tag}\"\n"));
+            }
+        }
+
+        if let Some(port) = server_port {
+            config.push_str("\n[server]\n");
+            config.push_str(&format!("port = {port}\n"));
+        }
+
+        std::fs::write(path, config).unwrap();
+    }
+
+    fn temp_config_path(prefix: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{nonce}.toml"))
     }
 
     #[test]
@@ -1218,5 +1463,62 @@ mod tests {
         assert_eq!(applied.general.hardswap, new.general.hardswap);
         assert_eq!(applied.general.use_middle_proxy, old.general.use_middle_proxy);
         assert!(!config_equal(&applied, &new));
+    }
+
+    #[test]
+    fn reload_requires_stable_snapshot_before_hot_apply() {
+        let initial_tag = "11111111111111111111111111111111";
+        let final_tag = "22222222222222222222222222222222";
+        let path = temp_config_path("telemt_hot_reload_stable");
+
+        write_reload_config(&path, Some(initial_tag), None);
+        let initial_cfg = Arc::new(ProxyConfig::load(&path).unwrap());
+        let initial_hash = ProxyConfig::load_with_metadata(&path).unwrap().rendered_hash;
+        let (config_tx, _config_rx) = watch::channel(initial_cfg.clone());
+        let (log_tx, _log_rx) = watch::channel(initial_cfg.general.log_level.clone());
+        let mut reload_state = ReloadState::new(Some(initial_hash));
+
+        write_reload_config(&path, None, None);
+        reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+        assert_eq!(
+            config_tx.borrow().general.ad_tag.as_deref(),
+            Some(initial_tag)
+        );
+
+        write_reload_config(&path, Some(final_tag), None);
+        reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+        assert_eq!(
+            config_tx.borrow().general.ad_tag.as_deref(),
+            Some(initial_tag)
+        );
+
+        reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+        assert_eq!(config_tx.borrow().general.ad_tag.as_deref(), Some(final_tag));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_keeps_hot_apply_when_non_hot_fields_change() {
+        let initial_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let final_tag = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let path = temp_config_path("telemt_hot_reload_mixed");
+
+        write_reload_config(&path, Some(initial_tag), None);
+        let initial_cfg = Arc::new(ProxyConfig::load(&path).unwrap());
+        let initial_hash = ProxyConfig::load_with_metadata(&path).unwrap().rendered_hash;
+        let (config_tx, _config_rx) = watch::channel(initial_cfg.clone());
+        let (log_tx, _log_rx) = watch::channel(initial_cfg.general.log_level.clone());
+        let mut reload_state = ReloadState::new(Some(initial_hash));
+
+        write_reload_config(&path, Some(final_tag), Some(initial_cfg.server.port + 1));
+        reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+        reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+
+        let applied = config_tx.borrow().clone();
+        assert_eq!(applied.general.ad_tag.as_deref(), Some(final_tag));
+        assert_eq!(applied.server.port, initial_cfg.server.port);
+
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -163,6 +163,7 @@ impl MePool {
         let writer = MeWriter {
             id: writer_id,
             addr,
+            source_ip: hs.source_ip,
             writer_dc,
             generation,
             contour: contour.clone(),
@@ -177,6 +178,7 @@ impl MePool {
             allow_drain_fallback: allow_drain_fallback.clone(),
         };
         self.writers.write().await.push(writer.clone());
+        self.registry.register_writer(writer_id, tx.clone()).await;
         self.registry.mark_writer_idle(writer_id).await;
         self.conn_count.fetch_add(1, Ordering::Relaxed);
         self.writer_available.notify_one();
@@ -413,9 +415,15 @@ impl MePool {
                 };
 
                 let (conn_id, mut service_rx) = pool.registry.register().await;
-                pool.registry
-                    .bind_writer(conn_id, writer_id, tx_signal.clone(), meta.clone())
-                    .await;
+                if !pool
+                    .registry
+                    .bind_writer(conn_id, writer_id, meta.clone())
+                    .await
+                {
+                    let _ = pool.registry.unregister(conn_id).await;
+                    stats_signal.increment_me_rpc_proxy_req_signal_skipped_no_meta_total();
+                    continue;
+                }
 
                 let payload = build_proxy_req_payload(
                     conn_id,
@@ -520,6 +528,12 @@ impl MePool {
                 self.conn_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        let conns = self.registry.writer_lost(writer_id).await;
+        {
+            let mut tracker = self.ping_tracker.lock().await;
+            tracker.retain(|_, (_, wid)| *wid != writer_id);
+        }
+        self.rtt_stats.lock().await.remove(&writer_id);
         if let Some(tx) = close_tx {
             let _ = tx.send(WriterCommand::Close).await;
         }
@@ -532,8 +546,7 @@ impl MePool {
             }
             self.trigger_immediate_refill_for_dc(addr, writer_dc);
         }
-        self.rtt_stats.lock().await.remove(&writer_id);
-        self.registry.writer_lost(writer_id).await
+        conns
     }
 
     pub(crate) async fn mark_writer_draining_with_timeout(

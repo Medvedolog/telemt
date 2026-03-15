@@ -34,6 +34,7 @@ pub(super) struct RefillEndpointKey {
 pub struct MeWriter {
     pub id: u64,
     pub addr: SocketAddr,
+    pub source_ip: IpAddr,
     pub writer_dc: i32,
     pub generation: u64,
     pub contour: Arc<AtomicU8>,
@@ -170,6 +171,7 @@ pub struct MePool {
     pub(super) endpoint_quarantine: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     pub(super) kdf_material_fingerprint: Arc<RwLock<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
+    pub(super) me_pool_drain_threshold: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
     pub(super) me_hardswap_warmup_delay_min_ms: AtomicU64,
@@ -270,6 +272,7 @@ impl MePool {
         me_adaptive_floor_max_warm_writers_global: u32,
         hardswap: bool,
         me_pool_drain_ttl_secs: u64,
+        me_pool_drain_threshold: u64,
         me_pool_force_close_secs: u64,
         me_pool_min_fresh_ratio: f32,
         me_hardswap_warmup_delay_min_ms: u64,
@@ -445,6 +448,7 @@ impl MePool {
             endpoint_quarantine: Arc::new(Mutex::new(HashMap::new())),
             kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
+            me_pool_drain_threshold: AtomicU64::new(me_pool_drain_threshold),
             me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
             me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(
                 me_pool_min_fresh_ratio,
@@ -491,6 +495,7 @@ impl MePool {
         &self,
         hardswap: bool,
         drain_ttl_secs: u64,
+        pool_drain_threshold: u64,
         force_close_secs: u64,
         min_fresh_ratio: f32,
         hardswap_warmup_delay_min_ms: u64,
@@ -529,6 +534,8 @@ impl MePool {
         self.hardswap.store(hardswap, Ordering::Relaxed);
         self.me_pool_drain_ttl_secs
             .store(drain_ttl_secs, Ordering::Relaxed);
+        self.me_pool_drain_threshold
+            .store(pool_drain_threshold, Ordering::Relaxed);
         self.me_pool_force_close_secs
             .store(force_close_secs, Ordering::Relaxed);
         self.me_pool_min_fresh_ratio_permille
@@ -638,9 +645,9 @@ impl MePool {
         }
     }
 
+    /// Translate the local ME address into the address material sent to the proxy.
     pub fn translate_our_addr(&self, addr: SocketAddr) -> SocketAddr {
-        let ip = self.translate_ip_for_nat(addr.ip());
-        SocketAddr::new(ip, addr.port())
+        self.translate_our_addr_with_reflection(addr, None)
     }
 
     pub fn registry(&self) -> &Arc<ConnRegistry> {
@@ -828,10 +835,29 @@ impl MePool {
         effective
     }
 
+    // Keeps per-contour (active/warm) writer budget bounded by CPU count.
+    // Baseline is 86 writers on the first core and +48 for each extra core.
+    fn adaptive_floor_cpu_budget_per_contour_cap(&self, cores: usize) -> usize {
+        const FIRST_CORE_WRITER_BUDGET: usize = 86;
+        const EXTRA_CORE_WRITER_BUDGET: usize = 48;
+        if cores == 0 {
+            return FIRST_CORE_WRITER_BUDGET;
+        }
+        FIRST_CORE_WRITER_BUDGET.saturating_add(
+            cores
+                .saturating_sub(1)
+                .saturating_mul(EXTRA_CORE_WRITER_BUDGET),
+        )
+    }
+
     pub(super) fn adaptive_floor_active_cap_configured_total(&self) -> usize {
         let cores = self.adaptive_floor_effective_cpu_cores();
-        let per_core_cap = cores.saturating_mul(self.adaptive_floor_max_active_writers_per_core());
-        let configured = per_core_cap.min(self.adaptive_floor_max_active_writers_global());
+        let per_contour_budget = self.adaptive_floor_cpu_budget_per_contour_cap(cores);
+        let configured = cores
+            .saturating_mul(self.adaptive_floor_max_active_writers_per_core())
+            .min(self.adaptive_floor_max_active_writers_global())
+            .min(per_contour_budget)
+            .max(1);
         self.me_adaptive_floor_active_cap_configured
             .store(configured as u64, Ordering::Relaxed);
         self.stats
@@ -841,8 +867,12 @@ impl MePool {
 
     pub(super) fn adaptive_floor_warm_cap_configured_total(&self) -> usize {
         let cores = self.adaptive_floor_effective_cpu_cores();
-        let per_core_cap = cores.saturating_mul(self.adaptive_floor_max_warm_writers_per_core());
-        let configured = per_core_cap.min(self.adaptive_floor_max_warm_writers_global());
+        let per_contour_budget = self.adaptive_floor_cpu_budget_per_contour_cap(cores);
+        let configured = cores
+            .saturating_mul(self.adaptive_floor_max_warm_writers_per_core())
+            .min(self.adaptive_floor_max_warm_writers_global())
+            .min(per_contour_budget)
+            .max(1);
         self.me_adaptive_floor_warm_cap_configured
             .store(configured as u64, Ordering::Relaxed);
         self.stats

@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::ip_tracker::UserIpTracker;
+use crate::proxy::route_mode::RouteRuntimeController;
 use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::middle_proxy::MePool;
@@ -28,6 +29,7 @@ mod model;
 mod runtime_edge;
 mod runtime_init;
 mod runtime_min;
+mod runtime_selftest;
 mod runtime_stats;
 mod runtime_watch;
 mod runtime_zero;
@@ -48,6 +50,7 @@ use runtime_min::{
     build_runtime_me_pool_state_data, build_runtime_me_quality_data, build_runtime_nat_stun_data,
     build_runtime_upstream_quality_data, build_security_whitelist_data,
 };
+use runtime_selftest::build_runtime_me_selftest_data;
 use runtime_stats::{
     MinimalCacheEntry, build_dcs_data, build_me_writers_data, build_minimal_all_data,
     build_upstreams_data, build_zero_all_data,
@@ -73,8 +76,7 @@ pub(super) struct ApiShared {
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
-    pub(super) startup_detected_ip_v4: Option<IpAddr>,
-    pub(super) startup_detected_ip_v6: Option<IpAddr>,
+    pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
     pub(super) runtime_edge_connections_cache: Arc<Mutex<Option<EdgeConnectionsCacheEntry>>>,
@@ -83,11 +85,16 @@ pub(super) struct ApiShared {
     pub(super) request_id: Arc<AtomicU64>,
     pub(super) runtime_state: Arc<ApiRuntimeState>,
     pub(super) startup_tracker: Arc<StartupTracker>,
+    pub(super) route_runtime: Arc<RouteRuntimeController>,
 }
 
 impl ApiShared {
     fn next_request_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn detected_link_ips(&self) -> (Option<IpAddr>, Option<IpAddr>) {
+        *self.detected_ips_rx.borrow()
     }
 }
 
@@ -96,12 +103,12 @@ pub async fn serve(
     stats: Arc<Stats>,
     ip_tracker: Arc<UserIpTracker>,
     me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
+    route_runtime: Arc<RouteRuntimeController>,
     upstream_manager: Arc<UpstreamManager>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     admission_rx: watch::Receiver<bool>,
     config_path: PathBuf,
-    startup_detected_ip_v4: Option<IpAddr>,
-    startup_detected_ip_v6: Option<IpAddr>,
+    detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     process_started_at_epoch_secs: u64,
     startup_tracker: Arc<StartupTracker>,
 ) {
@@ -132,8 +139,7 @@ pub async fn serve(
         me_pool,
         upstream_manager,
         config_path,
-        startup_detected_ip_v4,
-        startup_detected_ip_v6,
+        detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
         runtime_edge_connections_cache: Arc::new(Mutex::new(None)),
@@ -144,6 +150,7 @@ pub async fn serve(
         request_id: Arc::new(AtomicU64::new(1)),
         runtime_state: runtime_state.clone(),
         startup_tracker,
+        route_runtime,
     });
 
     spawn_runtime_watchers(
@@ -333,6 +340,11 @@ async fn handle(
                 let data = build_runtime_nat_stun_data(shared.as_ref()).await;
                 Ok(success_response(StatusCode::OK, data, revision))
             }
+            ("GET", "/v1/runtime/me-selftest") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_me_selftest_data(shared.as_ref(), cfg.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
             ("GET", "/v1/runtime/connections/summary") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = build_runtime_connections_summary_data(shared.as_ref(), cfg.as_ref()).await;
@@ -349,12 +361,13 @@ async fn handle(
             }
             ("GET", "/v1/stats/users") | ("GET", "/v1/users") => {
                 let revision = current_revision(&shared.config_path).await?;
+                let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
                 let users = users_from_config(
                     &cfg,
                     &shared.stats,
                     &shared.ip_tracker,
-                    shared.startup_detected_ip_v4,
-                    shared.startup_detected_ip_v6,
+                    detected_ip_v4,
+                    detected_ip_v6,
                 )
                 .await;
                 Ok(success_response(StatusCode::OK, users, revision))
@@ -392,12 +405,13 @@ async fn handle(
                 {
                     if method == Method::GET {
                         let revision = current_revision(&shared.config_path).await?;
+                        let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
                         let users = users_from_config(
                             &cfg,
                             &shared.stats,
                             &shared.ip_tracker,
-                            shared.startup_detected_ip_v4,
-                            shared.startup_detected_ip_v6,
+                            detected_ip_v4,
+                            detected_ip_v6,
                         )
                         .await;
                         if let Some(user_info) = users.into_iter().find(|entry| entry.username == user)

@@ -19,6 +19,15 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+detect_os() {
+    os="$(uname -s)"
+    case "$os" in
+        Linux) printf 'linux\n' ;;
+        OpenBSD) printf 'openbsd\n' ;;
+        *) printf '%s\n' "$os" ;;
+    esac
+}
+
 detect_arch() {
     arch="$(uname -m)"
     case "$arch" in
@@ -68,6 +77,19 @@ need_cmd grep
 need_cmd install
 
 ARCH="$(detect_arch)"
+OS="$(detect_os)"
+
+if [ "$OS" != "linux" ]; then
+    case "$OS" in
+        openbsd)
+            die "install.sh installs only Linux release artifacts. On OpenBSD, build from source (see docs/OPENBSD.en.md)."
+            ;;
+        *)
+            die "unsupported operating system for install.sh: $OS"
+            ;;
+    esac
+fi
+
 LIBC="$(detect_libc)"
 
 case "$VERSION" in

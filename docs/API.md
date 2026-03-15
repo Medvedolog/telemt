@@ -85,6 +85,7 @@ Notes:
 | `GET` | `/v1/health` | none | `200` | `HealthData` |
 | `GET` | `/v1/system/info` | none | `200` | `SystemInfoData` |
 | `GET` | `/v1/runtime/gates` | none | `200` | `RuntimeGatesData` |
+| `GET` | `/v1/runtime/initialization` | none | `200` | `RuntimeInitializationData` |
 | `GET` | `/v1/limits/effective` | none | `200` | `EffectiveLimitsData` |
 | `GET` | `/v1/security/posture` | none | `200` | `SecurityPostureData` |
 | `GET` | `/v1/security/whitelist` | none | `200` | `SecurityWhitelistData` |
@@ -98,6 +99,7 @@ Notes:
 | `GET` | `/v1/runtime/me_quality` | none | `200` | `RuntimeMeQualityData` |
 | `GET` | `/v1/runtime/upstream_quality` | none | `200` | `RuntimeUpstreamQualityData` |
 | `GET` | `/v1/runtime/nat_stun` | none | `200` | `RuntimeNatStunData` |
+| `GET` | `/v1/runtime/me-selftest` | none | `200` | `RuntimeMeSelftestData` |
 | `GET` | `/v1/runtime/connections/summary` | none | `200` | `RuntimeEdgeConnectionsSummaryData` |
 | `GET` | `/v1/runtime/events/recent` | none | `200` | `RuntimeEdgeEventsData` |
 | `GET` | `/v1/stats/users` | none | `200` | `UserInfo[]` |
@@ -146,6 +148,12 @@ Notes:
 - Unknown JSON fields are ignored by deserialization.
 - `PATCH` updates only provided fields and does not support explicit clearing of optional fields.
 - `If-Match` supports both quoted and unquoted values; surrounding whitespace is trimmed.
+
+## Query Parameters
+
+| Endpoint | Query | Behavior |
+| --- | --- | --- |
+| `GET /v1/runtime/events/recent` | `limit=<usize>` | Optional. Invalid/missing value falls back to default `50`. Effective value is clamped to `[1, 1000]` and additionally bounded by ring-buffer capacity. |
 
 ## Request Contracts
 
@@ -219,6 +227,45 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `me_runtime_ready` | `bool` | Current ME runtime readiness status used for conditional gate decisions. |
 | `me2dc_fallback_enabled` | `bool` | Whether ME -> direct fallback is enabled. |
 | `use_middle_proxy` | `bool` | Current transport mode preference. |
+| `startup_status` | `string` | Startup status (`pending`, `initializing`, `ready`, `failed`, `skipped`). |
+| `startup_stage` | `string` | Current startup stage identifier. |
+| `startup_progress_pct` | `f64` | Startup progress percentage (`0..100`). |
+
+### `RuntimeInitializationData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | `string` | Startup status (`pending`, `initializing`, `ready`, `failed`, `skipped`). |
+| `degraded` | `bool` | Whether runtime is currently in degraded mode. |
+| `current_stage` | `string` | Current startup stage identifier. |
+| `progress_pct` | `f64` | Overall startup progress percentage (`0..100`). |
+| `started_at_epoch_secs` | `u64` | Process start timestamp (Unix seconds). |
+| `ready_at_epoch_secs` | `u64?` | Timestamp when startup reached ready state; absent until ready. |
+| `total_elapsed_ms` | `u64` | Elapsed startup duration in milliseconds. |
+| `transport_mode` | `string` | Startup transport mode (`middle_proxy` or `direct`). |
+| `me` | `RuntimeInitializationMeData` | ME startup substate snapshot. |
+| `components` | `RuntimeInitializationComponentData[]` | Per-component startup timeline and status. |
+
+#### `RuntimeInitializationMeData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | `string` | ME startup status (`pending`, `initializing`, `ready`, `failed`, `skipped`). |
+| `current_stage` | `string` | Current ME startup stage identifier. |
+| `progress_pct` | `f64` | ME startup progress percentage (`0..100`). |
+| `init_attempt` | `u32` | Current ME init attempt counter. |
+| `retry_limit` | `string` | Retry limit (`"unlimited"` or numeric string). |
+| `last_error` | `string?` | Last ME initialization error text when present. |
+
+#### `RuntimeInitializationComponentData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Startup component identifier. |
+| `title` | `string` | Human-readable component title. |
+| `status` | `string` | Component status (`pending`, `running`, `ready`, `failed`, `skipped`). |
+| `started_at_epoch_ms` | `u64?` | Component start timestamp in Unix milliseconds. |
+| `finished_at_epoch_ms` | `u64?` | Component finish timestamp in Unix milliseconds. |
+| `duration_ms` | `u64?` | Component duration in milliseconds. |
+| `attempts` | `u32` | Attempt counter for this component. |
+| `details` | `string?` | Optional short status details text. |
 
 ### `EffectiveLimitsData`
 | Field | Type | Description |
@@ -256,11 +303,22 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `floor_mode` | `string` | Effective floor mode (`static` or `adaptive`). |
 | `adaptive_floor_idle_secs` | `u64` | Adaptive floor idle threshold. |
 | `adaptive_floor_min_writers_single_endpoint` | `u8` | Adaptive floor minimum for single-endpoint DCs. |
+| `adaptive_floor_min_writers_multi_endpoint` | `u8` | Adaptive floor minimum for multi-endpoint DCs. |
 | `adaptive_floor_recover_grace_secs` | `u64` | Adaptive floor recovery grace period. |
+| `adaptive_floor_writers_per_core_total` | `u16` | Target total writers-per-core budget in adaptive mode. |
+| `adaptive_floor_cpu_cores_override` | `u16` | Manual CPU core override (`0` means auto-detect). |
+| `adaptive_floor_max_extra_writers_single_per_core` | `u16` | Extra per-core adaptive headroom for single-endpoint DCs. |
+| `adaptive_floor_max_extra_writers_multi_per_core` | `u16` | Extra per-core adaptive headroom for multi-endpoint DCs. |
+| `adaptive_floor_max_active_writers_per_core` | `u16` | Active writer cap per CPU core. |
+| `adaptive_floor_max_warm_writers_per_core` | `u16` | Warm writer cap per CPU core. |
+| `adaptive_floor_max_active_writers_global` | `u32` | Global active writer cap. |
+| `adaptive_floor_max_warm_writers_global` | `u32` | Global warm writer cap. |
 | `reconnect_max_concurrent_per_dc` | `u32` | Max concurrent reconnects per DC. |
 | `reconnect_backoff_base_ms` | `u64` | Reconnect base backoff. |
 | `reconnect_backoff_cap_ms` | `u64` | Reconnect backoff cap. |
 | `reconnect_fast_retry_count` | `u32` | Number of fast retries before standard backoff strategy. |
+| `writer_pick_mode` | `string` | Writer picker mode (`sorted_rr`, `p2c`). |
+| `writer_pick_sample_size` | `u8` | Candidate sample size for `p2c` picker mode. |
 | `me2dc_fallback` | `bool` | Effective ME -> direct fallback flag. |
 
 #### `EffectiveUserIpPolicyLimits`
@@ -290,16 +348,353 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `entries_total` | `usize` | Number of whitelist CIDR entries. |
 | `entries` | `string[]` | Whitelist CIDR entries as strings. |
 
-### Runtime Min Endpoints
-- `/v1/runtime/me_pool_state`: generations, hardswap state, writer contour/health counts, refill inflight snapshot.
-- `/v1/runtime/me_quality`: ME error/drift/reconnect counters and per-DC RTT coverage snapshot.
-- `/v1/runtime/upstream_quality`: upstream runtime policy, connect counters, health summary and per-upstream DC latency/IP preference.
-- `/v1/runtime/nat_stun`: NAT/STUN runtime flags, server lists, reflection cache state and backoff remaining.
+### `RuntimeMePoolStateData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when ME pool snapshot is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeMePoolStatePayload?` | Null when unavailable. |
 
-### Runtime Edge Endpoints
-- `/v1/runtime/connections/summary`: cached connection totals (`total/me/direct`), active users and top-N users by connections/traffic.
-- `/v1/runtime/events/recent?limit=N`: bounded control-plane ring-buffer events (`limit` clamped to `[1, 1000]`).
-- If `server.api.runtime_edge_enabled=false`, runtime edge endpoints return `enabled=false` with `reason=feature_disabled`.
+#### `RuntimeMePoolStatePayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `generations` | `RuntimeMePoolStateGenerationData` | Active/warm/pending/draining generation snapshot. |
+| `hardswap` | `RuntimeMePoolStateHardswapData` | Hardswap state flags. |
+| `writers` | `RuntimeMePoolStateWriterData` | Writer total/contour/health counters. |
+| `refill` | `RuntimeMePoolStateRefillData` | In-flight refill counters by DC/family. |
+
+#### `RuntimeMePoolStateGenerationData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `active_generation` | `u64` | Active pool generation id. |
+| `warm_generation` | `u64` | Warm pool generation id. |
+| `pending_hardswap_generation` | `u64` | Pending hardswap generation id (`0` when none). |
+| `pending_hardswap_age_secs` | `u64?` | Age of pending hardswap generation in seconds. |
+| `draining_generations` | `u64[]` | Distinct generation ids currently draining. |
+
+#### `RuntimeMePoolStateHardswapData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Hardswap feature toggle. |
+| `pending` | `bool` | `true` when pending generation is non-zero. |
+
+#### `RuntimeMePoolStateWriterData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `total` | `usize` | Total writer rows in snapshot. |
+| `alive_non_draining` | `usize` | Alive writers excluding draining ones. |
+| `draining` | `usize` | Writers marked draining. |
+| `degraded` | `usize` | Non-draining degraded writers. |
+| `contour` | `RuntimeMePoolStateWriterContourData` | Counts by contour state. |
+| `health` | `RuntimeMePoolStateWriterHealthData` | Counts by health bucket. |
+
+#### `RuntimeMePoolStateWriterContourData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `warm` | `usize` | Writers in warm contour. |
+| `active` | `usize` | Writers in active contour. |
+| `draining` | `usize` | Writers in draining contour. |
+
+#### `RuntimeMePoolStateWriterHealthData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `healthy` | `usize` | Non-draining non-degraded writers. |
+| `degraded` | `usize` | Non-draining degraded writers. |
+| `draining` | `usize` | Draining writers. |
+
+#### `RuntimeMePoolStateRefillData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `inflight_endpoints_total` | `usize` | Total in-flight endpoint refill operations. |
+| `inflight_dc_total` | `usize` | Number of distinct DC+family keys with refill in flight. |
+| `by_dc` | `RuntimeMePoolStateRefillDcData[]` | Per-DC refill rows. |
+
+#### `RuntimeMePoolStateRefillDcData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `dc` | `i16` | Telegram DC id. |
+| `family` | `string` | Address family label (`V4`, `V6`). |
+| `inflight` | `usize` | In-flight refill operations for this row. |
+
+### `RuntimeMeQualityData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when ME pool snapshot is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeMeQualityPayload?` | Null when unavailable. |
+
+#### `RuntimeMeQualityPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `counters` | `RuntimeMeQualityCountersData` | Key ME lifecycle/error counters. |
+| `route_drops` | `RuntimeMeQualityRouteDropData` | Route drop counters by reason. |
+| `dc_rtt` | `RuntimeMeQualityDcRttData[]` | Per-DC RTT and writer coverage rows. |
+
+#### `RuntimeMeQualityCountersData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `idle_close_by_peer_total` | `u64` | Peer-initiated idle closes. |
+| `reader_eof_total` | `u64` | Reader EOF events. |
+| `kdf_drift_total` | `u64` | KDF drift detections. |
+| `kdf_port_only_drift_total` | `u64` | KDF port-only drift detections. |
+| `reconnect_attempt_total` | `u64` | Reconnect attempts. |
+| `reconnect_success_total` | `u64` | Successful reconnects. |
+
+#### `RuntimeMeQualityRouteDropData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `no_conn_total` | `u64` | Route drops with no connection mapping. |
+| `channel_closed_total` | `u64` | Route drops because destination channel is closed. |
+| `queue_full_total` | `u64` | Route drops due queue backpressure (aggregate). |
+| `queue_full_base_total` | `u64` | Route drops in base-queue path. |
+| `queue_full_high_total` | `u64` | Route drops in high-priority queue path. |
+
+#### `RuntimeMeQualityDcRttData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `dc` | `i16` | Telegram DC id. |
+| `rtt_ema_ms` | `f64?` | RTT EMA for this DC. |
+| `alive_writers` | `usize` | Alive writers currently mapped to this DC. |
+| `required_writers` | `usize` | Target writer floor for this DC. |
+| `coverage_pct` | `f64` | `alive_writers / required_writers * 100`. |
+
+### `RuntimeUpstreamQualityData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when upstream runtime snapshot is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `policy` | `RuntimeUpstreamQualityPolicyData` | Effective upstream policy values. |
+| `counters` | `RuntimeUpstreamQualityCountersData` | Upstream connect counters. |
+| `summary` | `RuntimeUpstreamQualitySummaryData?` | Aggregate runtime health summary. |
+| `upstreams` | `RuntimeUpstreamQualityUpstreamData[]?` | Per-upstream runtime rows. |
+
+#### `RuntimeUpstreamQualityPolicyData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `connect_retry_attempts` | `u32` | Upstream connect retry attempts. |
+| `connect_retry_backoff_ms` | `u64` | Upstream retry backoff delay. |
+| `connect_budget_ms` | `u64` | Total connect wall-clock budget. |
+| `unhealthy_fail_threshold` | `u32` | Consecutive fail threshold for unhealthy marking. |
+| `connect_failfast_hard_errors` | `bool` | Whether hard errors skip retries. |
+
+#### `RuntimeUpstreamQualityCountersData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `connect_attempt_total` | `u64` | Total connect attempts. |
+| `connect_success_total` | `u64` | Successful connects. |
+| `connect_fail_total` | `u64` | Failed connects. |
+| `connect_failfast_hard_error_total` | `u64` | Fail-fast hard errors. |
+
+#### `RuntimeUpstreamQualitySummaryData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `configured_total` | `usize` | Total configured upstream entries. |
+| `healthy_total` | `usize` | Upstreams currently healthy. |
+| `unhealthy_total` | `usize` | Upstreams currently unhealthy. |
+| `direct_total` | `usize` | Direct-route upstream entries. |
+| `socks4_total` | `usize` | SOCKS4 upstream entries. |
+| `socks5_total` | `usize` | SOCKS5 upstream entries. |
+
+#### `RuntimeUpstreamQualityUpstreamData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `upstream_id` | `usize` | Runtime upstream index. |
+| `route_kind` | `string` | `direct`, `socks4`, `socks5`. |
+| `address` | `string` | Upstream address (`direct` literal for direct route kind). |
+| `weight` | `u16` | Selection weight. |
+| `scopes` | `string` | Configured scope selector. |
+| `healthy` | `bool` | Current health flag. |
+| `fails` | `u32` | Consecutive fail counter. |
+| `last_check_age_secs` | `u64` | Seconds since last health update. |
+| `effective_latency_ms` | `f64?` | Effective latency score used by selector. |
+| `dc` | `RuntimeUpstreamQualityDcData[]` | Per-DC runtime rows. |
+
+#### `RuntimeUpstreamQualityDcData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `dc` | `i16` | Telegram DC id. |
+| `latency_ema_ms` | `f64?` | Per-DC latency EMA. |
+| `ip_preference` | `string` | `unknown`, `prefer_v4`, `prefer_v6`, `both_work`, `unavailable`. |
+
+### `RuntimeNatStunData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when shared STUN state is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeNatStunPayload?` | Null when unavailable. |
+
+#### `RuntimeNatStunPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `flags` | `RuntimeNatStunFlagsData` | NAT probe runtime flags. |
+| `servers` | `RuntimeNatStunServersData` | Configured/live STUN server lists. |
+| `reflection` | `RuntimeNatStunReflectionBlockData` | Reflection cache data for v4/v6. |
+| `stun_backoff_remaining_ms` | `u64?` | Remaining retry backoff (milliseconds). |
+
+#### `RuntimeNatStunFlagsData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `nat_probe_enabled` | `bool` | Current NAT probe enable state. |
+| `nat_probe_disabled_runtime` | `bool` | Runtime disable flag due failures/conditions. |
+| `nat_probe_attempts` | `u8` | Configured NAT probe attempt count. |
+
+#### `RuntimeNatStunServersData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `configured` | `string[]` | Configured STUN server entries. |
+| `live` | `string[]` | Runtime live STUN server entries. |
+| `live_total` | `usize` | Number of live STUN entries. |
+
+#### `RuntimeNatStunReflectionBlockData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `v4` | `RuntimeNatStunReflectionData?` | IPv4 reflection data. |
+| `v6` | `RuntimeNatStunReflectionData?` | IPv6 reflection data. |
+
+#### `RuntimeNatStunReflectionData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `addr` | `string` | Reflected public endpoint (`ip:port`). |
+| `age_secs` | `u64` | Reflection value age in seconds. |
+
+### `RuntimeMeSelftestData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when ME pool is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeMeSelftestPayload?` | Null when unavailable. |
+
+#### `RuntimeMeSelftestPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `kdf` | `RuntimeMeSelftestKdfData` | KDF EWMA health state. |
+| `timeskew` | `RuntimeMeSelftestTimeskewData` | Date-header skew health state. |
+| `ip` | `RuntimeMeSelftestIpData` | Interface IP family classification. |
+| `pid` | `RuntimeMeSelftestPidData` | Process PID marker (`one|non-one`). |
+| `bnd` | `RuntimeMeSelftestBndData` | SOCKS BND.ADDR/BND.PORT health state. |
+
+#### `RuntimeMeSelftestKdfData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | `string` | `ok` or `error` based on EWMA threshold. |
+| `ewma_errors_per_min` | `f64` | EWMA KDF error rate per minute. |
+| `threshold_errors_per_min` | `f64` | Threshold used for `error` decision. |
+| `errors_total` | `u64` | Total source errors (`kdf_drift + socks_kdf_strict_reject`). |
+
+#### `RuntimeMeSelftestTimeskewData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | `string` | `ok` or `error` (`max_skew_secs_15m > 60` => `error`). |
+| `max_skew_secs_15m` | `u64?` | Maximum observed skew in the last 15 minutes. |
+| `samples_15m` | `usize` | Number of skew samples in the last 15 minutes. |
+| `last_skew_secs` | `u64?` | Latest observed skew value. |
+| `last_source` | `string?` | Latest skew source marker. |
+| `last_seen_age_secs` | `u64?` | Age of the latest skew sample. |
+
+#### `RuntimeMeSelftestIpData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `v4` | `RuntimeMeSelftestIpFamilyData?` | IPv4 interface probe result; absent when unknown. |
+| `v6` | `RuntimeMeSelftestIpFamilyData?` | IPv6 interface probe result; absent when unknown. |
+
+#### `RuntimeMeSelftestIpFamilyData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `addr` | `string` | Detected interface IP. |
+| `state` | `string` | `good`, `bogon`, or `loopback`. |
+
+#### `RuntimeMeSelftestPidData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `pid` | `u32` | Current process PID. |
+| `state` | `string` | `one` when PID=1, otherwise `non-one`. |
+
+#### `RuntimeMeSelftestBndData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `addr_state` | `string` | `ok`, `bogon`, or `error`. |
+| `port_state` | `string` | `ok`, `zero`, or `error`. |
+| `last_addr` | `string?` | Latest observed SOCKS BND address. |
+| `last_seen_age_secs` | `u64?` | Age of latest BND sample. |
+
+### `RuntimeEdgeConnectionsSummaryData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Endpoint availability under `runtime_edge_enabled`. |
+| `reason` | `string?` | `feature_disabled` or `source_unavailable`. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeEdgeConnectionsSummaryPayload?` | Null when unavailable. |
+
+#### `RuntimeEdgeConnectionsSummaryPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `cache` | `RuntimeEdgeConnectionCacheData` | Runtime edge cache metadata. |
+| `totals` | `RuntimeEdgeConnectionTotalsData` | Connection totals block. |
+| `top` | `RuntimeEdgeConnectionTopData` | Top-N leaderboard blocks. |
+| `telemetry` | `RuntimeEdgeConnectionTelemetryData` | Telemetry-policy flags for counters. |
+
+#### `RuntimeEdgeConnectionCacheData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `ttl_ms` | `u64` | Configured cache TTL in milliseconds. |
+| `served_from_cache` | `bool` | `true` when payload is served from cache. |
+| `stale_cache_used` | `bool` | `true` when stale cache is used because recompute is busy. |
+
+#### `RuntimeEdgeConnectionTotalsData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `current_connections` | `u64` | Current global live connections. |
+| `current_connections_me` | `u64` | Current live connections routed through ME. |
+| `current_connections_direct` | `u64` | Current live connections routed through direct path. |
+| `active_users` | `usize` | Users with `current_connections > 0`. |
+
+#### `RuntimeEdgeConnectionTopData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `limit` | `usize` | Effective Top-N row count. |
+| `by_connections` | `RuntimeEdgeConnectionUserData[]` | Users sorted by current connections. |
+| `by_throughput` | `RuntimeEdgeConnectionUserData[]` | Users sorted by cumulative octets. |
+
+#### `RuntimeEdgeConnectionUserData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `username` | `string` | Username. |
+| `current_connections` | `u64` | Current live connections for user. |
+| `total_octets` | `u64` | Cumulative (`client->proxy + proxy->client`) octets. |
+
+#### `RuntimeEdgeConnectionTelemetryData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `user_enabled` | `bool` | Per-user telemetry enable flag. |
+| `throughput_is_cumulative` | `bool` | Always `true` in current implementation. |
+
+### `RuntimeEdgeEventsData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Endpoint availability under `runtime_edge_enabled`. |
+| `reason` | `string?` | `feature_disabled` when endpoint is disabled. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeEdgeEventsPayload?` | Null when unavailable. |
+
+#### `RuntimeEdgeEventsPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `capacity` | `usize` | Effective ring-buffer capacity. |
+| `dropped_total` | `u64` | Count of dropped oldest events due capacity pressure. |
+| `events` | `ApiEventRecord[]` | Recent events in chronological order. |
+
+#### `ApiEventRecord`
+| Field | Type | Description |
+| --- | --- | --- |
+| `seq` | `u64` | Monotonic sequence number. |
+| `ts_epoch_secs` | `u64` | Event timestamp (Unix seconds). |
+| `event_type` | `string` | Event kind identifier. |
+| `context` | `string` | Context text (truncated to implementation-defined max length). |
 
 ### `ZeroAllData`
 | Field | Type | Description |
@@ -485,7 +880,27 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `floor_mode` | `string` | Writer floor mode. |
 | `adaptive_floor_idle_secs` | `u64` | Idle threshold for adaptive floor. |
 | `adaptive_floor_min_writers_single_endpoint` | `u8` | Minimum writers for single-endpoint DC in adaptive mode. |
+| `adaptive_floor_min_writers_multi_endpoint` | `u8` | Minimum writers for multi-endpoint DC in adaptive mode. |
 | `adaptive_floor_recover_grace_secs` | `u64` | Grace period for floor recovery. |
+| `adaptive_floor_writers_per_core_total` | `u16` | Target total writers-per-core budget in adaptive mode. |
+| `adaptive_floor_cpu_cores_override` | `u16` | CPU core override (`0` means auto-detect). |
+| `adaptive_floor_max_extra_writers_single_per_core` | `u16` | Extra single-endpoint writers budget per core. |
+| `adaptive_floor_max_extra_writers_multi_per_core` | `u16` | Extra multi-endpoint writers budget per core. |
+| `adaptive_floor_max_active_writers_per_core` | `u16` | Active writer cap per core. |
+| `adaptive_floor_max_warm_writers_per_core` | `u16` | Warm writer cap per core. |
+| `adaptive_floor_max_active_writers_global` | `u32` | Global active writer cap. |
+| `adaptive_floor_max_warm_writers_global` | `u32` | Global warm writer cap. |
+| `adaptive_floor_cpu_cores_detected` | `u32` | Runtime-detected CPU cores. |
+| `adaptive_floor_cpu_cores_effective` | `u32` | Effective core count used for adaptive caps. |
+| `adaptive_floor_global_cap_raw` | `u64` | Raw global cap before clamping. |
+| `adaptive_floor_global_cap_effective` | `u64` | Effective global cap after clamping. |
+| `adaptive_floor_target_writers_total` | `u64` | Current adaptive total writer target. |
+| `adaptive_floor_active_cap_configured` | `u64` | Configured global active cap. |
+| `adaptive_floor_active_cap_effective` | `u64` | Effective global active cap. |
+| `adaptive_floor_warm_cap_configured` | `u64` | Configured global warm cap. |
+| `adaptive_floor_warm_cap_effective` | `u64` | Effective global warm cap. |
+| `adaptive_floor_active_writers_current` | `u64` | Current active writers count. |
+| `adaptive_floor_warm_writers_current` | `u64` | Current warm writers count. |
 | `me_keepalive_enabled` | `bool` | ME keepalive toggle. |
 | `me_keepalive_interval_secs` | `u64` | Keepalive period. |
 | `me_keepalive_jitter_secs` | `u64` | Keepalive jitter. |
@@ -507,6 +922,8 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `me_single_endpoint_outage_backoff_max_ms` | `u64` | Outage mode max reconnect backoff. |
 | `me_single_endpoint_shadow_rotate_every_secs` | `u64` | Shadow rotation interval. |
 | `me_deterministic_writer_sort` | `bool` | Deterministic writer ordering toggle. |
+| `me_writer_pick_mode` | `string` | Writer picker mode (`sorted_rr`, `p2c`). |
+| `me_writer_pick_sample_size` | `u8` | Candidate sample size for `p2c` picker mode. |
 | `me_socks_kdf_policy` | `string` | Current SOCKS KDF policy mode. |
 | `quarantined_endpoints_total` | `usize` | Total quarantined endpoints. |
 | `quarantined_endpoints` | `MinimalQuarantineData[]` | Quarantine details. |
@@ -572,13 +989,24 @@ Note: the request contract is defined, but the corresponding route currently ret
 | --- | --- | --- |
 | `dc` | `i16` | Telegram DC id. |
 | `endpoints` | `string[]` | Endpoints in this DC (`ip:port`). |
+| `endpoint_writers` | `DcEndpointWriters[]` | Active writer counts grouped by endpoint. |
 | `available_endpoints` | `usize` | Endpoints currently available in this DC. |
 | `available_pct` | `f64` | `available_endpoints / endpoints_total * 100`. |
 | `required_writers` | `usize` | Required writer count for this DC. |
+| `floor_min` | `usize` | Floor lower bound for this DC. |
+| `floor_target` | `usize` | Floor target writer count for this DC. |
+| `floor_max` | `usize` | Floor upper bound for this DC. |
+| `floor_capped` | `bool` | `true` when computed floor target was capped by active limits. |
 | `alive_writers` | `usize` | Alive writers in this DC. |
 | `coverage_pct` | `f64` | `alive_writers / required_writers * 100`. |
 | `rtt_ms` | `f64?` | Aggregated RTT for DC. |
 | `load` | `usize` | Active client sessions bound to this DC. |
+
+#### `DcEndpointWriters`
+| Field | Type | Description |
+| --- | --- | --- |
+| `endpoint` | `string` | Endpoint (`ip:port`). |
+| `active_writers` | `usize` | Active writers currently mapped to endpoint. |
 
 ### `UserInfo`
 | Field | Type | Description |
@@ -591,6 +1019,9 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `max_unique_ips` | `usize?` | Optional unique IP limit. |
 | `current_connections` | `u64` | Current live connections. |
 | `active_unique_ips` | `usize` | Current active unique source IPs. |
+| `active_unique_ips_list` | `ip[]` | Current active unique source IP list. |
+| `recent_unique_ips` | `usize` | Unique source IP count inside the configured recent window. |
+| `recent_unique_ips_list` | `ip[]` | Recent-window unique source IP list. |
 | `total_octets` | `u64` | Total traffic octets for this user. |
 | `links` | `UserLinks` | Active connection links derived from current config. |
 
@@ -602,11 +1033,15 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `tls` | `string[]` | Active `tg://proxy` links for EE-TLS mode (for each host+TLS domain). |
 
 Link generation uses active config and enabled modes:
-- `[general.links].public_host/public_port` have priority.
-- If `public_host` is not set, startup-detected public IPs are used (`IPv4`, `IPv6`, or both when available).
-- Fallback host sources: listener `announce`, `announce_ip`, explicit listener `ip`.
-- Legacy fallback: `listen_addr_ipv4` and `listen_addr_ipv6` when routable.
-- Startup-detected IPs are fixed for process lifetime and refreshed on restart.
+- Link port is `general.links.public_port` when configured; otherwise `server.port`.
+- If `general.links.public_host` is non-empty, it is used as the single link host override.
+- If `public_host` is not set, hosts are resolved from `server.listeners` in order:
+  `announce` -> `announce_ip` -> listener bind `ip`.
+- For wildcard listener IPs (`0.0.0.0` / `::`), startup-detected external IP of the same family is used when available.
+- Listener-derived hosts are de-duplicated while preserving first-seen order.
+- If multiple hosts are resolved, API returns links for all resolved hosts in every enabled mode.
+- If no host can be resolved from listeners, fallback is startup-detected `IPv4 -> IPv6`.
+- Final compatibility fallback uses `listen_addr_ipv4`/`listen_addr_ipv6` when routable, otherwise `"UNKNOWN"`.
 - User rows are sorted by `username` in ascending lexical order.
 
 ### `CreateUserResponse`
@@ -619,16 +1054,20 @@ Link generation uses active config and enabled modes:
 
 | Endpoint | Notes |
 | --- | --- |
-| `POST /v1/users` | Creates user and validates resulting config before atomic save. |
-| `PATCH /v1/users/{username}` | Partial update of provided fields only. Missing fields remain unchanged. |
+| `POST /v1/users` | Creates user, validates config, then atomically updates only affected `access.*` TOML tables (`access.users` always, plus optional per-user tables present in request). |
+| `PATCH /v1/users/{username}` | Partial update of provided fields only. Missing fields remain unchanged. Current implementation persists full config document on success. |
 | `POST /v1/users/{username}/rotate-secret` | Currently returns `404` in runtime route matcher; request schema is reserved for intended behavior. |
-| `DELETE /v1/users/{username}` | Deletes user and related optional settings. Last user deletion is blocked. |
+| `DELETE /v1/users/{username}` | Deletes only specified user, removes this user from related optional `access.user_*` maps, blocks last-user deletion, and atomically updates only related `access.*` TOML tables. |
 
 All mutating endpoints:
 - Respect `read_only` mode.
 - Accept optional `If-Match` for optimistic concurrency.
 - Return new `revision` after successful write.
 - Use process-local mutation lock + atomic write (`tmp + rename`) for config persistence.
+
+Delete path cleanup guarantees:
+- Config cleanup removes only the requested username keys.
+- Runtime unique-IP cleanup removes only this user's limiter and tracked IP state.
 
 ## Runtime State Matrix
 
@@ -643,6 +1082,28 @@ All mutating endpoints:
 - ME endpoints: ME pool is absent (for example direct-only mode or failed ME initialization).
 - Upstreams endpoint: non-blocking upstream snapshot lock is unavailable at request time.
 
+Additional runtime endpoint behavior:
+
+| Endpoint | Disabled by feature flag | `source_unavailable` condition | Normal mode |
+| --- | --- | --- | --- |
+| `/v1/runtime/me_pool_state` | No | ME pool snapshot unavailable | `enabled=true`, full payload |
+| `/v1/runtime/me_quality` | No | ME pool snapshot unavailable | `enabled=true`, full payload |
+| `/v1/runtime/upstream_quality` | No | Upstream runtime snapshot unavailable | `enabled=true`, full payload |
+| `/v1/runtime/nat_stun` | No | STUN shared state unavailable | `enabled=true`, full payload |
+| `/v1/runtime/me-selftest` | No | ME pool unavailable => `enabled=false`, `reason=source_unavailable` | `enabled=true`, full payload |
+| `/v1/runtime/connections/summary` | `runtime_edge_enabled=false` => `enabled=false`, `reason=feature_disabled` | Recompute lock contention with no cache entry => `enabled=true`, `reason=source_unavailable` | `enabled=true`, full payload |
+| `/v1/runtime/events/recent` | `runtime_edge_enabled=false` => `enabled=false`, `reason=feature_disabled` | Not used in current implementation | `enabled=true`, full payload |
+
+## ME Fallback Behavior Exposed Via API
+
+When `general.use_middle_proxy=true` and `general.me2dc_fallback=true`:
+- Startup does not block on full ME pool readiness; initialization can continue in background.
+- Runtime initialization payload can expose ME stage `background_init` until pool becomes ready.
+- Admission/routing decision uses two readiness grace windows for "ME not ready" periods:
+  `80s` before first-ever readiness is observed (startup grace),
+  `6s` after readiness has been observed at least once (runtime failover timeout).
+- While in fallback window breach, new sessions are routed via Direct-DC; when ME becomes ready, routing returns to Middle mode for new sessions.
+
 ## Serialization Rules
 
 - Success responses always include `revision`.
@@ -650,6 +1111,7 @@ All mutating endpoints:
 - Optional fields with `skip_serializing_if` are omitted when absent.
 - Nullable payload fields may still be `null` where contract uses `?` (for example `UserInfo` option fields).
 - For `/v1/stats/upstreams`, authentication details of SOCKS upstreams are intentionally omitted.
+- `ip[]` fields are serialized as JSON string arrays (for example `"1.2.3.4"`, `"2001:db8::1"`).
 
 ## Operational Notes
 
@@ -665,7 +1127,7 @@ All mutating endpoints:
 | Runtime apply path | Successful writes are picked up by existing config watcher/hot-reload path. |
 | Exposure | Built-in TLS/mTLS is not provided. Use loopback bind + reverse proxy if needed. |
 | Pagination | User list currently has no pagination/filtering. |
-| Serialization side effect | Config comments/manual formatting are not preserved on write. |
+| Serialization side effect | Updated TOML table bodies are re-serialized on write. Endpoints that persist full config can still rewrite broader formatting/comments. |
 
 ## Known Limitations (Current Release)
 

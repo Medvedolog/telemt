@@ -55,7 +55,10 @@ user2 = "00000000000000000000000000000002"
 user3 = "00000000000000000000000000000003"
 ```
 4. Save the config. Ctrl+S -> Ctrl+X. You don't need to restart telemt.
-5. Get the links via `journalctl -u telemt -n -g "links" --no-pager -o cat | tac`
+5. Get the links via
+```bash
+curl -s http://127.0.0.1:9091/v1/users | jq
+```
 
 ## How to view metrics
 

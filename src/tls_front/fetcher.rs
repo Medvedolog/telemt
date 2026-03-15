@@ -21,14 +21,18 @@ use x509_parser::certificate::X509Certificate;
 
 use crate::crypto::SecureRandom;
 use crate::network::dns_overrides::resolve_socket_addr;
-use crate::protocol::constants::{TLS_RECORD_APPLICATION, TLS_RECORD_HANDSHAKE};
+use crate::protocol::constants::{
+    TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
+};
 use crate::transport::proxy_protocol::{ProxyProtocolV1Builder, ProxyProtocolV2Builder};
 use crate::tls_front::types::{
     ParsedCertificateInfo,
     ParsedServerHello,
+    TlsBehaviorProfile,
     TlsCertPayload,
     TlsExtension,
     TlsFetchResult,
+    TlsProfileSource,
 };
 
 /// No-op verifier: accept any certificate (we only need lengths and metadata).
@@ -282,6 +286,41 @@ fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     })
 }
 
+fn derive_behavior_profile(records: &[(u8, Vec<u8>)]) -> TlsBehaviorProfile {
+    let mut change_cipher_spec_count = 0u8;
+    let mut app_data_record_sizes = Vec::new();
+
+    for (record_type, body) in records {
+        match *record_type {
+            TLS_RECORD_CHANGE_CIPHER => {
+                change_cipher_spec_count = change_cipher_spec_count.saturating_add(1);
+            }
+            TLS_RECORD_APPLICATION => {
+                app_data_record_sizes.push(body.len());
+            }
+            _ => {}
+        }
+    }
+
+    let mut ticket_record_sizes = Vec::new();
+    while app_data_record_sizes
+        .last()
+        .is_some_and(|size| *size <= 256 && ticket_record_sizes.len() < 2)
+    {
+        if let Some(size) = app_data_record_sizes.pop() {
+            ticket_record_sizes.push(size);
+        }
+    }
+    ticket_record_sizes.reverse();
+
+    TlsBehaviorProfile {
+        change_cipher_spec_count: change_cipher_spec_count.max(1),
+        app_data_record_sizes,
+        ticket_record_sizes,
+        source: TlsProfileSource::Raw,
+    }
+}
+
 fn parse_cert_info(certs: &[CertificateDer<'static>]) -> Option<ParsedCertificateInfo> {
     let first = certs.first()?;
     let (_rem, cert) = X509Certificate::from_der(first.as_ref()).ok()?;
@@ -443,39 +482,50 @@ where
     .await??;
 
     let mut records = Vec::new();
-    // Read up to 4 records: ServerHello, CCS, and up to two ApplicationData.
-    for _ in 0..4 {
+    let mut app_records_seen = 0usize;
+    // Read a bounded encrypted flight: ServerHello, CCS, certificate-like data,
+    // and a small number of ticket-like tail records.
+    for _ in 0..8 {
         match timeout(connect_timeout, read_tls_record(&mut stream)).await {
-            Ok(Ok(rec)) => records.push(rec),
+            Ok(Ok(rec)) => {
+                if rec.0 == TLS_RECORD_APPLICATION {
+                    app_records_seen += 1;
+                }
+                records.push(rec);
+            }
             Ok(Err(e)) => return Err(e),
             Err(_) => break,
         }
-        if records.len() >= 3 && records.iter().any(|(t, _)| *t == TLS_RECORD_APPLICATION) {
+        if app_records_seen >= 4 {
             break;
         }
     }
 
-    let mut app_sizes = Vec::new();
     let mut server_hello = None;
     for (t, body) in &records {
         if *t == TLS_RECORD_HANDSHAKE && server_hello.is_none() {
             server_hello = parse_server_hello(body);
-        } else if *t == TLS_RECORD_APPLICATION {
-            app_sizes.push(body.len());
         }
     }
 
     let parsed = server_hello.ok_or_else(|| anyhow!("ServerHello not received"))?;
+    let behavior_profile = derive_behavior_profile(&records);
+    let mut app_sizes = behavior_profile.app_data_record_sizes.clone();
+    app_sizes.extend_from_slice(&behavior_profile.ticket_record_sizes);
     let total_app_data_len = app_sizes.iter().sum::<usize>().max(1024);
+    let app_data_records_sizes = behavior_profile
+        .app_data_record_sizes
+        .first()
+        .copied()
+        .or_else(|| behavior_profile.ticket_record_sizes.first().copied())
+        .map(|size| vec![size])
+        .unwrap_or_else(|| vec![total_app_data_len]);
 
     Ok(TlsFetchResult {
         server_hello_parsed: parsed,
-        app_data_records_sizes: if app_sizes.is_empty() {
-            vec![total_app_data_len]
-        } else {
-            app_sizes
-        },
+        app_data_records_sizes,
         total_app_data_len,
+        behavior_profile,
         cert_info: None,
         cert_payload: None,
     })
@@ -608,6 +658,12 @@ where
         server_hello_parsed: parsed,
         app_data_records_sizes: app_data_records_sizes.clone(),
         total_app_data_len: app_data_records_sizes.iter().sum(),
+        behavior_profile: TlsBehaviorProfile {
+            change_cipher_spec_count: 1,
+            app_data_record_sizes: app_data_records_sizes,
+            ticket_record_sizes: Vec::new(),
+            source: TlsProfileSource::Rustls,
+        },
         cert_info,
         cert_payload,
     })
@@ -706,6 +762,7 @@ pub async fn fetch_real_tls(
             if let Some(mut raw) = raw_result {
                 raw.cert_info = rustls_result.cert_info;
                 raw.cert_payload = rustls_result.cert_payload;
+                raw.behavior_profile.source = TlsProfileSource::Merged;
                 debug!(sni = %sni, "Fetched TLS metadata via raw probe + rustls cert chain");
                 Ok(raw)
             } else {
@@ -725,7 +782,11 @@ pub async fn fetch_real_tls(
 
 #[cfg(test)]
 mod tests {
-    use super::encode_tls13_certificate_message;
+    use super::{derive_behavior_profile, encode_tls13_certificate_message};
+    use crate::protocol::constants::{
+        TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
+    };
+    use crate::tls_front::types::TlsProfileSource;
 
     fn read_u24(bytes: &[u8]) -> usize {
         ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | (bytes[2] as usize)
@@ -752,5 +813,21 @@ mod tests {
     #[test]
     fn test_encode_tls13_certificate_message_empty_chain() {
         assert!(encode_tls13_certificate_message(&[]).is_none());
+    }
+
+    #[test]
+    fn test_derive_behavior_profile_splits_ticket_like_tail_records() {
+        let profile = derive_behavior_profile(&[
+            (TLS_RECORD_HANDSHAKE, vec![0u8; 90]),
+            (TLS_RECORD_CHANGE_CIPHER, vec![0x01]),
+            (TLS_RECORD_APPLICATION, vec![0u8; 1400]),
+            (TLS_RECORD_APPLICATION, vec![0u8; 220]),
+            (TLS_RECORD_APPLICATION, vec![0u8; 180]),
+        ]);
+
+        assert_eq!(profile.change_cipher_spec_count, 1);
+        assert_eq!(profile.app_data_record_sizes, vec![1400]);
+        assert_eq!(profile.ticket_record_sizes, vec![220, 180]);
+        assert_eq!(profile.source, TlsProfileSource::Raw);
     }
 }

@@ -33,6 +33,7 @@ use super::codec::{
     cbc_decrypt_inplace, cbc_encrypt_padded, parse_handshake_flags, parse_nonce_payload,
     read_rpc_frame_plaintext, rpc_crc,
 };
+use super::selftest::{BndAddrStatus, BndPortStatus, record_bnd_status, record_upstream_bnd_status};
 use super::wire::{extract_ip_material, IpMaterial};
 use super::MePool;
 
@@ -58,6 +59,7 @@ impl KdfClientPortSource {
 pub(crate) struct HandshakeOutput {
     pub rd: ReadHalf<TcpStream>,
     pub wr: WriteHalf<TcpStream>,
+    pub source_ip: IpAddr,
     pub read_key: [u8; 32],
     pub read_iv: [u8; 16],
     pub write_key: [u8; 32],
@@ -131,6 +133,14 @@ impl MePool {
         )
     }
 
+    fn bnd_port_status(bound: Option<SocketAddr>) -> BndPortStatus {
+        match bound {
+            Some(addr) if addr.port() == 0 => BndPortStatus::Zero,
+            Some(_) => BndPortStatus::Ok,
+            None => BndPortStatus::Error,
+        }
+    }
+
     /// TCP connect with timeout + return RTT in milliseconds.
     pub(crate) async fn connect_tcp(
         &self,
@@ -190,10 +200,26 @@ impl MePool {
 
     fn configure_keepalive(stream: &TcpStream) -> std::io::Result<()> {
         let sock = SockRef::from(stream);
-        let ka = TcpKeepalive::new()
-            .with_time(Duration::from_secs(30))
-            .with_interval(Duration::from_secs(10))
-            .with_retries(3);
+        let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
+
+        // Mirror socket2 v0.5.10 target gate for with_retries(), the stricter method.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "cygwin",
+        ))]
+        let ka = ka.with_interval(Duration::from_secs(10)).with_retries(3);
+
         sock.set_tcp_keepalive(&ka)?;
         sock.set_keepalive(true)?;
         Ok(())
@@ -239,7 +265,27 @@ impl MePool {
             IpFamily::V6
         };
         let is_socks_route = Self::is_socks_route(upstream_egress);
+        let raw_socks_bound_addr = if is_socks_route {
+            upstream_egress.and_then(|info| info.socks_bound_addr)
+        } else {
+            None
+        };
         let socks_bound_addr = Self::select_socks_bound_addr(family, upstream_egress);
+        let bnd_addr_status = if !is_socks_route {
+            BndAddrStatus::Error
+        } else if raw_socks_bound_addr.is_some() && socks_bound_addr.is_none() {
+            BndAddrStatus::Bogon
+        } else if socks_bound_addr.is_some() {
+            BndAddrStatus::Ok
+        } else {
+            BndAddrStatus::Error
+        };
+        let bnd_port_status = if is_socks_route {
+            Self::bnd_port_status(raw_socks_bound_addr)
+        } else {
+            BndPortStatus::Error
+        };
+        record_bnd_status(bnd_addr_status, bnd_port_status, raw_socks_bound_addr);
         let reflected = if let Some(bound) = socks_bound_addr {
             Some(bound)
         } else if is_socks_route {
@@ -270,6 +316,18 @@ impl MePool {
 
         let local_addr_nat = self.translate_our_addr_with_reflection(local_addr, reflected);
         let peer_addr_nat = SocketAddr::new(self.translate_ip_for_nat(peer_addr.ip()), peer_addr.port());
+        if let Some(upstream_info) = upstream_egress {
+            let client_ip_for_kdf = socks_bound_addr
+                .map(|value| value.ip())
+                .unwrap_or(local_addr_nat.ip());
+            record_upstream_bnd_status(
+                upstream_info.upstream_id,
+                bnd_addr_status,
+                bnd_port_status,
+                raw_socks_bound_addr,
+                Some(client_ip_for_kdf),
+            );
+        }
         let (mut rd, mut wr) = tokio::io::split(stream);
 
         let my_nonce: [u8; 16] = rng.bytes(16).try_into().unwrap();
@@ -632,6 +690,7 @@ impl MePool {
         Ok(HandshakeOutput {
             rd,
             wr,
+            source_ip: local_addr_nat.ip(),
             read_key: rk,
             read_iv,
             write_key: wk,
@@ -655,4 +714,67 @@ fn hex_dump(data: &[u8]) -> String {
         out.push_str(" …");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn test_configure_keepalive_loopback() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind failed: {error}"),
+        };
+
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => panic!("local_addr failed: {error}"),
+        };
+
+        let stream = match TcpStream::connect(addr).await {
+            Ok(stream) => stream,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connect failed: {error}"),
+        };
+
+        if let Err(error) = MePool::configure_keepalive(&stream) {
+            if error.kind() == ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("configure_keepalive failed: {error}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "openbsd")]
+    fn test_openbsd_keepalive_cfg_path_compiles() {
+        let _ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "cygwin",
+    ))]
+    fn test_retry_keepalive_cfg_path_compiles() {
+        let _ka = TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10))
+            .with_retries(3);
+    }
 }

@@ -314,6 +314,8 @@ async fn get_minimal_payload_cached(
             required_writers: status.required_writers,
             alive_writers: status.alive_writers,
             coverage_pct: status.coverage_pct,
+            fresh_alive_writers: status.fresh_alive_writers,
+            fresh_coverage_pct: status.fresh_coverage_pct,
         },
         writers: status
             .writers
@@ -329,6 +331,12 @@ async fn get_minimal_payload_cached(
                 bound_clients: entry.bound_clients,
                 idle_for_secs: entry.idle_for_secs,
                 rtt_ema_ms: entry.rtt_ema_ms,
+                matches_active_generation: entry.matches_active_generation,
+                in_desired_map: entry.in_desired_map,
+                allow_drain_fallback: entry.allow_drain_fallback,
+                drain_started_at_epoch_secs: entry.drain_started_at_epoch_secs,
+                drain_deadline_epoch_secs: entry.drain_deadline_epoch_secs,
+                drain_over_ttl: entry.drain_over_ttl,
             })
             .collect(),
     };
@@ -363,6 +371,8 @@ async fn get_minimal_payload_cached(
                 floor_capped: entry.floor_capped,
                 alive_writers: entry.alive_writers,
                 coverage_pct: entry.coverage_pct,
+                fresh_alive_writers: entry.fresh_alive_writers,
+                fresh_coverage_pct: entry.fresh_coverage_pct,
                 rtt_ms: entry.rtt_ms,
                 load: entry.load,
             })
@@ -486,6 +496,8 @@ fn disabled_me_writers(now_epoch_secs: u64, reason: &'static str) -> MeWritersDa
             required_writers: 0,
             alive_writers: 0,
             coverage_pct: 0.0,
+            fresh_alive_writers: 0,
+            fresh_coverage_pct: 0.0,
         },
         writers: Vec::new(),
     }
