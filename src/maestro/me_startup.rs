@@ -237,6 +237,7 @@ pub(crate) async fn initialize_me_pool(
                     config.general.me_adaptive_floor_max_warm_writers_global,
                     config.general.hardswap,
                     config.general.me_pool_drain_ttl_secs,
+                    config.general.me_pool_drain_threshold,
                     config.general.effective_me_pool_force_close_secs(),
                     config.general.me_pool_min_fresh_ratio,
                     config.general.me_hardswap_warmup_delay_min_ms,

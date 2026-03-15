@@ -118,7 +118,11 @@ async fn reap_draining_writers(
     let now_epoch_secs = MePool::now_epoch_secs();
     let now = Instant::now();
     let drain_ttl_secs = pool.me_pool_drain_ttl_secs.load(std::sync::atomic::Ordering::Relaxed);
+    let drain_threshold = pool
+        .me_pool_drain_threshold
+        .load(std::sync::atomic::Ordering::Relaxed);
     let writers = pool.writers.read().await.clone();
+    let mut draining_writers = Vec::new();
     for writer in writers {
         if !writer.draining.load(std::sync::atomic::Ordering::Relaxed) {
             continue;
@@ -128,6 +132,36 @@ async fn reap_draining_writers(
             pool.remove_writer_and_close_clients(writer.id).await;
             continue;
         }
+        draining_writers.push(writer);
+    }
+
+    if drain_threshold > 0 && draining_writers.len() > drain_threshold as usize {
+        draining_writers.sort_by(|left, right| {
+            let left_started = left
+                .draining_started_at_epoch_secs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let right_started = right
+                .draining_started_at_epoch_secs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            left_started
+                .cmp(&right_started)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let overflow = draining_writers.len().saturating_sub(drain_threshold as usize);
+        warn!(
+            draining_writers = draining_writers.len(),
+            me_pool_drain_threshold = drain_threshold,
+            removing_writers = overflow,
+            "ME draining writer threshold exceeded, force-closing oldest draining writers"
+        );
+        for writer in draining_writers.drain(..overflow) {
+            pool.stats.increment_pool_force_close_total();
+            pool.remove_writer_and_close_clients(writer.id).await;
+        }
+    }
+
+    for writer in draining_writers {
         let drain_started_at_epoch_secs = writer
             .draining_started_at_epoch_secs
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1269,4 +1303,191 @@ async fn maybe_rotate_single_endpoint_shadow(
         rotate_every_secs = interval.as_secs(),
         "Single-endpoint shadow writer rotated"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use super::reap_draining_writers;
+    use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
+    use crate::crypto::SecureRandom;
+    use crate::network::probe::NetworkDecision;
+    use crate::stats::Stats;
+    use crate::transport::middle_proxy::codec::WriterCommand;
+    use crate::transport::middle_proxy::pool::{MePool, MeWriter, WriterContour};
+    use crate::transport::middle_proxy::registry::ConnMeta;
+
+    async fn make_pool(me_pool_drain_threshold: u64) -> Arc<MePool> {
+        let general = GeneralConfig {
+            me_pool_drain_threshold,
+            ..GeneralConfig::default()
+        };
+        MePool::new(
+            None,
+            vec![1u8; 32],
+            None,
+            false,
+            None,
+            Vec::new(),
+            1,
+            None,
+            12,
+            1200,
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            NetworkDecision::default(),
+            None,
+            Arc::new(SecureRandom::new()),
+            Arc::new(Stats::default()),
+            general.me_keepalive_enabled,
+            general.me_keepalive_interval_secs,
+            general.me_keepalive_jitter_secs,
+            general.me_keepalive_payload_random,
+            general.rpc_proxy_req_every,
+            general.me_warmup_stagger_enabled,
+            general.me_warmup_step_delay_ms,
+            general.me_warmup_step_jitter_ms,
+            general.me_reconnect_max_concurrent_per_dc,
+            general.me_reconnect_backoff_base_ms,
+            general.me_reconnect_backoff_cap_ms,
+            general.me_reconnect_fast_retry_count,
+            general.me_single_endpoint_shadow_writers,
+            general.me_single_endpoint_outage_mode_enabled,
+            general.me_single_endpoint_outage_disable_quarantine,
+            general.me_single_endpoint_outage_backoff_min_ms,
+            general.me_single_endpoint_outage_backoff_max_ms,
+            general.me_single_endpoint_shadow_rotate_every_secs,
+            general.me_floor_mode,
+            general.me_adaptive_floor_idle_secs,
+            general.me_adaptive_floor_min_writers_single_endpoint,
+            general.me_adaptive_floor_min_writers_multi_endpoint,
+            general.me_adaptive_floor_recover_grace_secs,
+            general.me_adaptive_floor_writers_per_core_total,
+            general.me_adaptive_floor_cpu_cores_override,
+            general.me_adaptive_floor_max_extra_writers_single_per_core,
+            general.me_adaptive_floor_max_extra_writers_multi_per_core,
+            general.me_adaptive_floor_max_active_writers_per_core,
+            general.me_adaptive_floor_max_warm_writers_per_core,
+            general.me_adaptive_floor_max_active_writers_global,
+            general.me_adaptive_floor_max_warm_writers_global,
+            general.hardswap,
+            general.me_pool_drain_ttl_secs,
+            general.me_pool_drain_threshold,
+            general.effective_me_pool_force_close_secs(),
+            general.me_pool_min_fresh_ratio,
+            general.me_hardswap_warmup_delay_min_ms,
+            general.me_hardswap_warmup_delay_max_ms,
+            general.me_hardswap_warmup_extra_passes,
+            general.me_hardswap_warmup_pass_backoff_base_ms,
+            general.me_bind_stale_mode,
+            general.me_bind_stale_ttl_secs,
+            general.me_secret_atomic_snapshot,
+            general.me_deterministic_writer_sort,
+            MeWriterPickMode::default(),
+            general.me_writer_pick_sample_size,
+            MeSocksKdfPolicy::default(),
+            general.me_writer_cmd_channel_capacity,
+            general.me_route_channel_capacity,
+            general.me_route_backpressure_base_timeout_ms,
+            general.me_route_backpressure_high_timeout_ms,
+            general.me_route_backpressure_high_watermark_pct,
+            general.me_reader_route_data_wait_ms,
+            general.me_health_interval_ms_unhealthy,
+            general.me_health_interval_ms_healthy,
+            general.me_warn_rate_limit_ms,
+            MeRouteNoWriterMode::default(),
+            general.me_route_no_writer_wait_ms,
+            general.me_route_inline_recovery_attempts,
+            general.me_route_inline_recovery_wait_ms,
+        )
+    }
+
+    async fn insert_draining_writer(
+        pool: &Arc<MePool>,
+        writer_id: u64,
+        drain_started_at_epoch_secs: u64,
+    ) -> u64 {
+        let (conn_id, _rx) = pool.registry.register().await;
+        let (tx, _writer_rx) = mpsc::channel::<WriterCommand>(8);
+        let writer = MeWriter {
+            id: writer_id,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000 + writer_id as u16),
+            source_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            writer_dc: 2,
+            generation: 1,
+            contour: Arc::new(AtomicU8::new(WriterContour::Draining.as_u8())),
+            created_at: Instant::now() - Duration::from_secs(writer_id),
+            tx: tx.clone(),
+            cancel: CancellationToken::new(),
+            degraded: Arc::new(AtomicBool::new(false)),
+            rtt_ema_ms_x10: Arc::new(AtomicU32::new(0)),
+            draining: Arc::new(AtomicBool::new(true)),
+            draining_started_at_epoch_secs: Arc::new(AtomicU64::new(drain_started_at_epoch_secs)),
+            drain_deadline_epoch_secs: Arc::new(AtomicU64::new(0)),
+            allow_drain_fallback: Arc::new(AtomicBool::new(false)),
+        };
+        pool.writers.write().await.push(writer);
+        pool.registry.register_writer(writer_id, tx).await;
+        pool.conn_count.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            pool.registry
+                .bind_writer(
+                    conn_id,
+                    writer_id,
+                    ConnMeta {
+                        target_dc: 2,
+                        client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6000),
+                        our_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+                        proto_flags: 0,
+                    },
+                )
+                .await
+        );
+        conn_id
+    }
+
+    #[tokio::test]
+    async fn reap_draining_writers_force_closes_oldest_over_threshold() {
+        let pool = make_pool(2).await;
+        let now_epoch_secs = MePool::now_epoch_secs();
+        let conn_a = insert_draining_writer(&pool, 10, now_epoch_secs.saturating_sub(30)).await;
+        let conn_b = insert_draining_writer(&pool, 20, now_epoch_secs.saturating_sub(20)).await;
+        let conn_c = insert_draining_writer(&pool, 30, now_epoch_secs.saturating_sub(10)).await;
+        let mut warn_next_allowed = HashMap::new();
+
+        reap_draining_writers(&pool, &mut warn_next_allowed).await;
+
+        let writer_ids: Vec<u64> = pool.writers.read().await.iter().map(|writer| writer.id).collect();
+        assert_eq!(writer_ids, vec![20, 30]);
+        assert!(pool.registry.get_writer(conn_a).await.is_none());
+        assert_eq!(pool.registry.get_writer(conn_b).await.unwrap().writer_id, 20);
+        assert_eq!(pool.registry.get_writer(conn_c).await.unwrap().writer_id, 30);
+    }
+
+    #[tokio::test]
+    async fn reap_draining_writers_keeps_timeout_only_behavior_when_threshold_disabled() {
+        let pool = make_pool(0).await;
+        let now_epoch_secs = MePool::now_epoch_secs();
+        let conn_a = insert_draining_writer(&pool, 10, now_epoch_secs.saturating_sub(30)).await;
+        let conn_b = insert_draining_writer(&pool, 20, now_epoch_secs.saturating_sub(20)).await;
+        let conn_c = insert_draining_writer(&pool, 30, now_epoch_secs.saturating_sub(10)).await;
+        let mut warn_next_allowed = HashMap::new();
+
+        reap_draining_writers(&pool, &mut warn_next_allowed).await;
+
+        let writer_ids: Vec<u64> = pool.writers.read().await.iter().map(|writer| writer.id).collect();
+        assert_eq!(writer_ids, vec![10, 20, 30]);
+        assert_eq!(pool.registry.get_writer(conn_a).await.unwrap().writer_id, 10);
+        assert_eq!(pool.registry.get_writer(conn_b).await.unwrap().writer_id, 20);
+        assert_eq!(pool.registry.get_writer(conn_c).await.unwrap().writer_id, 30);
+    }
 }

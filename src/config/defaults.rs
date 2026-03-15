@@ -584,6 +584,10 @@ pub(crate) fn default_me_pool_drain_ttl_secs() -> u64 {
     90
 }
 
+pub(crate) fn default_me_pool_drain_threshold() -> u64 {
+    128
+}
+
 pub(crate) fn default_me_bind_stale_ttl_secs() -> u64 {
     default_me_pool_drain_ttl_secs()
 }

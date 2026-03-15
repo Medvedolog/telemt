@@ -171,6 +171,7 @@ pub struct MePool {
     pub(super) endpoint_quarantine: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     pub(super) kdf_material_fingerprint: Arc<RwLock<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
+    pub(super) me_pool_drain_threshold: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
     pub(super) me_hardswap_warmup_delay_min_ms: AtomicU64,
@@ -271,6 +272,7 @@ impl MePool {
         me_adaptive_floor_max_warm_writers_global: u32,
         hardswap: bool,
         me_pool_drain_ttl_secs: u64,
+        me_pool_drain_threshold: u64,
         me_pool_force_close_secs: u64,
         me_pool_min_fresh_ratio: f32,
         me_hardswap_warmup_delay_min_ms: u64,
@@ -446,6 +448,7 @@ impl MePool {
             endpoint_quarantine: Arc::new(Mutex::new(HashMap::new())),
             kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
+            me_pool_drain_threshold: AtomicU64::new(me_pool_drain_threshold),
             me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
             me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(
                 me_pool_min_fresh_ratio,
@@ -492,6 +495,7 @@ impl MePool {
         &self,
         hardswap: bool,
         drain_ttl_secs: u64,
+        pool_drain_threshold: u64,
         force_close_secs: u64,
         min_fresh_ratio: f32,
         hardswap_warmup_delay_min_ms: u64,
@@ -530,6 +534,8 @@ impl MePool {
         self.hardswap.store(hardswap, Ordering::Relaxed);
         self.me_pool_drain_ttl_secs
             .store(drain_ttl_secs, Ordering::Relaxed);
+        self.me_pool_drain_threshold
+            .store(pool_drain_threshold, Ordering::Relaxed);
         self.me_pool_force_close_secs
             .store(force_close_secs, Ordering::Relaxed);
         self.me_pool_min_fresh_ratio_permille
